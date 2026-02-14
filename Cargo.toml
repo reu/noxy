@@ -10,10 +10,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "noxy"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["clap"]
 
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+clap = { version = "4", features = ["derive"], optional = true }
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 rustls = "0.23"

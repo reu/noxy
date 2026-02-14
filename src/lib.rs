@@ -79,6 +79,31 @@ impl CertificateAuthority {
         Self::from_pem(&cert_pem, &key_pem)
     }
 
+    /// Generate a new self-signed CA certificate and key pair.
+    pub fn generate() -> anyhow::Result<Self> {
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Noxy CA");
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+
+        let key = KeyPair::generate()?;
+        let cert = params.self_signed(&key)?;
+        Ok(Self { cert, key })
+    }
+
+    /// Write the CA certificate and key as PEM files to disk.
+    pub fn to_pem_files(
+        &self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<()> {
+        std::fs::write(cert_path, self.cert.pem())?;
+        std::fs::write(key_path, self.key.serialize_pem())?;
+        Ok(())
+    }
+
     /// Generate a leaf certificate for the given hostname, signed by this CA.
     pub fn generate_cert(
         &self,
