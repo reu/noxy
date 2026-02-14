@@ -12,7 +12,9 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::stream::StreamExt;
 use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
-use noxy::middleware::{BandwidthThrottle, FaultInjector, LatencyInjector, TrafficLogger};
+use noxy::middleware::{
+    BandwidthThrottle, FaultInjector, LatencyInjector, MockResponder, TrafficLogger,
+};
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
@@ -662,6 +664,65 @@ async fn fault_injector_aborts_connection() {
         result.is_err(),
         "expected connection abort to cause an error"
     );
+}
+
+#[tokio::test]
+async fn mock_responder_returns_canned_response() {
+    let upstream_addr = start_upstream("real response").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let mock = MockResponder::new().path("/mocked", "fake response");
+        tower::util::BoxService::new(mock.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    // Matched path returns canned response
+    let resp = client
+        .get(format!("https://localhost:{}/mocked", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "fake response");
+
+    // Unmatched path forwards to upstream
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.text().await.unwrap(), "real response");
+}
+
+#[tokio::test]
+async fn mock_responder_custom_status() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let mock = MockResponder::new().when(
+            |req| req.uri().path().starts_with("/fail"),
+            || {
+                http::Response::builder()
+                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(noxy::http::full_body("down for maintenance"))
+                    .unwrap()
+            },
+        );
+        tower::util::BoxService::new(mock.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!(
+            "https://localhost:{}/fail/here",
+            upstream_addr.port()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.text().await.unwrap(), "down for maintenance");
 }
 
 #[test]
