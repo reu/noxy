@@ -1,32 +1,31 @@
 # Noxy — TLS MITM Proxy
 
-Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT requests, generates fake certificates signed by a local CA, and relays traffic between client and upstream while running it through a middleware pipeline.
+Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT requests, generates fake certificates signed by a local CA, and relays HTTP traffic between client and upstream through a tower middleware pipeline.
 
 ## Architecture
 
 ### Entry point (`src/main.rs`)
-- `main()` — binds listener, loads CA cert/key, configures middleware layers, spawns per-connection tasks
-- `handle_connect()` — handles a single CONNECT tunnel: TLS termination on both sides, relay loop with middleware
-- `generate_cert()` — generates per-host certificates signed by the CA
+- `main()` — CLI interface (behind `cli` feature), loads CA cert/key, builds proxy, runs accept loop
+- CA generation via `--generate` flag
 
-### Middleware system (`src/middleware.rs`)
-- `Direction` — `Upstream` / `Downstream`
-- `ConnectionInfo` — per-connection metadata (client addr, target host/port)
-- `TcpMiddleware` trait — stateful per-connection middleware with `on_data()` and `flush()`
-- `TcpMiddlewareLayer` trait — factory that creates `TcpMiddleware` instances per connection
-- `flush_middlewares()` — drains all middleware buffers on connection close
+### HTTP types and forwarding (`src/http.rs`)
+- `Body` — `BoxBody<Bytes, BoxError>`, supports both buffered and streaming access
+- `HttpService` — `BoxService<Request<Body>, Response<Body>, BoxError>`
+- `ForwardService` — innermost tower service, wraps a hyper `SendRequest` handle to forward requests upstream. Supports both HTTP/1.1 and HTTP/2 via `UpstreamSender` enum.
+- `incoming_to_body()` — converts hyper's `Incoming` to our `BoxBody`
+- `full_body()` / `empty_body()` — body construction helpers
 
-### TCP middlewares (`src/middleware/tcp/`)
-- `FindReplaceLayer` / `FindReplace` — byte-level find and replace with partial-match buffering
-- `TrafficLoggerLayer` / `TrafficLogger` — logs bytes sent/received per direction
-
-### Middleware levels (design intent)
-- **TcpMiddleware** — operates on raw byte streams; suitable for traffic logging, bandwidth throttling, latency injection, byte-level find/replace, connection stats
-- **HttpMiddleware** — not yet implemented; would operate on parsed HTTP requests/responses (headers, body, status codes); suitable for header rewriting, content injection, cookie extraction, sensitive data scanning
-
-## TODO
-
-- **HTTP middleware layer using tower** — Add an `HttpMiddleware` layer using tower's `Service` trait for request/response semantics. The TCP middleware pipeline feeds raw bytes into an HTTP codec (parser/serializer), which passes parsed requests/responses through a tower `Service` chain. The HTTP codec itself is a `TcpMiddleware` at the TCP level, so both systems meet at the byte boundary: `client ↔ [TcpMiddleware pipeline] ↔ [HTTP codec] ↔ [tower Service chain] ↔ upstream`
+### Proxy core (`src/lib.rs`)
+- `CertificateAuthority` — wraps CA cert/key, generates per-host leaf certificates
+- `ProxyBuilder` — configures CA, tower layers, upstream cert verification
+- `Proxy` — cloneable via internal `Arc`s, runs accept loop
+- `handle_connection()` — handles a single CONNECT tunnel:
+  1. Parses CONNECT request, establishes TLS on both sides (with ALPN for h2/http1.1)
+  2. Hyper client handshake on upstream (HTTP/1.1 or HTTP/2 based on ALPN)
+  3. Builds tower service chain: `ForwardService` → user layers
+  4. Hyper server auto-builder serves the client connection through the service chain
+- `HyperServiceAdapter` — bridges tower's `&mut self` call model to hyper's `&self` via `Arc<Mutex>`
+- `http_layer()` — accepts any `tower::Layer<HttpService>`, type-erased via `LayerFn` closures
 
 ## Project Guidelines
 
