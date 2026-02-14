@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
@@ -6,6 +8,65 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+enum Direction {
+    Upstream,
+    Downstream,
+}
+
+#[allow(dead_code)]
+struct ConnectionInfo {
+    pub client_addr: SocketAddr,
+    pub target_host: String,
+    pub target_port: u16,
+}
+
+trait TcpMiddleware {
+    fn on_data<'a>(&mut self, direction: Direction, data: &'a [u8]) -> Cow<'a, [u8]>;
+}
+
+trait TcpMiddlewareLayer: Send + Sync {
+    fn create(&self, info: &ConnectionInfo) -> Box<dyn TcpMiddleware + Send>;
+}
+
+struct TrafficLoggerLayer;
+
+impl TcpMiddlewareLayer for TrafficLoggerLayer {
+    fn create(&self, info: &ConnectionInfo) -> Box<dyn TcpMiddleware + Send> {
+        Box::new(TrafficLogger {
+            target_host: info.target_host.clone(),
+            bytes_sent: 0,
+            bytes_received: 0,
+        })
+    }
+}
+
+struct TrafficLogger {
+    target_host: String,
+    bytes_sent: usize,
+    bytes_received: usize,
+}
+
+impl TcpMiddleware for TrafficLogger {
+    fn on_data<'a>(&mut self, direction: Direction, data: &'a [u8]) -> Cow<'a, [u8]> {
+        let n = data.len();
+        let host = &self.target_host;
+        match direction {
+            Direction::Upstream => {
+                self.bytes_sent += n;
+                let total = self.bytes_sent;
+                eprintln!("[{host}] >>> upstream ({n} bytes, {total} sent)");
+            }
+            Direction::Downstream => {
+                self.bytes_received += n;
+                let total = self.bytes_received;
+                eprintln!("[{host}] <<< downstream ({n} bytes, {total} received)");
+            }
+        }
+        print!("{}", String::from_utf8_lossy(data));
+        Cow::Borrowed(data)
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,6 +77,9 @@ async fn main() -> anyhow::Result<()> {
     let ca_params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
     let ca_cert = Arc::new(ca_params.self_signed(&ca_key)?);
 
+    let middlewares: Arc<Vec<Box<dyn TcpMiddlewareLayer>>> =
+        Arc::new(vec![Box::new(TrafficLoggerLayer)]);
+
     let listener = TcpListener::bind("127.0.0.1:8080").await?;
     eprintln!("Noxy listening on 127.0.0.1:8080");
 
@@ -24,8 +88,9 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("Connection from {addr}");
         let ca_cert = ca_cert.clone();
         let ca_key = ca_key.clone();
+        let middlewares = middlewares.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connect(stream, &ca_cert, &ca_key).await {
+            if let Err(e) = handle_connect(stream, addr, &ca_cert, &ca_key, &middlewares).await {
                 eprintln!("Error handling {addr}: {e}");
             }
         });
@@ -34,8 +99,10 @@ async fn main() -> anyhow::Result<()> {
 
 async fn handle_connect(
     stream: TcpStream,
+    client_addr: SocketAddr,
     ca_cert: &rcgen::Certificate,
     ca_key: &KeyPair,
+    middlewares: &[Box<dyn TcpMiddlewareLayer>],
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::new(stream);
 
@@ -64,6 +131,14 @@ async fn handle_connect(
         (target, 443u16)
     };
     eprintln!("CONNECT to {host}:{port}");
+
+    let info = ConnectionInfo {
+        client_addr,
+        target_host: host.to_string(),
+        target_port: port,
+    };
+    let mut mws: Vec<Box<dyn TcpMiddleware + Send>> =
+        middlewares.iter().map(|f| f.create(&info)).collect();
 
     // Send 200 to client
     let mut client_stream = reader.into_inner();
@@ -102,20 +177,22 @@ async fn handle_connect(
                 if n == 0 {
                     break;
                 }
-                let data = &buf_c[..n];
-                eprintln!(">>> client → upstream ({n} bytes)");
-                print!("{}", String::from_utf8_lossy(data));
-                upstream_tls.write_all(data).await?;
+                let mut data = buf_c[..n].to_vec();
+                for mw in &mut mws {
+                    data = mw.on_data(Direction::Upstream, &data).into_owned();
+                }
+                upstream_tls.write_all(&data).await?;
             }
             result = upstream_tls.read(&mut buf_s) => {
                 let n = result?;
                 if n == 0 {
                     break;
                 }
-                let data = &buf_s[..n];
-                eprintln!("<<< upstream → client ({n} bytes)");
-                print!("{}", String::from_utf8_lossy(data));
-                client_tls.write_all(data).await?;
+                let mut data = buf_s[..n].to_vec();
+                for mw in &mut mws {
+                    data = mw.on_data(Direction::Downstream, &data).into_owned();
+                }
+                client_tls.write_all(&data).await?;
             }
         }
     }
