@@ -1,4 +1,5 @@
 pub mod http;
+pub mod middleware;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -177,6 +178,15 @@ impl ProxyBuilder {
             tower::util::BoxService::new(layer.layer(svc))
         }));
         self
+    }
+
+    /// Add a traffic logger that logs request/response metadata to stderr.
+    ///
+    /// Use [`TrafficLogger`](middleware::TrafficLogger) directly with
+    /// [`http_layer`](Self::http_layer) for more control (custom writer,
+    /// body logging).
+    pub fn traffic_logger(self) -> Self {
+        self.http_layer(middleware::TrafficLogger::new())
     }
 
     /// Disable upstream TLS certificate verification. Useful for testing with

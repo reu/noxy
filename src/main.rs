@@ -33,7 +33,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let proxy = Proxy::builder().ca_pem_files(&cli.cert, &cli.key)?.build();
+    let proxy = Proxy::builder()
+        .ca_pem_files(&cli.cert, &cli.key)?
+        .traffic_logger()
+        .build();
 
     proxy.listen(&cli.listen).await
 }
