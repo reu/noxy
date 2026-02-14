@@ -24,6 +24,10 @@ Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT req
 - **TcpMiddleware** — operates on raw byte streams; suitable for traffic logging, bandwidth throttling, latency injection, byte-level find/replace, connection stats
 - **HttpMiddleware** — not yet implemented; would operate on parsed HTTP requests/responses (headers, body, status codes); suitable for header rewriting, content injection, cookie extraction, sensitive data scanning
 
+## TODO
+
+- **HTTP middleware layer using tower** — Add an `HttpMiddleware` layer using tower's `Service` trait for request/response semantics. The TCP middleware pipeline feeds raw bytes into an HTTP codec (parser/serializer), which passes parsed requests/responses through a tower `Service` chain. The HTTP codec itself is a `TcpMiddleware` at the TCP level, so both systems meet at the byte boundary: `client ↔ [TcpMiddleware pipeline] ↔ [HTTP codec] ↔ [tower Service chain] ↔ upstream`
+
 ## Project Guidelines
 
 ## After every Rust file change
