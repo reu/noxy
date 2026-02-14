@@ -128,7 +128,11 @@ async fn handle_connect(
     loop {
         tokio::select! {
             result = client_tls.read(&mut buf_c) => {
-                let n = result?;
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) if is_tls_close(&e) => 0,
+                    Err(e) => return Err(e.into()),
+                };
                 if n == 0 {
                     let data = flush_middlewares(&mut mws, Direction::Upstream);
                     if !data.is_empty() {
@@ -143,7 +147,11 @@ async fn handle_connect(
                 upstream_tls.write_all(&data).await?;
             }
             result = upstream_tls.read(&mut buf_s) => {
-                let n = result?;
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) if is_tls_close(&e) => 0,
+                    Err(e) => return Err(e.into()),
+                };
                 if n == 0 {
                     let data = flush_middlewares(&mut mws, Direction::Downstream);
                     if !data.is_empty() {
@@ -159,6 +167,9 @@ async fn handle_connect(
             }
         }
     }
+
+    let _ = client_tls.shutdown().await;
+    let _ = upstream_tls.shutdown().await;
 
     eprintln!("Connection closed");
     Ok(())
@@ -182,4 +193,8 @@ fn generate_cert(
     let cert_der = cert.der().clone();
 
     Ok((cert_der, key_der))
+}
+
+fn is_tls_close(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::UnexpectedEof
 }
