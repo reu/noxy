@@ -127,6 +127,7 @@ async fn handle_connect(
     // Relay loop
     let mut buf_c = vec![0u8; 8192];
     let mut buf_s = vec![0u8; 8192];
+    let mut data = Vec::with_capacity(8192);
 
     loop {
         tokio::select! {
@@ -137,15 +138,16 @@ async fn handle_connect(
                     Err(e) => return Err(e.into()),
                 };
                 if n == 0 {
-                    let data = flush_middlewares(&mut mws, Direction::Upstream).await;
+                    flush_middlewares(&mut mws, Direction::Upstream, &mut data).await;
                     if !data.is_empty() {
                         upstream_tls.write_all(&data).await?;
                     }
                     break;
                 }
-                let mut data = buf_c[..n].to_vec();
+                data.clear();
+                data.extend_from_slice(&buf_c[..n]);
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Upstream, data).await;
+                    mw.on_data(Direction::Upstream, &mut data).await;
                 }
                 upstream_tls.write_all(&data).await?;
             }
@@ -156,15 +158,16 @@ async fn handle_connect(
                     Err(e) => return Err(e.into()),
                 };
                 if n == 0 {
-                    let data = flush_middlewares(&mut mws, Direction::Downstream).await;
+                    flush_middlewares(&mut mws, Direction::Downstream, &mut data).await;
                     if !data.is_empty() {
                         client_tls.write_all(&data).await?;
                     }
                     break;
                 }
-                let mut data = buf_s[..n].to_vec();
+                data.clear();
+                data.extend_from_slice(&buf_s[..n]);
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Downstream, data).await;
+                    mw.on_data(Direction::Downstream, &mut data).await;
                 }
                 client_tls.write_all(&data).await?;
             }

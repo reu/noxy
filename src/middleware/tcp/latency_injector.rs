@@ -18,8 +18,7 @@ struct LatencyInjector {
 
 #[async_trait::async_trait]
 impl TcpMiddleware for LatencyInjector {
-    async fn on_data(&mut self, _direction: Direction, data: Vec<u8>) -> Vec<u8> {
+    async fn on_data(&mut self, _direction: Direction, _data: &mut Vec<u8>) {
         tokio::time::sleep(self.delay).await;
-        data
     }
 }

@@ -20,7 +20,7 @@ struct TrafficLogger {
 
 #[async_trait::async_trait]
 impl TcpMiddleware for TrafficLogger {
-    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8> {
+    async fn on_data(&mut self, direction: Direction, data: &mut Vec<u8>) {
         let n = data.len();
         let host = &self.target_host;
         match direction {
@@ -35,7 +35,6 @@ impl TcpMiddleware for TrafficLogger {
                 eprintln!("[{host}] <<< downstream ({n} bytes, {total} received)");
             }
         }
-        print!("{}", String::from_utf8_lossy(&data));
-        data
+        print!("{}", String::from_utf8_lossy(data));
     }
 }

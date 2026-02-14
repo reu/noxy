@@ -17,7 +17,7 @@ pub struct ConnectionInfo {
 
 #[async_trait::async_trait]
 pub trait TcpMiddleware {
-    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8>;
+    async fn on_data(&mut self, direction: Direction, data: &mut Vec<u8>);
 
     /// Drain any buffered data for the given direction. Called when the connection closes.
     ///
@@ -38,18 +38,16 @@ pub trait TcpMiddlewareLayer: Send + Sync {
 pub async fn flush_middlewares(
     middlewares: &mut [Box<dyn TcpMiddleware + Send>],
     direction: Direction,
-) -> Vec<u8> {
-    let mut result = Vec::new();
+    data: &mut Vec<u8>,
+) {
+    data.clear();
     for middleware in middlewares.iter_mut() {
-        // Pass accumulated flush data from earlier middlewares through this one
-        if !result.is_empty() {
-            result = middleware.on_data(direction, result).await;
+        if !data.is_empty() {
+            middleware.on_data(direction, data).await;
         }
-        // Then drain this middleware's own buffer
         let flushed = middleware.flush(direction);
         if !flushed.is_empty() {
-            result.extend_from_slice(&flushed);
+            data.extend_from_slice(&flushed);
         }
     }
-    result
 }

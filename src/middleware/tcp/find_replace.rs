@@ -41,9 +41,9 @@ fn suffix_prefix_overlap(data: &[u8], needle: &[u8]) -> usize {
 
 #[async_trait::async_trait]
 impl TcpMiddleware for FindReplace {
-    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8> {
+    async fn on_data(&mut self, direction: Direction, data: &mut Vec<u8>) {
         if self.find.is_empty() {
-            return data;
+            return;
         }
 
         let buf = match direction {
@@ -51,16 +51,16 @@ impl TcpMiddleware for FindReplace {
             Direction::Downstream => &mut self.downstream_buf,
         };
 
-        buf.extend_from_slice(&data);
+        buf.extend_from_slice(data);
+        data.clear();
 
-        let mut out = Vec::new();
         let mut start = 0;
 
         // Replace all complete matches in the buffer
         while let Some(pos) = memchr_find(&buf[start..], &self.find) {
             let abs_pos = start + pos;
-            out.extend_from_slice(&buf[start..abs_pos]);
-            out.extend_from_slice(&self.replace);
+            data.extend_from_slice(&buf[start..abs_pos]);
+            data.extend_from_slice(&self.replace);
             start = abs_pos + self.find.len();
         }
 
@@ -68,13 +68,11 @@ impl TcpMiddleware for FindReplace {
         let hold_back = suffix_prefix_overlap(&buf[start..], &self.find);
         let emit_end = buf.len() - hold_back;
         if emit_end > start {
-            out.extend_from_slice(&buf[start..emit_end]);
+            data.extend_from_slice(&buf[start..emit_end]);
             start = emit_end;
         }
 
         *buf = buf[start..].to_vec();
-
-        out
     }
 
     fn flush(&mut self, direction: Direction) -> Vec<u8> {
