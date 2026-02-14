@@ -14,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 
-use http::{Body, BoxError, ForwardService, HttpService, incoming_to_body};
+use http::{Body, BoxError, ForwardService, HttpService, UpstreamSender, incoming_to_body};
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
@@ -198,8 +198,7 @@ impl ProxyBuilder {
 }
 
 /// Adapter that bridges a tower `Service` (which uses `&mut self`) to hyper's
-/// `Service` trait (which uses `&self`). Uses a `Mutex` for interior mutability;
-/// since HTTP/1.1 processes requests sequentially, the lock is never contended.
+/// `Service` trait (which uses `&self`). Uses a `Mutex` for interior mutability.
 struct HyperServiceAdapter {
     inner: Arc<tokio::sync::Mutex<HttpService>>,
 }
@@ -300,8 +299,8 @@ impl Proxy {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        // Connect upstream via TLS
-        let client_config = if self.accept_invalid_upstream_certs {
+        // Connect upstream via TLS (advertise both h2 and http/1.1)
+        let mut client_config = if self.accept_invalid_upstream_certs {
             ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
@@ -313,28 +312,52 @@ impl Proxy {
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let connector = TlsConnector::from(Arc::new(client_config));
 
         let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
         let server_name: ServerName<'static> = host.to_string().try_into()?;
         let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
 
+        // Check which protocol was negotiated with upstream
+        let upstream_is_h2 = upstream_tls
+            .get_ref()
+            .1
+            .alpn_protocol()
+            .is_some_and(|p| p == b"h2");
+
         // Generate fake cert for the host, signed by our CA
         let (cert_der, key_der) = self.ca.generate_cert(host)?;
-        let server_config = ServerConfig::builder()
+        let mut server_config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let client_tls = acceptor.accept(client_stream).await?;
 
-        // Hyper client handshake on upstream
+        // Hyper client handshake on upstream (protocol matches ALPN negotiation)
         let upstream_io = TokioIo::new(upstream_tls);
-        let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                eprintln!("Upstream connection error: {e}");
-            }
-        });
+        let sender = if upstream_is_h2 {
+            let (sender, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                upstream_io,
+            )
+            .await?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("Upstream connection error: {e}");
+                }
+            });
+            UpstreamSender::Http2(sender)
+        } else {
+            let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("Upstream connection error: {e}");
+                }
+            });
+            UpstreamSender::Http1(sender)
+        };
 
         // Build tower service chain for this connection
         let mut service: HttpService = tower::util::BoxService::new(ForwardService::new(sender));
@@ -343,17 +366,17 @@ impl Proxy {
         }
 
         // Wrap tower service for hyper: hyper's Service::call takes &self,
-        // so we use a Mutex for interior mutability. HTTP/1.1 is sequential,
-        // so the lock is never contended.
+        // so we use a Mutex for interior mutability.
         let hyper_service = HyperServiceAdapter {
             inner: Arc::new(tokio::sync::Mutex::new(service)),
         };
 
-        // Hyper server on client TLS — handles the entire request/response loop
+        // Hyper server on client TLS — auto-detects HTTP/1.1 vs HTTP/2
         let client_io = TokioIo::new(client_tls);
-        hyper::server::conn::http1::Builder::new()
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
             .serve_connection(client_io, hyper_service)
-            .await?;
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         eprintln!("Connection closed");
         Ok(())

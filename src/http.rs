@@ -27,13 +27,19 @@ pub fn incoming_to_body(incoming: Incoming) -> Body {
     incoming.map_err(|e| -> BoxError { Box::new(e) }).boxed()
 }
 
+/// Upstream sender that works with both HTTP/1.1 and HTTP/2.
+pub enum UpstreamSender {
+    Http1(hyper::client::conn::http1::SendRequest<Body>),
+    Http2(hyper::client::conn::http2::SendRequest<Body>),
+}
+
 /// Tower service that forwards requests to an upstream hyper connection.
 pub struct ForwardService {
-    sender: hyper::client::conn::http1::SendRequest<Body>,
+    sender: UpstreamSender,
 }
 
 impl ForwardService {
-    pub fn new(sender: hyper::client::conn::http1::SendRequest<Body>) -> Self {
+    pub fn new(sender: UpstreamSender) -> Self {
         Self { sender }
     }
 }
@@ -44,16 +50,28 @@ impl Service<Request<Body>> for ForwardService {
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.sender
-            .poll_ready(cx)
-            .map_err(|e| Box::new(e) as BoxError)
+        match &mut self.sender {
+            UpstreamSender::Http1(s) => s.poll_ready(cx).map_err(|e| Box::new(e) as BoxError),
+            UpstreamSender::Http2(s) => s.poll_ready(cx).map_err(|e| Box::new(e) as BoxError),
+        }
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let fut = self.sender.send_request(req);
-        Box::pin(async move {
-            let resp = fut.await?;
-            Ok(resp.map(incoming_to_body))
-        })
+        match &mut self.sender {
+            UpstreamSender::Http1(s) => {
+                let fut = s.send_request(req);
+                Box::pin(async move {
+                    let resp = fut.await?;
+                    Ok(resp.map(incoming_to_body))
+                })
+            }
+            UpstreamSender::Http2(s) => {
+                let fut = s.send_request(req);
+                Box::pin(async move {
+                    let resp = fut.await?;
+                    Ok(resp.map(incoming_to_body))
+                })
+            }
+        }
     }
 }
