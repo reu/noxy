@@ -189,6 +189,14 @@ impl ProxyBuilder {
         self.http_layer(middleware::TrafficLogger::new())
     }
 
+    /// Add a fixed latency before each request is forwarded upstream.
+    ///
+    /// Use [`LatencyInjector`](middleware::LatencyInjector) directly with
+    /// [`http_layer`](Self::http_layer) for more control (e.g., random range).
+    pub fn latency(self, delay: std::time::Duration) -> Self {
+        self.http_layer(middleware::LatencyInjector::fixed(delay))
+    }
+
     /// Disable upstream TLS certificate verification. Useful for testing with
     /// self-signed upstream servers.
     pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {

@@ -12,7 +12,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::stream::StreamExt;
 use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
-use noxy::middleware::TrafficLogger;
+use noxy::middleware::{LatencyInjector, TrafficLogger};
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
@@ -537,6 +537,33 @@ async fn traffic_logger_logs_body_content() {
     assert!(log.contains("[body:"), "should log body info");
     assert!(log.contains("hello"), "should log body content");
     assert!(log.contains("* Completed in"), "should log completion");
+}
+
+#[tokio::test]
+async fn latency_injector_adds_delay() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let delay = Duration::from_millis(200);
+    let proxy_addr = start_proxy(vec![Box::new(move |inner: HttpService| {
+        let layer = LatencyInjector::fixed(delay);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let start = Instant::now();
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.text().await.unwrap(), "hello");
+    assert!(
+        elapsed >= delay,
+        "request took {elapsed:?}, expected at least {delay:?}"
+    );
 }
 
 #[test]
