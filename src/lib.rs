@@ -12,6 +12,48 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use middleware::{ConnectionInfo, Direction, TcpMiddlewareLayer, flush_middlewares};
 
+/// A `ServerCertVerifier` that accepts any certificate. Used when
+/// `danger_accept_invalid_upstream_certs` is enabled on the builder.
+#[derive(Debug)]
+struct NoCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// Wraps a CA certificate and key pair used to sign per-host certificates.
 pub struct CertificateAuthority {
     cert: rcgen::Certificate,
@@ -62,6 +104,7 @@ impl CertificateAuthority {
 pub struct ProxyBuilder {
     ca: Option<CertificateAuthority>,
     middlewares: Vec<Box<dyn TcpMiddlewareLayer>>,
+    accept_invalid_upstream_certs: bool,
 }
 
 impl ProxyBuilder {
@@ -93,12 +136,26 @@ impl ProxyBuilder {
         self
     }
 
+    /// Add an already-boxed TCP middleware layer.
+    pub fn middleware_boxed(mut self, layer: Box<dyn TcpMiddlewareLayer>) -> Self {
+        self.middlewares.push(layer);
+        self
+    }
+
+    /// Disable upstream TLS certificate verification. Useful for testing with
+    /// self-signed upstream servers.
+    pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {
+        self.accept_invalid_upstream_certs = true;
+        self
+    }
+
     /// Build the proxy. Panics if no CA has been set.
     pub fn build(self) -> Proxy {
         let ca = self.ca.expect("CertificateAuthority must be set");
         Proxy {
             ca: Arc::new(ca),
             middlewares: Arc::new(self.middlewares),
+            accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
         }
     }
 }
@@ -110,6 +167,7 @@ impl ProxyBuilder {
 pub struct Proxy {
     ca: Arc<CertificateAuthority>,
     middlewares: Arc<Vec<Box<dyn TcpMiddlewareLayer>>>,
+    accept_invalid_upstream_certs: bool,
 }
 
 impl Proxy {
@@ -118,6 +176,7 @@ impl Proxy {
         ProxyBuilder {
             ca: None,
             middlewares: Vec::new(),
+            accept_invalid_upstream_certs: false,
         }
     }
 
@@ -188,11 +247,18 @@ impl Proxy {
             .await?;
 
         // Connect upstream via TLS
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
+        let client_config = if self.accept_invalid_upstream_certs {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                .with_no_client_auth()
+        } else {
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
         let connector = TlsConnector::from(Arc::new(client_config));
 
         let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;

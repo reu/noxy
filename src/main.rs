@@ -6,7 +6,7 @@ use noxy::middleware::tcp::{FindReplaceLayer, LatencyInjectorLayer, TrafficLogge
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let proxy = Proxy::builder()
-        .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+        .ca_pem_files("tests/ca-cert.pem", "tests/ca-key.pem")?
         .middleware(FindReplaceLayer {
             find: b"<TITLE>".to_vec(),
             replace: b"<title>".to_vec(),
