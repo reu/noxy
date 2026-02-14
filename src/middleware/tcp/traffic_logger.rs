@@ -38,3 +38,18 @@ impl TcpMiddleware for TrafficLogger {
         print!("{}", String::from_utf8_lossy(data));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::test_helpers::*;
+
+    #[tokio::test]
+    async fn data_passes_through_unmodified() {
+        let layer = TrafficLoggerLayer;
+        let mut mw = layer.create(&test_conn_info());
+        let input = b"hello world";
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[input]).await;
+        assert_eq!(out, input);
+    }
+}

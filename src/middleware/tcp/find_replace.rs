@@ -83,3 +83,63 @@ impl TcpMiddleware for FindReplace {
         std::mem::take(buf)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::middleware::test_helpers::*;
+
+    fn make_find_replace(find: &[u8], replace: &[u8]) -> Box<dyn TcpMiddleware + Send> {
+        let layer = FindReplaceLayer {
+            find: find.to_vec(),
+            replace: replace.to_vec(),
+        };
+        layer.create(&test_conn_info())
+    }
+
+    #[tokio::test]
+    async fn basic_replacement() {
+        let mut mw = make_find_replace(b"world", b"rust");
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[b"hello world"]).await;
+        assert_eq!(out, b"hello rust");
+    }
+
+    #[tokio::test]
+    async fn no_match_passes_through() {
+        let mut mw = make_find_replace(b"xyz", b"abc");
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[b"hello world"]).await;
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn split_across_chunks() {
+        let mut mw = make_find_replace(b"hello", b"HI");
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[b"hel", b"lo world"]).await;
+        assert_eq!(out, b"HI world");
+    }
+
+    #[tokio::test]
+    async fn multiple_matches_in_one_chunk() {
+        let mut mw = make_find_replace(b"a", b"bb");
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[b"banana"]).await;
+        assert_eq!(out, b"bbbnbbnbb");
+    }
+
+    #[tokio::test]
+    async fn flush_emits_held_back_bytes() {
+        let mut mw = make_find_replace(b"abc", b"X");
+        // "ab" is a prefix of "abc", so it will be held back
+        let out = run_middleware(&mut *mw, Direction::Upstream, &[b"ab"]).await;
+        assert_eq!(out, b"ab");
+    }
+
+    #[tokio::test]
+    async fn directions_are_independent() {
+        let mut mw = make_find_replace(b"foo", b"bar");
+        let up = run_middleware(&mut *mw, Direction::Upstream, &[b"foo"]).await;
+        // Upstream buffer was flushed by run_middleware, downstream is independent
+        let down = run_middleware(&mut *mw, Direction::Downstream, &[b"foo"]).await;
+        assert_eq!(up, b"bar");
+        assert_eq!(down, b"bar");
+    }
+}
