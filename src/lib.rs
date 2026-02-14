@@ -197,6 +197,14 @@ impl ProxyBuilder {
         self.http_layer(middleware::LatencyInjector::fixed(delay))
     }
 
+    /// Throttle response body throughput to the given bytes per second.
+    ///
+    /// Use [`BandwidthThrottle`](middleware::BandwidthThrottle) directly with
+    /// [`http_layer`](Self::http_layer) for more control.
+    pub fn bandwidth(self, bytes_per_second: u64) -> Self {
+        self.http_layer(middleware::BandwidthThrottle::new(bytes_per_second))
+    }
+
     /// Disable upstream TLS certificate verification. Useful for testing with
     /// self-signed upstream servers.
     pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {
