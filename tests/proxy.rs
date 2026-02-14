@@ -12,7 +12,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use futures_util::stream::StreamExt;
 use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
-use noxy::middleware::{LatencyInjector, TrafficLogger};
+use noxy::middleware::{FaultInjector, LatencyInjector, TrafficLogger};
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
@@ -563,6 +563,51 @@ async fn latency_injector_adds_delay() {
     assert!(
         elapsed >= delay,
         "request took {elapsed:?}, expected at least {delay:?}"
+    );
+}
+
+#[tokio::test]
+async fn fault_injector_returns_error_status() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = FaultInjector::new()
+            .error_rate(1.0)
+            .error_status(http::StatusCode::SERVICE_UNAVAILABLE);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(resp.text().await.unwrap(), "fault injected");
+}
+
+#[tokio::test]
+async fn fault_injector_aborts_connection() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = FaultInjector::new().abort_rate(1.0);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let result = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected connection abort to cause an error"
     );
 }
 
