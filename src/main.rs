@@ -22,7 +22,7 @@ struct ConnectionInfo {
 }
 
 trait TcpMiddleware {
-    fn on_data<'a>(&mut self, direction: Direction, data: &'a [u8]) -> Cow<'a, [u8]>;
+    fn on_data<'a>(&mut self, direction: Direction, data: Cow<'a, [u8]>) -> Cow<'a, [u8]>;
 }
 
 trait TcpMiddlewareLayer: Send + Sync {
@@ -48,7 +48,7 @@ struct TrafficLogger {
 }
 
 impl TcpMiddleware for TrafficLogger {
-    fn on_data<'a>(&mut self, direction: Direction, data: &'a [u8]) -> Cow<'a, [u8]> {
+    fn on_data<'a>(&mut self, direction: Direction, data: Cow<'a, [u8]>) -> Cow<'a, [u8]> {
         let n = data.len();
         let host = &self.target_host;
         match direction {
@@ -63,8 +63,8 @@ impl TcpMiddleware for TrafficLogger {
                 eprintln!("[{host}] <<< downstream ({n} bytes, {total} received)");
             }
         }
-        print!("{}", String::from_utf8_lossy(data));
-        Cow::Borrowed(data)
+        print!("{}", String::from_utf8_lossy(&data));
+        data
     }
 }
 
@@ -177,9 +177,9 @@ async fn handle_connect(
                 if n == 0 {
                     break;
                 }
-                let mut data = buf_c[..n].to_vec();
+                let mut data: Cow<[u8]> = Cow::Borrowed(&buf_c[..n]);
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Upstream, &data).into_owned();
+                    data = mw.on_data(Direction::Upstream, data);
                 }
                 upstream_tls.write_all(&data).await?;
             }
@@ -188,9 +188,9 @@ async fn handle_connect(
                 if n == 0 {
                     break;
                 }
-                let mut data = buf_s[..n].to_vec();
+                let mut data: Cow<[u8]> = Cow::Borrowed(&buf_s[..n]);
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Downstream, &data).into_owned();
+                    data = mw.on_data(Direction::Downstream, data);
                 }
                 client_tls.write_all(&data).await?;
             }
