@@ -1,11 +1,13 @@
 mod bandwidth_throttle;
+mod conditional;
 mod fault_injector;
 mod latency_injector;
-mod mock_responder;
+mod set_response;
 mod traffic_logger;
 
 pub use bandwidth_throttle::BandwidthThrottle;
+pub use conditional::Conditional;
 pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;
-pub use mock_responder::MockResponder;
+pub use set_response::SetResponse;
 pub use traffic_logger::TrafficLogger;
