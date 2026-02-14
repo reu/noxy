@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::middleware::{ConnectionInfo, Direction, TcpMiddleware, TcpMiddlewareLayer};
 
 pub struct FindReplaceLayer {
@@ -41,8 +39,9 @@ fn suffix_prefix_overlap(data: &[u8], needle: &[u8]) -> usize {
     0
 }
 
+#[async_trait::async_trait]
 impl TcpMiddleware for FindReplace {
-    fn on_data<'a>(&mut self, direction: Direction, data: Cow<'a, [u8]>) -> Cow<'a, [u8]> {
+    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8> {
         if self.find.is_empty() {
             return data;
         }
@@ -75,18 +74,14 @@ impl TcpMiddleware for FindReplace {
 
         *buf = buf[start..].to_vec();
 
-        Cow::Owned(out)
+        out
     }
 
-    fn flush(&mut self, direction: Direction) -> Cow<'static, [u8]> {
+    fn flush(&mut self, direction: Direction) -> Vec<u8> {
         let buf = match direction {
             Direction::Upstream => &mut self.upstream_buf,
             Direction::Downstream => &mut self.downstream_buf,
         };
-        if buf.is_empty() {
-            Cow::Borrowed(&[])
-        } else {
-            Cow::Owned(std::mem::take(buf))
-        }
+        std::mem::take(buf)
     }
 }

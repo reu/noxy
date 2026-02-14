@@ -1,6 +1,5 @@
 pub mod tcp;
 
-use std::borrow::Cow;
 use std::net::SocketAddr;
 
 #[derive(Clone, Copy)]
@@ -16,8 +15,9 @@ pub struct ConnectionInfo {
     pub target_port: u16,
 }
 
+#[async_trait::async_trait]
 pub trait TcpMiddleware {
-    fn on_data<'a>(&mut self, direction: Direction, data: Cow<'a, [u8]>) -> Cow<'a, [u8]>;
+    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8>;
 
     /// Drain any buffered data for the given direction. Called when the connection closes.
     ///
@@ -26,8 +26,8 @@ pub trait TcpMiddleware {
     /// genuine prefix of the needle, so `on_data` correctly buffers them waiting for more data.
     /// When the connection closes, no more data is coming — `flush` emits those held-back bytes
     /// so they aren't silently lost.
-    fn flush(&mut self, _direction: Direction) -> Cow<'static, [u8]> {
-        Cow::Borrowed(&[])
+    fn flush(&mut self, _direction: Direction) -> Vec<u8> {
+        Vec::new()
     }
 }
 
@@ -35,7 +35,7 @@ pub trait TcpMiddlewareLayer: Send + Sync {
     fn create(&self, info: &ConnectionInfo) -> Box<dyn TcpMiddleware + Send>;
 }
 
-pub fn flush_middlewares(
+pub async fn flush_middlewares(
     middlewares: &mut [Box<dyn TcpMiddleware + Send>],
     direction: Direction,
 ) -> Vec<u8> {
@@ -43,8 +43,7 @@ pub fn flush_middlewares(
     for middleware in middlewares.iter_mut() {
         // Pass accumulated flush data from earlier middlewares through this one
         if !result.is_empty() {
-            let processed = middleware.on_data(direction, Cow::Owned(result));
-            result = processed.into_owned();
+            result = middleware.on_data(direction, result).await;
         }
         // Then drain this middleware's own buffer
         let flushed = middleware.flush(direction);

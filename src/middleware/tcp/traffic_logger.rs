@@ -1,5 +1,3 @@
-use std::borrow::Cow;
-
 use crate::middleware::{ConnectionInfo, Direction, TcpMiddleware, TcpMiddlewareLayer};
 
 pub struct TrafficLoggerLayer;
@@ -20,8 +18,9 @@ struct TrafficLogger {
     bytes_received: usize,
 }
 
+#[async_trait::async_trait]
 impl TcpMiddleware for TrafficLogger {
-    fn on_data<'a>(&mut self, direction: Direction, data: Cow<'a, [u8]>) -> Cow<'a, [u8]> {
+    async fn on_data(&mut self, direction: Direction, data: Vec<u8>) -> Vec<u8> {
         let n = data.len();
         let host = &self.target_host;
         match direction {

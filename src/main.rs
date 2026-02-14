@@ -1,8 +1,8 @@
 mod middleware;
 
-use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use middleware::tcp::{FindReplaceLayer, TrafficLoggerLayer};
+use middleware::tcp::{FindReplaceLayer, LatencyInjectorLayer, TrafficLoggerLayer};
 use middleware::{ConnectionInfo, Direction, TcpMiddleware, TcpMiddlewareLayer, flush_middlewares};
 
 #[tokio::main]
@@ -31,6 +31,9 @@ async fn main() -> anyhow::Result<()> {
         Box::new(FindReplaceLayer {
             find: b"</TITLE>".to_vec(),
             replace: b"</title>".to_vec(),
+        }),
+        Box::new(LatencyInjectorLayer {
+            delay: Duration::from_millis(100),
         }),
         Box::new(TrafficLoggerLayer),
     ]);
@@ -134,15 +137,15 @@ async fn handle_connect(
                     Err(e) => return Err(e.into()),
                 };
                 if n == 0 {
-                    let data = flush_middlewares(&mut mws, Direction::Upstream);
+                    let data = flush_middlewares(&mut mws, Direction::Upstream).await;
                     if !data.is_empty() {
                         upstream_tls.write_all(&data).await?;
                     }
                     break;
                 }
-                let mut data: Cow<[u8]> = Cow::Borrowed(&buf_c[..n]);
+                let mut data = buf_c[..n].to_vec();
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Upstream, data);
+                    data = mw.on_data(Direction::Upstream, data).await;
                 }
                 upstream_tls.write_all(&data).await?;
             }
@@ -153,15 +156,15 @@ async fn handle_connect(
                     Err(e) => return Err(e.into()),
                 };
                 if n == 0 {
-                    let data = flush_middlewares(&mut mws, Direction::Downstream);
+                    let data = flush_middlewares(&mut mws, Direction::Downstream).await;
                     if !data.is_empty() {
                         client_tls.write_all(&data).await?;
                     }
                     break;
                 }
-                let mut data: Cow<[u8]> = Cow::Borrowed(&buf_s[..n]);
+                let mut data = buf_s[..n].to_vec();
                 for mw in &mut mws {
-                    data = mw.on_data(Direction::Downstream, data);
+                    data = mw.on_data(Direction::Downstream, data).await;
                 }
                 client_tls.write_all(&data).await?;
             }
