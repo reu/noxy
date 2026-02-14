@@ -1,10 +1,12 @@
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use axum::Router;
 use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
-use noxy::middleware::TcpMiddlewareLayer;
-use noxy::middleware::tcp::FindReplaceLayer;
+use noxy::http::{Body, BoxError, HttpService};
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
@@ -42,15 +44,17 @@ async fn start_upstream(body: &'static str) -> SocketAddr {
     listener_handle.listening().await.unwrap()
 }
 
-/// Build a proxy and spawn its accept loop. Returns the proxy's listen address.
-async fn start_proxy(middlewares: Vec<Box<dyn TcpMiddlewareLayer>>) -> SocketAddr {
+/// Build a proxy with optional HTTP layers and spawn its accept loop.
+async fn start_proxy(
+    layers: Vec<Box<dyn Fn(HttpService) -> HttpService + Send + Sync>>,
+) -> SocketAddr {
     let mut builder = Proxy::builder()
         .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
         .unwrap()
         .danger_accept_invalid_upstream_certs();
 
-    for mw in middlewares {
-        builder = builder.middleware_boxed(mw);
+    for layer in layers {
+        builder = builder.http_layer(BoxedLayer(layer));
     }
 
     let proxy = builder.build();
@@ -83,6 +87,44 @@ fn http_client(proxy_addr: SocketAddr) -> reqwest::Client {
         .unwrap()
 }
 
+/// Wrapper to turn a boxed closure into a tower Layer for testing.
+struct BoxedLayer(Box<dyn Fn(HttpService) -> HttpService + Send + Sync>);
+
+impl tower::Layer<HttpService> for BoxedLayer {
+    type Service = HttpService;
+    fn layer(&self, inner: HttpService) -> HttpService {
+        (self.0)(inner)
+    }
+}
+
+/// A tower Service that adds a response header, wrapping an inner service.
+struct AddResponseHeader {
+    inner: HttpService,
+    name: http::HeaderName,
+    value: http::HeaderValue,
+}
+
+impl tower::Service<http::Request<Body>> for AddResponseHeader {
+    type Response = http::Response<Body>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<http::Response<Body>, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: http::Request<Body>) -> Self::Future {
+        let fut = self.inner.call(req);
+        let name = self.name.clone();
+        let value = self.value.clone();
+        Box::pin(async move {
+            let mut resp = fut.await?;
+            resp.headers_mut().insert(name, value);
+            Ok(resp)
+        })
+    }
+}
+
 #[tokio::test]
 async fn proxy_relays_data() {
     let upstream_addr = start_upstream("hello world").await;
@@ -99,11 +141,14 @@ async fn proxy_relays_data() {
 }
 
 #[tokio::test]
-async fn proxy_applies_find_replace() {
-    let upstream_addr = start_upstream("hello foo world").await;
-    let proxy_addr = start_proxy(vec![Box::new(FindReplaceLayer {
-        find: b"foo".to_vec(),
-        replace: b"bar".to_vec(),
+async fn proxy_applies_http_layer() {
+    let upstream_addr = start_upstream("hello").await;
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        tower::util::BoxService::new(AddResponseHeader {
+            inner,
+            name: http::HeaderName::from_static("x-proxy"),
+            value: http::HeaderValue::from_static("noxy"),
+        })
     })])
     .await;
     let client = http_client(proxy_addr);
@@ -114,24 +159,27 @@ async fn proxy_applies_find_replace() {
         .await
         .unwrap();
 
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("hello bar world"),
-        "expected find/replace to transform 'foo' to 'bar', got: {body}"
-    );
+    assert_eq!(resp.headers().get("x-proxy").unwrap(), "noxy");
+    assert_eq!(resp.text().await.unwrap(), "hello");
 }
 
 #[tokio::test]
-async fn proxy_chains_multiple_middlewares() {
-    let upstream_addr = start_upstream("aaa").await;
+async fn proxy_chains_http_layers() {
+    let upstream_addr = start_upstream("hello").await;
     let proxy_addr = start_proxy(vec![
-        Box::new(FindReplaceLayer {
-            find: b"aaa".to_vec(),
-            replace: b"bbb".to_vec(),
+        Box::new(|inner: HttpService| {
+            tower::util::BoxService::new(AddResponseHeader {
+                inner,
+                name: http::HeaderName::from_static("x-first"),
+                value: http::HeaderValue::from_static("1"),
+            })
         }),
-        Box::new(FindReplaceLayer {
-            find: b"bbb".to_vec(),
-            replace: b"ccc".to_vec(),
+        Box::new(|inner: HttpService| {
+            tower::util::BoxService::new(AddResponseHeader {
+                inner,
+                name: http::HeaderName::from_static("x-second"),
+                value: http::HeaderValue::from_static("2"),
+            })
         }),
     ])
     .await;
@@ -143,11 +191,8 @@ async fn proxy_chains_multiple_middlewares() {
         .await
         .unwrap();
 
-    let body = resp.text().await.unwrap();
-    assert!(
-        body.contains("ccc"),
-        "expected chained find/replace aaa→bbb→ccc, got: {body}"
-    );
+    assert_eq!(resp.headers().get("x-first").unwrap(), "1");
+    assert_eq!(resp.headers().get("x-second").unwrap(), "2");
 }
 
 #[tokio::test]

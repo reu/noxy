@@ -1,16 +1,21 @@
-pub mod middleware;
+pub mod http;
 
+use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use ::http::{Request, Response};
 use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tower::Service;
 
-use middleware::{ConnectionInfo, Direction, TcpMiddlewareLayer, flush_middlewares};
+use http::{Body, BoxError, ForwardService, HttpService};
+
+type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
 /// A `ServerCertVerifier` that accepts any certificate. Used when
 /// `danger_accept_invalid_upstream_certs` is enabled on the builder.
@@ -128,7 +133,7 @@ impl CertificateAuthority {
 /// Builder for configuring a [`Proxy`].
 pub struct ProxyBuilder {
     ca: Option<CertificateAuthority>,
-    middlewares: Vec<Box<dyn TcpMiddlewareLayer>>,
+    http_layers: Vec<LayerFn>,
     accept_invalid_upstream_certs: bool,
 }
 
@@ -155,15 +160,21 @@ impl ProxyBuilder {
         self
     }
 
-    /// Add a TCP middleware layer.
-    pub fn middleware(mut self, layer: impl TcpMiddlewareLayer + 'static) -> Self {
-        self.middlewares.push(Box::new(layer));
-        self
-    }
-
-    /// Add an already-boxed TCP middleware layer.
-    pub fn middleware_boxed(mut self, layer: Box<dyn TcpMiddlewareLayer>) -> Self {
-        self.middlewares.push(layer);
+    /// Add a tower HTTP layer.
+    ///
+    /// Layers wrap the inner service in an onion model. The innermost service
+    /// forwards requests to the upstream server. Each layer can inspect/modify
+    /// the request before forwarding and the response after.
+    pub fn http_layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<HttpService> + Send + Sync + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send,
+    {
+        self.http_layers.push(Box::new(move |svc| {
+            tower::util::BoxService::new(layer.layer(svc))
+        }));
         self
     }
 
@@ -179,7 +190,7 @@ impl ProxyBuilder {
         let ca = self.ca.expect("CertificateAuthority must be set");
         Proxy {
             ca: Arc::new(ca),
-            middlewares: Arc::new(self.middlewares),
+            http_layers: Arc::new(self.http_layers),
             accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
         }
     }
@@ -191,7 +202,7 @@ impl ProxyBuilder {
 #[derive(Clone)]
 pub struct Proxy {
     ca: Arc<CertificateAuthority>,
-    middlewares: Arc<Vec<Box<dyn TcpMiddlewareLayer>>>,
+    http_layers: Arc<Vec<LayerFn>>,
     accept_invalid_upstream_certs: bool,
 }
 
@@ -200,7 +211,7 @@ impl Proxy {
     pub fn builder() -> ProxyBuilder {
         ProxyBuilder {
             ca: None,
-            middlewares: Vec::new(),
+            http_layers: Vec::new(),
             accept_invalid_upstream_certs: false,
         }
     }
@@ -227,7 +238,7 @@ impl Proxy {
     pub async fn handle_connection(
         &self,
         stream: TcpStream,
-        client_addr: SocketAddr,
+        _client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let mut reader = BufReader::new(stream);
 
@@ -257,14 +268,6 @@ impl Proxy {
         };
         eprintln!("CONNECT to {host}:{port}");
 
-        let info = ConnectionInfo {
-            client_addr,
-            target_host: host.to_string(),
-            target_port: port,
-        };
-        let mut mws: Vec<Box<dyn middleware::TcpMiddleware + Send>> =
-            self.middlewares.iter().map(|f| f.create(&info)).collect();
-
         // Send 200 to client
         let mut client_stream = reader.into_inner();
         client_stream
@@ -288,7 +291,7 @@ impl Proxy {
 
         let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
         let server_name: ServerName<'static> = host.to_string().try_into()?;
-        let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+        let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
 
         // Generate fake cert for the host, signed by our CA
         let (cert_der, key_der) = self.ca.generate_cert(host)?;
@@ -298,64 +301,34 @@ impl Proxy {
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let mut client_tls = acceptor.accept(client_stream).await?;
 
-        // Relay loop
-        let mut buf_c = vec![0u8; 8192];
-        let mut buf_s = vec![0u8; 8192];
-        let mut data = Vec::with_capacity(8192);
+        // Build tower service chain for this connection
+        let mut service: HttpService =
+            tower::util::BoxService::new(ForwardService::new(upstream_tls));
+        for layer_fn in self.http_layers.iter() {
+            service = layer_fn(service);
+        }
 
+        // HTTP relay loop
         loop {
-            tokio::select! {
-                result = client_tls.read(&mut buf_c) => {
-                    let n = match result {
-                        Ok(n) => n,
-                        Err(e) if is_tls_close(&e) => 0,
-                        Err(e) => return Err(e.into()),
-                    };
-                    if n == 0 {
-                        flush_middlewares(&mut mws, Direction::Upstream, &mut data).await;
-                        if !data.is_empty() {
-                            upstream_tls.write_all(&data).await?;
-                        }
-                        break;
-                    }
-                    data.clear();
-                    data.extend_from_slice(&buf_c[..n]);
-                    for mw in &mut mws {
-                        mw.on_data(Direction::Upstream, &mut data).await;
-                    }
-                    upstream_tls.write_all(&data).await?;
-                }
-                result = upstream_tls.read(&mut buf_s) => {
-                    let n = match result {
-                        Ok(n) => n,
-                        Err(e) if is_tls_close(&e) => 0,
-                        Err(e) => return Err(e.into()),
-                    };
-                    if n == 0 {
-                        flush_middlewares(&mut mws, Direction::Downstream, &mut data).await;
-                        if !data.is_empty() {
-                            client_tls.write_all(&data).await?;
-                        }
-                        break;
-                    }
-                    data.clear();
-                    data.extend_from_slice(&buf_s[..n]);
-                    for mw in &mut mws {
-                        mw.on_data(Direction::Downstream, &mut data).await;
-                    }
-                    client_tls.write_all(&data).await?;
-                }
-            }
+            let request = match http::read_request(&mut client_tls).await {
+                Ok(req) => req,
+                Err(_) => break,
+            };
+
+            poll_fn(|cx| service.poll_ready(cx))
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let response = service
+                .call(request)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            http::write_response(&mut client_tls, response).await?;
         }
 
         let _ = client_tls.shutdown().await;
-        let _ = upstream_tls.shutdown().await;
 
         eprintln!("Connection closed");
         Ok(())
     }
-}
-
-fn is_tls_close(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::UnexpectedEof
 }

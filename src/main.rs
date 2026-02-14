@@ -1,8 +1,5 @@
-use std::time::Duration;
-
 use clap::Parser;
-use noxy::middleware::tcp::{FindReplaceLayer, LatencyInjectorLayer, TrafficLoggerLayer};
-use noxy::{CertificateAuthority, Proxy};
+use noxy::Proxy;
 
 #[derive(Parser)]
 #[command(name = "noxy", about = "TLS man-in-the-middle proxy")]
@@ -29,28 +26,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.generate {
-        let ca = CertificateAuthority::generate()?;
+        let ca = noxy::CertificateAuthority::generate()?;
         ca.to_pem_files(&cli.cert, &cli.key)?;
         eprintln!("Generated CA certificate: {}", cli.cert);
         eprintln!("Generated CA private key: {}", cli.key);
         return Ok(());
     }
 
-    let proxy = Proxy::builder()
-        .ca_pem_files(&cli.cert, &cli.key)?
-        .middleware(FindReplaceLayer {
-            find: b"<TITLE>".to_vec(),
-            replace: b"<title>".to_vec(),
-        })
-        .middleware(FindReplaceLayer {
-            find: b"</TITLE>".to_vec(),
-            replace: b"</title>".to_vec(),
-        })
-        .middleware(LatencyInjectorLayer {
-            delay: Duration::from_millis(100),
-        })
-        .middleware(TrafficLoggerLayer)
-        .build();
+    let proxy = Proxy::builder().ca_pem_files(&cli.cert, &cli.key)?.build();
 
     proxy.listen(&cli.listen).await
 }
