@@ -1,10 +1,11 @@
 pub mod http;
 
-use std::future::poll_fn;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use ::http::{Request, Response};
+use hyper::body::Incoming;
+use hyper_util::rt::TokioIo;
 use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
@@ -13,7 +14,7 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 
-use http::{Body, BoxError, ForwardService, HttpService};
+use http::{Body, BoxError, ForwardService, HttpService, incoming_to_body};
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
@@ -196,6 +197,31 @@ impl ProxyBuilder {
     }
 }
 
+/// Adapter that bridges a tower `Service` (which uses `&mut self`) to hyper's
+/// `Service` trait (which uses `&self`). Uses a `Mutex` for interior mutability;
+/// since HTTP/1.1 processes requests sequentially, the lock is never contended.
+struct HyperServiceAdapter {
+    inner: Arc<tokio::sync::Mutex<HttpService>>,
+}
+
+impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
+    type Response = Response<Body>;
+    type Error = BoxError;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Response<Body>, BoxError>> + Send>,
+    >;
+
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let req = req.map(incoming_to_body);
+            let mut svc = inner.lock().await;
+            std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
+            svc.call(req).await
+        })
+    }
+}
+
 /// A configured TLS MITM proxy.
 ///
 /// Cheaply cloneable via internal `Arc`s.
@@ -299,34 +325,35 @@ impl Proxy {
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
-        let mut client_tls = acceptor.accept(client_stream).await?;
+        let client_tls = acceptor.accept(client_stream).await?;
+
+        // Hyper client handshake on upstream
+        let upstream_io = TokioIo::new(upstream_tls);
+        let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                eprintln!("Upstream connection error: {e}");
+            }
+        });
 
         // Build tower service chain for this connection
-        let mut service: HttpService =
-            tower::util::BoxService::new(ForwardService::new(upstream_tls));
+        let mut service: HttpService = tower::util::BoxService::new(ForwardService::new(sender));
         for layer_fn in self.http_layers.iter() {
             service = layer_fn(service);
         }
 
-        // HTTP relay loop
-        loop {
-            let request = match http::read_request(&mut client_tls).await {
-                Ok(req) => req,
-                Err(_) => break,
-            };
+        // Wrap tower service for hyper: hyper's Service::call takes &self,
+        // so we use a Mutex for interior mutability. HTTP/1.1 is sequential,
+        // so the lock is never contended.
+        let hyper_service = HyperServiceAdapter {
+            inner: Arc::new(tokio::sync::Mutex::new(service)),
+        };
 
-            poll_fn(|cx| service.poll_ready(cx))
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let response = service
-                .call(request)
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            http::write_response(&mut client_tls, response).await?;
-        }
-
-        let _ = client_tls.shutdown().await;
+        // Hyper server on client TLS — handles the entire request/response loop
+        let client_io = TokioIo::new(client_tls);
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(client_io, hyper_service)
+            .await?;
 
         eprintln!("Connection closed");
         Ok(())
