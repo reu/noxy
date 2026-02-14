@@ -1,6 +1,9 @@
 pub mod http;
 pub mod middleware;
 
+#[cfg(feature = "config")]
+pub mod config;
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

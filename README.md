@@ -5,10 +5,12 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 ## Features
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
+- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, and mock responses
+- **Conditional rules** -- apply middleware only to requests matching a path or path prefix
+- **TOML config file** -- configure the proxy and middleware rules declaratively
 - Per-host certificate generation on the fly, signed by a user-provided CA
 - HTTP/1.1 and HTTP/2 support (auto-negotiated via ALPN)
 - Streaming bodies -- middleware can process data as it arrives without buffering
-- Upstream TLS verification using Mozilla root certificates
 - Async I/O with Tokio and Hyper
 
 ## Library Usage
@@ -59,6 +61,120 @@ Instead of passing `--cacert` every time, you can install `ca-cert.pem` into you
 
 **Important:** Only do this in development/testing environments. Remove the CA when you're done.
 
+## CLI
+
+The CLI provides flags for common middleware without needing a config file.
+
+```bash
+Usage: noxy [OPTIONS]
+
+Options:
+      --config <CONFIG>        Path to TOML config file
+      --cert <CERT>            Path to CA certificate PEM file [default: ca-cert.pem]
+      --key <KEY>              Path to CA private key PEM file [default: ca-key.pem]
+      --listen <LISTEN>        Listen address [default: 127.0.0.1:8080]
+      --generate               Generate a new CA cert+key pair and exit
+      --log                    Enable traffic logging
+      --log-bodies             Log request/response bodies (implies --log)
+      --latency <LATENCY>      Add global latency (e.g., "200ms", "100ms..500ms")
+      --bandwidth <BANDWIDTH>  Global bandwidth limit in bytes per second
+      --accept-invalid-certs   Accept invalid upstream TLS certificates
+  -h, --help                   Print help
+
+# Log all traffic
+noxy --log
+
+# Log traffic including request/response bodies
+noxy --log-bodies
+
+# Add 200ms latency to every request
+noxy --latency 200ms
+
+# Add random latency between 100ms and 500ms
+noxy --latency 100ms..500ms
+
+# Limit bandwidth to 10 KB/s
+noxy --bandwidth 10240
+
+# Combine multiple flags
+noxy --log --latency 200ms --bandwidth 10240
+
+# Accept invalid upstream certificates (e.g. self-signed)
+noxy --accept-invalid-certs
+
+# Custom listen address and CA paths
+noxy --listen 0.0.0.0:9090 --cert my-ca.pem --key my-ca-key.pem
+```
+
+## Config File
+
+For conditional rules and more complex setups, use a TOML config file.
+
+```bash
+noxy --config proxy.toml
+```
+
+CLI flags override config file settings for global options (listen address, CA paths, etc.) and append additional unconditional rules.
+
+### Example config
+
+```toml
+listen = "127.0.0.1:8080"
+
+[ca]
+cert = "ca-cert.pem"
+key = "ca-key.pem"
+
+# accept_invalid_upstream_certs = true
+
+# Log all traffic
+[[rules]]
+log = true
+
+# Log with request/response bodies
+# [[rules]]
+# log = { bodies = true }
+
+# Add 200ms latency to API requests
+[[rules]]
+match = { path_prefix = "/api" }
+latency = "200ms"
+
+# Simulate slow downloads with random latency and bandwidth limit
+[[rules]]
+match = { path_prefix = "/downloads" }
+latency = "50ms..200ms"
+bandwidth = 10240
+
+# Inject faults on a specific endpoint
+[[rules]]
+match = { path = "/flaky" }
+fault = { error_rate = 0.5, abort_rate = 0.02 }
+
+# Mock a health check endpoint
+[[rules]]
+match = { path = "/health" }
+respond = { body = "ok" }
+
+# Return 503 for all paths under /fail
+[[rules]]
+match = { path_prefix = "/fail" }
+respond = { status = 503, body = "service unavailable" }
+```
+
+### Rules
+
+Each rule has an optional `match` condition and one or more middleware configs. Rules without a `match` apply to all requests.
+
+| Field       | Description                                              |
+|-------------|----------------------------------------------------------|
+| `match`     | `{ path = "/exact" }` or `{ path_prefix = "/prefix" }`  |
+| `log`       | `true` or `{ bodies = true }`                            |
+| `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |
+| `bandwidth` | Bytes per second throughput limit                         |
+| `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
+| `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
+
 ## How It Works
 
 Normal HTTPS creates an encrypted tunnel between client and server -- nobody in the middle can read the traffic. Noxy breaks that tunnel into **two separate TLS sessions** and sits in between, with your middleware pipeline processing decoded HTTP traffic.
@@ -67,27 +183,27 @@ Normal HTTPS creates an encrypted tunnel between client and server -- nobody in 
 
 ```
 Client (curl)            Noxy                       Server (example.com)
-     |                     |                               |
-     |--- CONNECT host --->|                               |
-     |<-- 200 OK ---------|                               |
-     |                     |--- TLS handshake ------------>|
-     |                     |   (real cert verified)        |
-     |                     |                               |
-     |   Noxy generates a  |                               |
-     |   fake cert for     |                               |
-     |   "example.com"     |                               |
-     |   signed by our CA  |                               |
-     |                     |                               |
-     |<- TLS handshake --->|                               |
-     |   (fake cert)       |                               |
-     |                     |                               |
-     |== TLS session 1 ====|====== TLS session 2 =========|
-     |                     |                               |
+     |                     |                                |
+     |--- CONNECT host --->|                                |
+     |<-- 200 OK ----------|                                |
+     |                     |--- TLS handshake ------------->|
+     |                     |   (real cert verified)         |
+     |                     |                                |
+     |   Noxy generates a  |                                |
+     |   fake cert for     |                                |
+     |   "example.com"     |                                |
+     |   signed by our CA  |                                |
+     |                     |                                |
+     |<- TLS handshake --->|                                |
+     |   (fake cert)       |                                |
+     |                     |                                |
+     |== TLS session 1 ====|======= TLS session 2 ==========|
+     |                     |                                |
      | "GET / HTTP/1.1"    |  tower middleware pipeline     |
-     |--- encrypted ------>|  [Layer] -> [Layer] -> upstream
-     |                     |                               |
-     |                     |           response + layers   |
-     |<--- re-encrypted ---|  upstream -> [Layer] -> [Layer]
+     |--- encrypted ------>| [Layer] -> [Layer] -> upstream |
+     |                     |                                |
+     |                     |           response + layers    |
+     |<--- re-encrypted ---| upstream -> [Layer] -> [Layer] |
 ```
 
 ### Step by step

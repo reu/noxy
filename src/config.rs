@@ -1,0 +1,433 @@
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use http::Request;
+use serde::Deserialize;
+
+use crate::http::Body;
+use crate::middleware::{
+    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, SetResponse, TrafficLogger,
+};
+
+/// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
+#[derive(Debug, Default, Deserialize)]
+pub struct ProxyConfig {
+    /// Listen address, e.g. "127.0.0.1:8080".
+    pub listen: Option<String>,
+
+    /// CA certificate and key paths.
+    pub ca: Option<CaConfig>,
+
+    /// Accept invalid upstream TLS certificates.
+    #[serde(default)]
+    pub accept_invalid_upstream_certs: bool,
+
+    /// Ordered list of middleware rules.
+    #[serde(default)]
+    pub rules: Vec<RuleConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CaConfig {
+    pub cert: String,
+    pub key: String,
+}
+
+/// A single rule. Has an optional condition and one or more middleware configs.
+#[derive(Debug, Default, Deserialize)]
+pub struct RuleConfig {
+    #[serde(rename = "match")]
+    pub match_config: Option<MatchConfig>,
+
+    pub log: Option<LogConfig>,
+    pub latency: Option<DurationOrRange>,
+    pub bandwidth: Option<u64>,
+    pub fault: Option<FaultConfig>,
+    pub respond: Option<RespondConfig>,
+}
+
+/// Request matching condition.
+#[derive(Debug, Deserialize)]
+pub struct MatchConfig {
+    /// Exact path match.
+    pub path: Option<String>,
+    /// Path prefix match.
+    pub path_prefix: Option<String>,
+}
+
+/// Log configuration: `true` for defaults, or `{ bodies = true }` for detail.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum LogConfig {
+    Enabled(bool),
+    Detailed(LogDetailConfig),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LogDetailConfig {
+    #[serde(default)]
+    pub bodies: bool,
+}
+
+/// A duration or range, deserialized from strings like `"200ms"` or `"100ms..500ms"`.
+#[derive(Debug)]
+pub enum DurationOrRange {
+    Fixed(Duration),
+    Range(Duration, Duration),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FaultConfig {
+    #[serde(default)]
+    pub error_rate: f64,
+    #[serde(default)]
+    pub abort_rate: f64,
+    pub error_status: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RespondConfig {
+    pub body: String,
+    pub status: Option<u16>,
+}
+
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+    if let Some(ms) = s.strip_suffix("ms") {
+        let n: u64 = ms.parse().map_err(|e| format!("invalid duration: {e}"))?;
+        Ok(Duration::from_millis(n))
+    } else if let Some(secs) = s.strip_suffix('s') {
+        let n: f64 = secs.parse().map_err(|e| format!("invalid duration: {e}"))?;
+        Ok(Duration::from_secs_f64(n))
+    } else {
+        Err(format!("expected duration like '200ms' or '1s', got '{s}'"))
+    }
+}
+
+impl FromStr for DurationOrRange {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some((lo, hi)) = s.split_once("..") {
+            let lo = parse_duration(lo)?;
+            let hi = parse_duration(hi)?;
+            Ok(DurationOrRange::Range(lo, hi))
+        } else {
+            let d = parse_duration(s)?;
+            Ok(DurationOrRange::Fixed(d))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DurationOrRange {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+type Predicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
+
+impl MatchConfig {
+    fn into_predicate(self) -> Predicate {
+        Arc::new(move |req: &Request<Body>| {
+            let req_path = req.uri().path();
+            if let Some(ref exact) = self.path {
+                return req_path == exact;
+            }
+            if let Some(ref prefix) = self.path_prefix {
+                return req_path.starts_with(prefix.as_str());
+            }
+            true
+        })
+    }
+}
+
+impl ProxyConfig {
+    /// Parse config from a TOML string.
+    pub fn from_toml(s: &str) -> anyhow::Result<Self> {
+        Ok(toml::from_str(s)?)
+    }
+
+    /// Load config from a TOML file.
+    pub fn from_toml_file(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        Self::from_toml(&content)
+    }
+
+    /// Append rules (used to merge CLI-derived rules).
+    pub fn append_rules(&mut self, rules: Vec<RuleConfig>) {
+        self.rules.extend(rules);
+    }
+
+    /// Build a [`ProxyBuilder`](crate::ProxyBuilder) from this config.
+    pub fn into_builder(self) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut builder = crate::Proxy::builder();
+
+        if let Some(ca) = self.ca {
+            builder = builder.ca_pem_files(&ca.cert, &ca.key)?;
+        }
+
+        if self.accept_invalid_upstream_certs {
+            builder = builder.danger_accept_invalid_upstream_certs();
+        }
+
+        for rule in self.rules {
+            builder = apply_rule(builder, rule)?;
+        }
+
+        Ok(builder)
+    }
+}
+
+fn apply_rule(
+    mut builder: crate::ProxyBuilder,
+    rule: RuleConfig,
+) -> anyhow::Result<crate::ProxyBuilder> {
+    let predicate = rule.match_config.map(|m| m.into_predicate());
+
+    if let Some(log_config) = rule.log {
+        let logger = build_traffic_logger(log_config);
+        builder = apply_layer(builder, &predicate, logger);
+    }
+
+    if let Some(latency_config) = rule.latency {
+        let injector = build_latency_injector(latency_config);
+        builder = apply_layer(builder, &predicate, injector);
+    }
+
+    if let Some(bps) = rule.bandwidth {
+        builder = apply_layer(builder, &predicate, BandwidthThrottle::new(bps));
+    }
+
+    if let Some(fault_config) = rule.fault {
+        let injector = build_fault_injector(fault_config)?;
+        builder = apply_layer(builder, &predicate, injector);
+    }
+
+    if let Some(respond_config) = rule.respond {
+        let responder = build_set_response(respond_config)?;
+        builder = apply_layer(builder, &predicate, responder);
+    }
+
+    Ok(builder)
+}
+
+fn apply_layer<L>(
+    builder: crate::ProxyBuilder,
+    predicate: &Option<Predicate>,
+    layer: L,
+) -> crate::ProxyBuilder
+where
+    L: tower::Layer<crate::http::HttpService> + Send + Sync + 'static,
+    L::Service: tower::Service<
+            Request<Body>,
+            Response = http::Response<Body>,
+            Error = crate::http::BoxError,
+        > + Send
+        + 'static,
+    <L::Service as tower::Service<Request<Body>>>::Future: Send,
+{
+    if let Some(pred) = predicate {
+        let pred = pred.clone();
+        builder.http_layer(Conditional::new().when(move |req| pred(req), layer))
+    } else {
+        builder.http_layer(layer)
+    }
+}
+
+fn build_traffic_logger(config: LogConfig) -> TrafficLogger {
+    match config {
+        LogConfig::Enabled(true) => TrafficLogger::new(),
+        LogConfig::Enabled(false) => TrafficLogger::new(), // no-op but included
+        LogConfig::Detailed(detail) => TrafficLogger::new().log_bodies(detail.bodies),
+    }
+}
+
+fn build_latency_injector(config: DurationOrRange) -> LatencyInjector {
+    match config {
+        DurationOrRange::Fixed(d) => LatencyInjector::fixed(d),
+        DurationOrRange::Range(lo, hi) => LatencyInjector::uniform(lo..hi),
+    }
+}
+
+fn build_fault_injector(config: FaultConfig) -> anyhow::Result<FaultInjector> {
+    let mut injector = FaultInjector::new()
+        .error_rate(config.error_rate)
+        .abort_rate(config.abort_rate);
+
+    if let Some(status) = config.error_status {
+        let status = http::StatusCode::from_u16(status)
+            .map_err(|e| anyhow::anyhow!("invalid error_status: {e}"))?;
+        injector = injector.error_status(status);
+    }
+
+    Ok(injector)
+}
+
+fn build_set_response(config: RespondConfig) -> anyhow::Result<SetResponse> {
+    let status = config.status.unwrap_or(200);
+    let status = http::StatusCode::from_u16(status)
+        .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
+    Ok(SetResponse::new(status, config.body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_fixed_millis() {
+        let d: DurationOrRange = "200ms".parse().unwrap();
+        assert!(matches!(d, DurationOrRange::Fixed(d) if d == Duration::from_millis(200)));
+    }
+
+    #[test]
+    fn parse_fixed_seconds() {
+        let d: DurationOrRange = "1s".parse().unwrap();
+        assert!(matches!(d, DurationOrRange::Fixed(d) if d == Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn parse_fixed_fractional_seconds() {
+        let d: DurationOrRange = "2.5s".parse().unwrap();
+        assert!(matches!(d, DurationOrRange::Fixed(d) if d == Duration::from_secs_f64(2.5)));
+    }
+
+    #[test]
+    fn parse_range() {
+        let d: DurationOrRange = "100ms..500ms".parse().unwrap();
+        assert!(matches!(
+            d,
+            DurationOrRange::Range(lo, hi)
+                if lo == Duration::from_millis(100) && hi == Duration::from_millis(500)
+        ));
+    }
+
+    #[test]
+    fn parse_invalid() {
+        assert!("foo".parse::<DurationOrRange>().is_err());
+        assert!("200".parse::<DurationOrRange>().is_err());
+    }
+
+    #[test]
+    fn deserialize_full_config() {
+        let toml = r#"
+            listen = "127.0.0.1:9090"
+            accept_invalid_upstream_certs = true
+
+            [ca]
+            cert = "cert.pem"
+            key = "key.pem"
+
+            [[rules]]
+            log = true
+
+            [[rules]]
+            log = { bodies = true }
+
+            [[rules]]
+            match = { path_prefix = "/api" }
+            latency = "200ms"
+
+            [[rules]]
+            match = { path_prefix = "/downloads" }
+            latency = "50ms..200ms"
+            bandwidth = 10240
+
+            [[rules]]
+            match = { path = "/flaky" }
+            fault = { error_rate = 0.5, abort_rate = 0.02 }
+
+            [[rules]]
+            match = { path = "/health" }
+            respond = { body = "ok" }
+
+            [[rules]]
+            match = { path_prefix = "/fail" }
+            respond = { status = 503, body = "down" }
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.listen.as_deref(), Some("127.0.0.1:9090"));
+        assert!(config.accept_invalid_upstream_certs);
+
+        let ca = config.ca.unwrap();
+        assert_eq!(ca.cert, "cert.pem");
+        assert_eq!(ca.key, "key.pem");
+
+        assert_eq!(config.rules.len(), 7);
+
+        // Rule 0: log = true
+        assert!(matches!(
+            config.rules[0].log,
+            Some(LogConfig::Enabled(true))
+        ));
+
+        // Rule 1: log = { bodies = true }
+        assert!(matches!(
+            config.rules[1].log,
+            Some(LogConfig::Detailed(LogDetailConfig { bodies: true }))
+        ));
+
+        // Rule 2: latency = "200ms"
+        assert!(config.rules[2].match_config.is_some());
+        assert!(matches!(
+            config.rules[2].latency,
+            Some(DurationOrRange::Fixed(d)) if d == Duration::from_millis(200)
+        ));
+
+        // Rule 3: latency range + bandwidth
+        assert!(matches!(
+            config.rules[3].latency,
+            Some(DurationOrRange::Range(lo, hi))
+                if lo == Duration::from_millis(50) && hi == Duration::from_millis(200)
+        ));
+        assert_eq!(config.rules[3].bandwidth, Some(10240));
+
+        // Rule 4: fault
+        let fault = config.rules[4].fault.as_ref().unwrap();
+        assert!((fault.error_rate - 0.5).abs() < f64::EPSILON);
+        assert!((fault.abort_rate - 0.02).abs() < f64::EPSILON);
+
+        // Rule 5: respond 200
+        let respond = config.rules[5].respond.as_ref().unwrap();
+        assert_eq!(respond.body, "ok");
+        assert_eq!(respond.status, None);
+
+        // Rule 6: respond 503
+        let respond = config.rules[6].respond.as_ref().unwrap();
+        assert_eq!(respond.body, "down");
+        assert_eq!(respond.status, Some(503));
+    }
+
+    #[test]
+    fn deserialize_minimal_config() {
+        let toml = "";
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert!(config.listen.is_none());
+        assert!(config.ca.is_none());
+        assert!(!config.accept_invalid_upstream_certs);
+        assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn into_builder_with_ca() {
+        let config = ProxyConfig {
+            ca: Some(CaConfig {
+                cert: "tests/dummy-cert.pem".to_string(),
+                key: "tests/dummy-key.pem".to_string(),
+            }),
+            rules: vec![RuleConfig {
+                log: Some(LogConfig::Enabled(true)),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let builder = config.into_builder();
+        assert!(builder.is_ok());
+    }
+}

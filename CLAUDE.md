@@ -29,6 +29,10 @@ Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT req
 
 ## Project Guidelines
 
-## After every Rust file change
+### Comments
+- Avoid unnecessary comments, especially section dividers (e.g., `// -- Section name --`)
+- Only add comments that genuinely help understand the code, such as explanations of non-obvious logic, examples, or important caveats
+
+### After every Rust file change
 - Run `cargo fmt` to format the code
 - Run `cargo clippy` and fix all warnings before considering the task done

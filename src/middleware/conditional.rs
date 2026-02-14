@@ -126,8 +126,6 @@ impl tower::Layer<HttpService> for Conditional {
     }
 }
 
-// -- SharedInnerService: locks the shared inner and delegates.
-
 struct SharedInnerService {
     inner: Arc<Mutex<HttpService>>,
 }
@@ -145,8 +143,6 @@ impl Service<Request<Body>> for SharedInnerService {
         self.inner.lock().unwrap().call(req)
     }
 }
-
-// -- ConditionalService
 
 pub struct ConditionalService {
     rules: Vec<(Predicate, HttpService)>,

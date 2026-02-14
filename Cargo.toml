@@ -19,7 +19,8 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-cli = ["clap"]
+config = ["serde", "toml"]
+cli = ["clap", "config"]
 
 [dependencies]
 anyhow = "1"
@@ -37,6 +38,8 @@ rustls = "0.23"
 rustls-pemfile = "2"
 rand = "0.9"
 rcgen = { version = "0.13", features = ["x509-parser"] }
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
 webpki-roots = "0.26"
 
 [dev-dependencies]
