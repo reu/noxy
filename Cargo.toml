@@ -1,7 +1,13 @@
 [package]
 name = "noxy"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+authors = ["Rodrigo Navarro <rnavarro@rnavarro.com.br>"]
+description = "TLS man-in-the-middle proxy with a pluggable middleware pipeline"
+license = "MIT"
+repository = "https://github.com/reu/noxy"
+keywords = ["proxy", "tls", "mitm", "middleware", "https"]
+categories = ["network-programming"]
 
 [lib]
 name = "noxy"
