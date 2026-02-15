@@ -23,6 +23,15 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub accept_invalid_upstream_certs: bool,
 
+    /// Timeout for the handshake phase (CONNECT, TLS, hyper handshake), e.g. "10s".
+    pub handshake_timeout: Option<DurationValue>,
+
+    /// Idle timeout for established connections, e.g. "60s".
+    pub idle_timeout: Option<DurationValue>,
+
+    /// Maximum number of concurrent connections.
+    pub max_connections: Option<usize>,
+
     /// Ordered list of middleware rules.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
@@ -68,6 +77,19 @@ pub enum LogConfig {
 pub struct LogDetailConfig {
     #[serde(default)]
     pub bodies: bool,
+}
+
+/// A single duration, deserialized from a string like `"10s"` or `"200ms"`.
+#[derive(Debug)]
+pub struct DurationValue(pub Duration);
+
+impl<'de> Deserialize<'de> for DurationValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        parse_duration(&s)
+            .map(DurationValue)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 /// A duration or range, deserialized from strings like `"200ms"` or `"100ms..500ms"`.
@@ -171,6 +193,18 @@ impl ProxyConfig {
 
         if self.accept_invalid_upstream_certs {
             builder = builder.danger_accept_invalid_upstream_certs();
+        }
+
+        if let Some(timeout) = self.handshake_timeout {
+            builder = builder.handshake_timeout(timeout.0);
+        }
+
+        if let Some(timeout) = self.idle_timeout {
+            builder = builder.idle_timeout(timeout.0);
+        }
+
+        if let Some(max) = self.max_connections {
+            builder = builder.max_connections(max);
         }
 
         for rule in self.rules {

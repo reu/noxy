@@ -855,3 +855,153 @@ fn certificate_authority_generates_valid_cert() {
     // Key should be parseable
     assert!(!key_der.secret_der().is_empty());
 }
+
+/// Spawn a proxy's accept loop on a random port and return the address.
+async fn spawn_proxy(proxy: noxy::Proxy) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, client_addr) = listener.accept().await.unwrap();
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                proxy.handle_connection(stream, client_addr).await.ok();
+            });
+        }
+    });
+
+    addr
+}
+
+#[tokio::test]
+async fn handshake_timeout_drops_slow_connection() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = Proxy::builder()
+        .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
+        .unwrap()
+        .danger_accept_invalid_upstream_certs()
+        .handshake_timeout(Duration::from_millis(200))
+        .build();
+    let proxy_addr = spawn_proxy(proxy).await;
+
+    // Connect raw TCP and send CONNECT very slowly — the proxy should drop us
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(format!("CONNECT localhost:{}", upstream_addr.port()).as_bytes())
+        .await
+        .unwrap();
+
+    // Sleep past the handshake timeout without finishing the request
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Try finishing the request — connection should be dead
+    let result = stream.write_all(b" HTTP/1.1\r\n\r\n").await;
+    if result.is_ok() {
+        // Even if the write succeeds (buffered), the read should fail
+        let mut buf = [0u8; 128];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+            .await
+            .unwrap_or(0);
+        assert_eq!(n, 0, "expected proxy to have closed the connection");
+    }
+}
+
+#[tokio::test]
+async fn handshake_timeout_allows_fast_connection() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = Proxy::builder()
+        .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
+        .unwrap()
+        .danger_accept_invalid_upstream_certs()
+        .handshake_timeout(Duration::from_secs(10))
+        .build();
+    let proxy_addr = spawn_proxy(proxy).await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn max_connections_applies_backpressure() {
+    // Upstream that takes 300ms to respond
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let app = Router::new().route(
+        "/",
+        get(|| async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            "ok"
+        }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    // Proxy allows only 2 concurrent connections
+    let proxy = Proxy::builder()
+        .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
+        .unwrap()
+        .danger_accept_invalid_upstream_certs()
+        .max_connections(2)
+        .build();
+
+    // Use the proxy's own listen() loop so the semaphore is enforced
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        proxy.listen_on(listener).await.unwrap();
+    });
+
+    let client = http_client(proxy_addr);
+
+    // Fire 3 requests concurrently — with max_connections=2, the 3rd must
+    // wait for a slot, so total time should be ~600ms (2 batches of 300ms)
+    // instead of ~300ms if all 3 ran in parallel.
+    let start = Instant::now();
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+    let (r1, r2, r3) = tokio::join!(
+        client.get(&url).send(),
+        client.get(&url).send(),
+        client.get(&url).send(),
+    );
+    let elapsed = start.elapsed();
+
+    assert_eq!(r1.unwrap().text().await.unwrap(), "ok");
+    assert_eq!(r2.unwrap().text().await.unwrap(), "ok");
+    assert_eq!(r3.unwrap().text().await.unwrap(), "ok");
+
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "3 requests with max_connections=2 and 300ms upstream should take ~600ms, took {elapsed:?}"
+    );
+}

@@ -7,6 +7,7 @@ pub mod config;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use ::http::{Request, Response};
 use hyper::body::Incoming;
@@ -16,6 +17,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 
@@ -141,6 +143,9 @@ pub struct ProxyBuilder {
     ca: Option<CertificateAuthority>,
     http_layers: Vec<LayerFn>,
     accept_invalid_upstream_certs: bool,
+    handshake_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    max_connections: Option<usize>,
 }
 
 impl ProxyBuilder {
@@ -209,6 +214,28 @@ impl ProxyBuilder {
         self.http_layer(middleware::BandwidthThrottle::new(bytes_per_second))
     }
 
+    /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
+    /// TCP connect, TLS handshakes, and hyper handshakes.
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Set an idle timeout for established connections. For HTTP/1.1 this
+    /// configures `header_read_timeout`; for HTTP/2 it configures keep-alive
+    /// pings.
+    pub fn idle_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_timeout = Some(timeout);
+        self
+    }
+
+    /// Limit the number of concurrent connections the proxy will handle.
+    /// Additional connections will be backpressured at the accept loop.
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = Some(max);
+        self
+    }
+
     /// Disable upstream TLS certificate verification. Useful for testing with
     /// self-signed upstream servers.
     pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {
@@ -224,6 +251,9 @@ impl ProxyBuilder {
             http_layers: Arc::new(self.http_layers),
             accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
             server_config_cache: Arc::new(RwLock::new(HashMap::new())),
+            handshake_timeout: self.handshake_timeout,
+            idle_timeout: self.idle_timeout,
+            max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
         }
     }
 }
@@ -261,6 +291,9 @@ pub struct Proxy {
     http_layers: Arc<Vec<LayerFn>>,
     accept_invalid_upstream_certs: bool,
     server_config_cache: Arc<RwLock<HashMap<String, Arc<ServerConfig>>>>,
+    handshake_timeout: Option<Duration>,
+    idle_timeout: Option<Duration>,
+    max_connections: Option<Arc<Semaphore>>,
 }
 
 impl Proxy {
@@ -270,23 +303,39 @@ impl Proxy {
             ca: None,
             http_layers: Vec::new(),
             accept_invalid_upstream_certs: false,
+            handshake_timeout: None,
+            idle_timeout: None,
+            max_connections: None,
         }
     }
 
     /// Bind to `addr` and run the accept loop.
     pub async fn listen(&self, addr: impl ToSocketAddrs) -> anyhow::Result<()> {
         let listener = TcpListener::bind(addr).await?;
+        self.listen_on(listener).await
+    }
+
+    /// Run the accept loop on an existing listener.
+    pub async fn listen_on(&self, listener: TcpListener) -> anyhow::Result<()> {
         let local_addr = listener.local_addr()?;
         eprintln!("Noxy listening on {local_addr}");
 
         loop {
             let (stream, addr) = listener.accept().await?;
             eprintln!("Connection from {addr}");
+
+            let permit = if let Some(ref sem) = self.max_connections {
+                Some(Arc::clone(sem).acquire_owned().await?)
+            } else {
+                None
+            };
+
             let proxy = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = proxy.handle_connection(stream, addr).await {
                     eprintln!("Error handling {addr}: {e}");
                 }
+                drop(permit);
             });
         }
     }
@@ -314,6 +363,52 @@ impl Proxy {
         stream: TcpStream,
         _client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
+        let (hyper_service, client_tls) = {
+            let handshake = self.handshake(stream);
+            if let Some(timeout) = self.handshake_timeout {
+                tokio::time::timeout(timeout, handshake)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("handshake timed out"))??
+            } else {
+                handshake.await?
+            }
+        };
+
+        let client_io = TokioIo::new(client_tls);
+        let mut builder =
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+        if let Some(idle) = self.idle_timeout {
+            builder
+                .http1()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .header_read_timeout(idle);
+            builder
+                .http2()
+                .timer(hyper_util::rt::TokioTimer::new())
+                .keep_alive_interval(Some(idle / 2))
+                .keep_alive_timeout(idle);
+        }
+
+        builder
+            .serve_connection(client_io, hyper_service)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        eprintln!("Connection closed");
+        Ok(())
+    }
+
+    /// Perform the full handshake sequence: CONNECT parsing, TLS on both
+    /// sides, and hyper handshake. Returns the tower service and client TLS
+    /// stream ready for `serve_connection`.
+    async fn handshake(
+        &self,
+        stream: TcpStream,
+    ) -> anyhow::Result<(
+        HyperServiceAdapter,
+        tokio_rustls::server::TlsStream<TcpStream>,
+    )> {
         let mut reader = BufReader::new(stream);
 
         // Read the CONNECT request line
@@ -409,20 +504,10 @@ impl Proxy {
             service = layer_fn(service);
         }
 
-        // Wrap tower service for hyper: hyper's Service::call takes &self,
-        // so we use a Mutex for interior mutability.
         let hyper_service = HyperServiceAdapter {
             inner: Arc::new(tokio::sync::Mutex::new(service)),
         };
 
-        // Hyper server on client TLS — auto-detects HTTP/1.1 vs HTTP/2
-        let client_io = TokioIo::new(client_tls);
-        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
-            .serve_connection(client_io, hyper_service)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
-
-        eprintln!("Connection closed");
-        Ok(())
+        Ok((hyper_service, client_tls))
     }
 }
