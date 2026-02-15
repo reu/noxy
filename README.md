@@ -31,6 +31,32 @@ proxy.listen("127.0.0.1:8080").await?;
 
 Any tower `Layer<HttpService>` works. The innermost service forwards requests to the upstream server; your layers wrap around it in an onion model and can inspect or modify requests before forwarding and responses after.
 
+## Installation
+
+### Pre-built binaries
+
+Download a pre-built binary from the [latest release](https://github.com/reu/noxy/releases/latest):
+
+| Platform       | Architecture | Download |
+|----------------|--------------|----------|
+| Linux (glibc)  | x86_64       | [noxy-x86_64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux (glibc)  | aarch64      | [noxy-aarch64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-unknown-linux-gnu.tar.gz) |
+| Linux (musl)   | x86_64       | [noxy-x86_64-unknown-linux-musl.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-musl.tar.gz) |
+| Linux (musl)   | aarch64      | [noxy-aarch64-unknown-linux-musl.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-unknown-linux-musl.tar.gz) |
+| macOS          | Apple Silicon | [noxy-aarch64-apple-darwin.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-apple-darwin.tar.gz) |
+
+```bash
+# Example: install on Linux x86_64
+curl -L https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv noxy /usr/local/bin/
+```
+
+### Cargo
+
+```bash
+cargo install noxy --features cli
+```
+
 ## Quick Start
 
 ### 1. Generate a CA certificate
