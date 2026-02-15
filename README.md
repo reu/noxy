@@ -37,13 +37,11 @@ Any tower `Layer<HttpService>` works. The innermost service forwards requests to
 
 Download a pre-built binary from the [latest release](https://github.com/reu/noxy/releases/latest):
 
-| Platform       | Architecture | Download |
-|----------------|--------------|----------|
-| Linux (glibc)  | x86_64       | [noxy-x86_64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-gnu.tar.gz) |
-| Linux (glibc)  | aarch64      | [noxy-aarch64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-unknown-linux-gnu.tar.gz) |
-| Linux (musl)   | x86_64       | [noxy-x86_64-unknown-linux-musl.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-musl.tar.gz) |
-| Linux (musl)   | aarch64      | [noxy-aarch64-unknown-linux-musl.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-unknown-linux-musl.tar.gz) |
-| macOS          | Apple Silicon | [noxy-aarch64-apple-darwin.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-apple-darwin.tar.gz) |
+| Platform      | Architecture | Download |
+|---------------|--------------|----------|
+| Linux         | x86_64       | [noxy-x86_64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux         | aarch64      | [noxy-aarch64-unknown-linux-gnu.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-unknown-linux-gnu.tar.gz) |
+| macOS         | Apple Silicon | [noxy-aarch64-apple-darwin.tar.gz](https://github.com/reu/noxy/releases/latest/download/noxy-aarch64-apple-darwin.tar.gz) |
 
 ```bash
 # Example: install on Linux x86_64
