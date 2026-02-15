@@ -53,8 +53,13 @@ lru = "0.16.3"
 [dev-dependencies]
 axum = "0.8"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
 futures-util = "0.3"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 tokio = { version = "1", features = ["full"] }
+
+[[bench]]
+name = "proxy"
+harness = false
