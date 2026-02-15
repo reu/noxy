@@ -1,5 +1,7 @@
 # Noxy
 
+> *The darkness your packets pass through.*
+
 A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built on [tower](https://crates.io/crates/tower), noxy gives you full access to decoded HTTP requests and responses flowing through the proxy using standard tower `Service` and `Layer` abstractions -- including all existing [tower-http](https://crates.io/crates/tower-http) middleware out of the box.
 
 ## Features
