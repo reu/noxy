@@ -5,6 +5,7 @@ pub mod middleware;
 pub mod config;
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -18,6 +19,7 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 use tracing::Instrument;
@@ -147,6 +149,7 @@ pub struct ProxyBuilder {
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_connections: Option<usize>,
+    drain_timeout: Option<Duration>,
 }
 
 impl ProxyBuilder {
@@ -237,6 +240,14 @@ impl ProxyBuilder {
         self
     }
 
+    /// Set a drain timeout for graceful shutdown. After the shutdown signal,
+    /// the proxy waits up to this duration for in-flight connections to
+    /// complete before aborting them.
+    pub fn drain_timeout(mut self, timeout: Duration) -> Self {
+        self.drain_timeout = Some(timeout);
+        self
+    }
+
     /// Disable upstream TLS certificate verification. Useful for testing with
     /// self-signed upstream servers.
     pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {
@@ -255,6 +266,7 @@ impl ProxyBuilder {
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
+            drain_timeout: self.drain_timeout,
         }
     }
 }
@@ -299,6 +311,7 @@ pub struct Proxy {
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
+    drain_timeout: Option<Duration>,
 }
 
 impl Proxy {
@@ -311,42 +324,105 @@ impl Proxy {
             handshake_timeout: None,
             idle_timeout: None,
             max_connections: None,
+            drain_timeout: None,
         }
     }
 
     /// Bind to `addr` and run the accept loop.
     pub async fn listen(&self, addr: impl ToSocketAddrs) -> anyhow::Result<()> {
+        self.listen_with_shutdown(addr, std::future::pending())
+            .await
+    }
+
+    /// Bind to `addr` and run the accept loop, stopping when `shutdown`
+    /// completes.
+    pub async fn listen_with_shutdown(
+        &self,
+        addr: impl ToSocketAddrs,
+        shutdown: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
         let listener = TcpListener::bind(addr).await?;
-        self.listen_on(listener).await
+        self.listen_on_with_shutdown(listener, shutdown).await
     }
 
     /// Run the accept loop on an existing listener.
     pub async fn listen_on(&self, listener: TcpListener) -> anyhow::Result<()> {
+        self.listen_on_with_shutdown(listener, std::future::pending())
+            .await
+    }
+
+    /// Run the accept loop on an existing listener, stopping when `shutdown`
+    /// completes.
+    pub async fn listen_on_with_shutdown(
+        &self,
+        listener: TcpListener,
+        shutdown: impl Future<Output = ()>,
+    ) -> anyhow::Result<()> {
         let local_addr = listener.local_addr()?;
         tracing::info!(%local_addr, "listening");
 
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut tasks = JoinSet::new();
+
+        tokio::pin!(shutdown);
+
         loop {
-            let (stream, addr) = listener.accept().await?;
+            tokio::select! {
+                result = listener.accept() => {
+                    let (stream, addr) = result?;
 
-            let permit = if let Some(ref sem) = self.max_connections {
-                Some(Arc::clone(sem).acquire_owned().await?)
-            } else {
-                None
-            };
+                    let permit = if let Some(ref sem) = self.max_connections {
+                        Some(Arc::clone(sem).acquire_owned().await?)
+                    } else {
+                        None
+                    };
 
-            let proxy = self.clone();
-            let span =
-                tracing::info_span!("connection", client = %addr, target = tracing::field::Empty);
-            tokio::spawn(
-                async move {
-                    if let Err(e) = proxy.handle_connection(stream, addr).await {
-                        tracing::warn!(error = %e, "connection error");
-                    }
-                    drop(permit);
+                    let proxy = self.clone();
+                    let rx = shutdown_rx.clone();
+                    let span = tracing::info_span!(
+                        "connection",
+                        client = %addr,
+                        target = tracing::field::Empty,
+                    );
+                    tasks.spawn(
+                        async move {
+                            if let Err(e) = proxy
+                                .handle_connection_inner(stream, addr, rx)
+                                .await
+                            {
+                                tracing::warn!(error = %e, "connection error");
+                            }
+                            drop(permit);
+                        }
+                        .instrument(span),
+                    );
                 }
-                .instrument(span),
-            );
+                () = &mut shutdown => {
+                    break;
+                }
+            }
         }
+
+        tracing::info!("shutdown signal received, draining connections");
+        let _ = shutdown_tx.send(true);
+        drop(shutdown_rx);
+
+        if let Some(timeout) = self.drain_timeout {
+            if tokio::time::timeout(timeout, async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await
+            .is_err()
+            {
+                tracing::warn!("drain timeout reached, aborting remaining connections");
+                tasks.abort_all();
+            }
+        } else {
+            while tasks.join_next().await.is_some() {}
+        }
+
+        tracing::info!("all connections closed");
+        Ok(())
     }
 
     fn server_config_for(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
@@ -370,7 +446,17 @@ impl Proxy {
     pub async fn handle_connection(
         &self,
         stream: TcpStream,
+        client_addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.handle_connection_inner(stream, client_addr, rx).await
+    }
+
+    async fn handle_connection_inner(
+        &self,
+        stream: TcpStream,
         _client_addr: SocketAddr,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let (hyper_service, client_tls) = {
             let handshake = self.handshake(stream);
@@ -399,10 +485,20 @@ impl Proxy {
                 .keep_alive_timeout(idle);
         }
 
-        builder
-            .serve_connection(client_io, hyper_service)
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+        let conn = builder.serve_connection(client_io, hyper_service);
+        tokio::pin!(conn);
+
+        tokio::select! {
+            result = conn.as_mut() => {
+                result.map_err(|e| anyhow::anyhow!(e))?;
+            }
+            _ = shutdown_rx.changed() => {
+                conn.as_mut().graceful_shutdown();
+                if let Err(e) = conn.await {
+                    tracing::debug!(error = %e, "connection closed during shutdown");
+                }
+            }
+        }
 
         tracing::debug!("connection closed");
         Ok(())

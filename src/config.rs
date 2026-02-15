@@ -32,6 +32,9 @@ pub struct ProxyConfig {
     /// Maximum number of concurrent connections.
     pub max_connections: Option<usize>,
 
+    /// Drain timeout for graceful shutdown, e.g. "30s".
+    pub drain_timeout: Option<DurationValue>,
+
     /// Ordered list of middleware rules.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
@@ -205,6 +208,10 @@ impl ProxyConfig {
 
         if let Some(max) = self.max_connections {
             builder = builder.max_connections(max);
+        }
+
+        if let Some(timeout) = self.drain_timeout {
+            builder = builder.drain_timeout(timeout.0);
         }
 
         for rule in self.rules {

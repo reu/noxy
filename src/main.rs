@@ -136,5 +136,9 @@ async fn main() -> anyhow::Result<()> {
 
     let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
     let proxy = config.into_builder()?.build();
-    proxy.listen(&listen).await
+    proxy
+        .listen_with_shutdown(&listen, async {
+            tokio::signal::ctrl_c().await.ok();
+        })
+        .await
 }

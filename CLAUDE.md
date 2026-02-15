@@ -42,7 +42,6 @@ Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT req
 - External module support (`https://`, `jsr:`, `npm:`) in scripting — currently only the user script is served; users can work around this by bundling dependencies into a single file
 
 ### Production readiness
-- Graceful shutdown — signal handling, connection draining
 - Host-based conditional matching — match rules on hostname, not just path
 - Authentication — Proxy-Authorization header support
 
