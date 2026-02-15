@@ -43,19 +43,31 @@ struct Cli {
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
+
+    /// Output logs as JSON
+    #[arg(long)]
+    log_json: bool,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("noxy=info")),
-        )
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .init();
-
     let cli = Cli::parse();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("noxy=info"));
+    let span_events = tracing_subscriber::fmt::format::FmtSpan::CLOSE;
+    if cli.log_json {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(env_filter)
+            .with_span_events(span_events)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_span_events(span_events)
+            .init();
+    }
 
     if cli.generate {
         let ca = noxy::CertificateAuthority::generate()?;
