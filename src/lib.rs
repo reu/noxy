@@ -335,7 +335,8 @@ impl Proxy {
             };
 
             let proxy = self.clone();
-            let span = tracing::info_span!("connection", client = %addr);
+            let span =
+                tracing::info_span!("connection", client = %addr, target = tracing::field::Empty);
             tokio::spawn(
                 async move {
                     if let Err(e) = proxy.handle_connection(stream, addr).await {
@@ -443,7 +444,11 @@ impl Proxy {
         } else {
             (target, 443u16)
         };
-        tracing::debug!(%host, %port, "CONNECT");
+        tracing::Span::current().record(
+            "target",
+            tracing::field::display(format_args!("{host}:{port}")),
+        );
+        tracing::debug!("CONNECT");
 
         // Send 200 to client
         let mut client_stream = reader.into_inner();
