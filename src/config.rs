@@ -62,6 +62,8 @@ pub struct RuleConfig {
 /// Request matching condition.
 #[derive(Debug, Deserialize)]
 pub struct MatchConfig {
+    /// Exact hostname match (port stripped).
+    pub host: Option<String>,
     /// Exact path match.
     pub path: Option<String>,
     /// Path prefix match.
@@ -157,12 +159,21 @@ type Predicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
 impl MatchConfig {
     fn into_predicate(self) -> Predicate {
         Arc::new(move |req: &Request<Body>| {
-            let req_path = req.uri().path();
+            if let Some(ref host) = self.host {
+                let req_host = req
+                    .uri()
+                    .host()
+                    .or_else(|| req.headers().get(http::header::HOST)?.to_str().ok())
+                    .map(|h| h.split(':').next().unwrap_or(h));
+                if req_host != Some(host.as_str()) {
+                    return false;
+                }
+            }
             if let Some(ref exact) = self.path {
-                return req_path == exact;
+                return req.uri().path() == exact.as_str();
             }
             if let Some(ref prefix) = self.path_prefix {
-                return req_path.starts_with(prefix.as_str());
+                return req.uri().path().starts_with(prefix.as_str());
             }
             true
         })
@@ -388,6 +399,10 @@ mod tests {
             [[rules]]
             match = { path_prefix = "/fail" }
             respond = { status = 503, body = "down" }
+
+            [[rules]]
+            match = { host = "api.example.com", path_prefix = "/v2" }
+            latency = "100ms"
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -399,7 +414,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 7);
+        assert_eq!(config.rules.len(), 8);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -442,6 +457,15 @@ mod tests {
         let respond = config.rules[6].respond.as_ref().unwrap();
         assert_eq!(respond.body, "down");
         assert_eq!(respond.status, Some(503));
+
+        // Rule 7: host + path_prefix match with latency
+        let m = config.rules[7].match_config.as_ref().unwrap();
+        assert_eq!(m.host.as_deref(), Some("api.example.com"));
+        assert_eq!(m.path_prefix.as_deref(), Some("/v2"));
+        assert!(matches!(
+            config.rules[7].latency,
+            Some(DurationOrRange::Fixed(d)) if d == Duration::from_millis(100)
+        ));
     }
 
     #[test]
