@@ -4,10 +4,10 @@ pub mod middleware;
 #[cfg(feature = "config")]
 pub mod config;
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ::http::{Request, Response};
@@ -277,7 +277,9 @@ impl ProxyBuilder {
             ca: Arc::new(ca),
             http_layers: Arc::new(self.http_layers),
             upstream_tls_connector: TlsConnector::from(Arc::new(client_config)),
-            server_config_cache: Arc::new(RwLock::new(HashMap::new())),
+            server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(1024).unwrap(),
+            ))),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
@@ -322,7 +324,7 @@ pub struct Proxy {
     ca: Arc<CertificateAuthority>,
     http_layers: Arc<Vec<LayerFn>>,
     upstream_tls_connector: TlsConnector,
-    server_config_cache: Arc<RwLock<HashMap<String, Arc<ServerConfig>>>>,
+    server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
@@ -441,7 +443,8 @@ impl Proxy {
     }
 
     fn server_config_for(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
-        if let Some(config) = self.server_config_cache.read().unwrap().get(hostname) {
+        let mut cache = self.server_config_cache.lock().unwrap();
+        if let Some(config) = cache.get(hostname) {
             return Ok(config.clone());
         }
         let (cert_der, key_der) = self.ca.generate_cert(hostname)?;
@@ -450,10 +453,7 @@ impl Proxy {
             .with_single_cert(vec![cert_der], key_der)?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
-        self.server_config_cache
-            .write()
-            .unwrap()
-            .insert(hostname.to_string(), config.clone());
+        cache.put(hostname.to_string(), config.clone());
         Ok(config)
     }
 

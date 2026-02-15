@@ -47,6 +47,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 serde = { version = "1", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 webpki-roots = "0.26"
+lru = "0.16.3"
 
 [dev-dependencies]
 axum = "0.8"
