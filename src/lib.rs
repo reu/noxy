@@ -318,15 +318,58 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
         Box<dyn std::future::Future<Output = Result<Response<Body>, BoxError>> + Send>,
     >;
 
-    fn call(&self, req: Request<Incoming>) -> Self::Future {
+    fn call(&self, mut req: Request<Incoming>) -> Self::Future {
         let inner = self.inner.clone();
         let span = tracing::debug_span!("request", method = %req.method(), uri = %req.uri());
+
+        let is_upgrade = req
+            .headers()
+            .get(::http::header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| {
+                v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+            })
+            .unwrap_or(false);
+
+        let client_upgrade = if is_upgrade {
+            Some(hyper::upgrade::on(&mut req))
+        } else {
+            None
+        };
+
         Box::pin(
             async move {
                 let req = req.map(incoming_to_body);
                 let mut svc = inner.lock().await;
                 std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
-                svc.call(req).await
+                let mut resp = svc.call(req).await?;
+
+                if resp.status() == ::http::StatusCode::SWITCHING_PROTOCOLS {
+                    if let Some(client_upgrade) = client_upgrade {
+                        let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                        tokio::spawn(async move {
+                            let (client_io, upstream_io) =
+                                match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                                    Ok(io) => io,
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "upgrade failed");
+                                        return;
+                                    }
+                                };
+                            let mut client_io = TokioIo::new(client_io);
+                            let mut upstream_io = TokioIo::new(upstream_io);
+                            if let Err(e) =
+                                tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io)
+                                    .await
+                            {
+                                tracing::debug!(error = %e, "upgrade stream ended");
+                            }
+                        });
+                    }
+                }
+
+                Ok(resp)
             }
             .instrument(span),
         )
@@ -519,7 +562,7 @@ impl Proxy {
                 .keep_alive_timeout(idle);
         }
 
-        let conn = builder.serve_connection(client_io, hyper_service);
+        let conn = builder.serve_connection_with_upgrades(client_io, hyper_service);
         tokio::pin!(conn);
 
         tokio::select! {
@@ -679,7 +722,7 @@ impl Proxy {
         } else {
             let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
             tokio::spawn(async move {
-                if let Err(e) = conn.await {
+                if let Err(e) = conn.with_upgrades().await {
                     tracing::debug!(error = %e, "upstream connection closed");
                 }
             });

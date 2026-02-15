@@ -1106,3 +1106,140 @@ async fn proxy_auth_accepts_second_credential() {
 
     assert_eq!(resp.text().await.unwrap(), "hello");
 }
+
+#[tokio::test]
+async fn proxy_relays_websocket() {
+    use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn echo_ws(mut socket: WebSocket) {
+        while let Some(Ok(msg)) = socket.recv().await {
+            if matches!(msg, Message::Text(_) | Message::Binary(_)) {
+                if socket.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().clone();
+    let key_der =
+        rustls::pki_types::PrivateKeyDer::Pkcs8(key_pair.serialized_der().to_vec().into());
+
+    let mut server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der)
+        .unwrap();
+    server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+    let app = Router::new().route(
+        "/ws",
+        get(|ws: WebSocketUpgrade| async { ws.on_upgrade(echo_ws) }),
+    );
+
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = upstream_listener.accept().await else {
+                break;
+            };
+            let acceptor = acceptor.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let Ok(tls_stream) = acceptor.accept(stream).await else {
+                    return;
+                };
+                let io = hyper_util::rt::TokioIo::new(tls_stream);
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(
+                        io,
+                        hyper::service::service_fn(
+                            move |req: hyper::Request<hyper::body::Incoming>| {
+                                let app = app.clone();
+                                async move {
+                                    use tower::Service;
+                                    let mut app = app;
+                                    let req = req.map(axum::body::Body::new);
+                                    Ok::<_, Infallible>(app.call(req).await.unwrap())
+                                }
+                            },
+                        ),
+                    )
+                    .with_upgrades()
+                    .await
+                    .ok();
+            });
+        }
+    });
+
+    let proxy_addr = start_proxy(vec![]).await;
+    let port = upstream_addr.port();
+
+    // Raw TCP → CONNECT → read 200
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+    stream
+        .write_all(
+            format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 256];
+    let mut total = 0;
+    loop {
+        let n = stream.read(&mut buf[total..]).await.unwrap();
+        assert!(n > 0, "proxy closed connection before 200 response");
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    let resp = std::str::from_utf8(&buf[..total]).unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {resp}"
+    );
+
+    // TLS handshake trusting the test CA
+    let ca_pem = std::fs::read("tests/dummy-cert.pem").unwrap();
+    let ca_certs: Vec<_> = rustls_pemfile::certs(&mut &*ca_pem)
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let mut root_store = rustls::RootCertStore::empty();
+    for cert in ca_certs {
+        root_store.add(cert).unwrap();
+    }
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
+    let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls_stream = connector.connect(server_name, stream).await.unwrap();
+
+    // WebSocket handshake over the TLS stream
+    let (mut ws, _) =
+        tokio_tungstenite::client_async(format!("ws://localhost:{port}/ws"), tls_stream)
+            .await
+            .unwrap();
+
+    // Send a message and assert echo
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        "hello".into(),
+    ))
+    .await
+    .unwrap();
+    let msg = ws.next().await.unwrap().unwrap();
+    assert_eq!(msg.into_text().unwrap(), "hello");
+
+    // Clean close
+    ws.close(None).await.unwrap();
+}
