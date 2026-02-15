@@ -47,13 +47,20 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("noxy=info")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     if cli.generate {
         let ca = noxy::CertificateAuthority::generate()?;
         ca.to_pem_files(&cli.cert, &cli.key)?;
-        eprintln!("Generated CA certificate: {}", cli.cert);
-        eprintln!("Generated CA private key: {}", cli.key);
+        tracing::info!(path = %cli.cert, "generated CA certificate");
+        tracing::info!(path = %cli.key, "generated CA private key");
         return Ok(());
     }
 

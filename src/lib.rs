@@ -20,6 +20,7 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
+use tracing::Instrument;
 
 use http::{Body, BoxError, ForwardService, HttpService, UpstreamSender, incoming_to_body};
 
@@ -273,12 +274,16 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let inner = self.inner.clone();
-        Box::pin(async move {
-            let req = req.map(incoming_to_body);
-            let mut svc = inner.lock().await;
-            std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
-            svc.call(req).await
-        })
+        let span = tracing::debug_span!("request", method = %req.method(), uri = %req.uri());
+        Box::pin(
+            async move {
+                let req = req.map(incoming_to_body);
+                let mut svc = inner.lock().await;
+                std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
+                svc.call(req).await
+            }
+            .instrument(span),
+        )
     }
 }
 
@@ -318,11 +323,10 @@ impl Proxy {
     /// Run the accept loop on an existing listener.
     pub async fn listen_on(&self, listener: TcpListener) -> anyhow::Result<()> {
         let local_addr = listener.local_addr()?;
-        eprintln!("Noxy listening on {local_addr}");
+        tracing::info!(%local_addr, "listening");
 
         loop {
             let (stream, addr) = listener.accept().await?;
-            eprintln!("Connection from {addr}");
 
             let permit = if let Some(ref sem) = self.max_connections {
                 Some(Arc::clone(sem).acquire_owned().await?)
@@ -331,12 +335,16 @@ impl Proxy {
             };
 
             let proxy = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = proxy.handle_connection(stream, addr).await {
-                    eprintln!("Error handling {addr}: {e}");
+            let span = tracing::info_span!("connection", client = %addr);
+            tokio::spawn(
+                async move {
+                    if let Err(e) = proxy.handle_connection(stream, addr).await {
+                        tracing::warn!(error = %e, "connection error");
+                    }
+                    drop(permit);
                 }
-                drop(permit);
-            });
+                .instrument(span),
+            );
         }
     }
 
@@ -395,7 +403,7 @@ impl Proxy {
             .await
             .map_err(|e| anyhow::anyhow!(e))?;
 
-        eprintln!("Connection closed");
+        tracing::debug!("connection closed");
         Ok(())
     }
 
@@ -435,7 +443,7 @@ impl Proxy {
         } else {
             (target, 443u16)
         };
-        eprintln!("CONNECT to {host}:{port}");
+        tracing::debug!(%host, %port, "CONNECT");
 
         // Send 200 to client
         let mut client_stream = reader.into_inner();
@@ -484,7 +492,7 @@ impl Proxy {
             .await?;
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
-                    eprintln!("Upstream connection error: {e}");
+                    tracing::debug!(error = %e, "upstream connection closed");
                 }
             });
             UpstreamSender::Http2(sender)
@@ -492,7 +500,7 @@ impl Proxy {
             let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
-                    eprintln!("Upstream connection error: {e}");
+                    tracing::debug!(error = %e, "upstream connection closed");
                 }
             });
             UpstreamSender::Http1(sender)

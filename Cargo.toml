@@ -20,7 +20,7 @@ required-features = ["cli"]
 
 [features]
 config = ["serde", "toml"]
-cli = ["clap", "config"]
+cli = ["clap", "config", "tracing-subscriber"]
 scripting = ["deno_core", "deno_ast", "deno_error", "serde"]
 
 [dependencies]
@@ -38,6 +38,8 @@ hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto", "
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 rustls = "0.23"
 rustls-pemfile = "2"
 rand = "0.9"
