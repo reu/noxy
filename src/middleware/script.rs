@@ -398,8 +398,9 @@ async fn handle_request(
 
 /// Tower layer that runs a TypeScript/JavaScript script on each request.
 ///
-/// The script is transpiled at construction time and executed in a
-/// persistent V8 isolate on a dedicated thread.
+/// The script is transpiled at construction time. By default, each connection
+/// gets its own V8 isolate on a dedicated thread (per-connection isolation).
+/// Use [`shared`](Self::shared) to reuse a single isolate across all connections.
 ///
 /// # Examples
 ///
@@ -415,8 +416,9 @@ async fn handle_request(
 /// # }
 /// ```
 pub struct ScriptLayer {
-    tx: tokio::sync::mpsc::Sender<RequestEnvelope>,
-    _thread: Arc<std::thread::JoinHandle<()>>,
+    source: Arc<String>,
+    shared_tx: Option<tokio::sync::mpsc::Sender<RequestEnvelope>>,
+    _shared_thread: Option<Arc<std::thread::JoinHandle<()>>>,
 }
 
 impl ScriptLayer {
@@ -426,22 +428,32 @@ impl ScriptLayer {
         let source = std::fs::read_to_string(path)?;
         let filename = path.to_string_lossy();
         let transpiled = transpile_source(&source, &filename)?;
-        Self::from_transpiled(transpiled)
+        Ok(Self::from_transpiled(transpiled))
     }
 
     /// Load a script from source code. The source must be valid JavaScript
     /// (use [`from_file`](Self::from_file) for automatic TypeScript transpilation).
     pub fn from_source(source: &str) -> anyhow::Result<Self> {
-        Self::from_transpiled(source.to_string())
+        Ok(Self::from_transpiled(source.to_string()))
     }
 
-    fn from_transpiled(transpiled: String) -> anyhow::Result<Self> {
+    fn from_transpiled(transpiled: String) -> Self {
+        Self {
+            source: Arc::new(transpiled),
+            shared_tx: None,
+            _shared_thread: None,
+        }
+    }
+
+    /// Share a single V8 isolate across all connections instead of spawning
+    /// one per connection. Global state in the script will be visible to all
+    /// requests regardless of which connection they belong to.
+    pub fn shared(mut self) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let thread = spawn_v8_thread(transpiled, rx);
-        Ok(Self {
-            tx,
-            _thread: Arc::new(thread),
-        })
+        let thread = spawn_v8_thread((*self.source).clone(), rx);
+        self.shared_tx = Some(tx);
+        self._shared_thread = Some(Arc::new(thread));
+        self
     }
 }
 
@@ -449,9 +461,20 @@ impl tower::Layer<HttpService> for ScriptLayer {
     type Service = ScriptService;
 
     fn layer(&self, inner: HttpService) -> Self::Service {
+        if let Some(tx) = &self.shared_tx {
+            return ScriptService {
+                inner: Arc::new(tokio::sync::Mutex::new(inner)),
+                tx: tx.clone(),
+                _thread: None,
+            };
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let thread = spawn_v8_thread((*self.source).clone(), rx);
         ScriptService {
             inner: Arc::new(tokio::sync::Mutex::new(inner)),
-            tx: self.tx.clone(),
+            tx,
+            _thread: Some(Arc::new(thread)),
         }
     }
 }
@@ -459,6 +482,7 @@ impl tower::Layer<HttpService> for ScriptLayer {
 pub struct ScriptService {
     inner: Arc<tokio::sync::Mutex<HttpService>>,
     tx: tokio::sync::mpsc::Sender<RequestEnvelope>,
+    _thread: Option<Arc<std::thread::JoinHandle<()>>>,
 }
 
 impl Service<Request<Body>> for ScriptService {

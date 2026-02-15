@@ -235,6 +235,16 @@ export default async function(req: Request, respond: Function) {
 }
 ```
 
+By default, each connection gets its own V8 isolate, so global state in the script (like variables declared outside the handler) is scoped per connection. Use `.shared()` to reuse a single isolate across all connections:
+
+```rust
+// Per-connection (default) -- each connection gets a fresh isolate
+ScriptLayer::from_file("middleware.ts")?
+
+// Shared -- one isolate for all connections, global state is shared
+ScriptLayer::from_file("middleware.ts")?.shared()
+```
+
 ## How It Works
 
 Normal HTTPS creates an encrypted tunnel between client and server -- nobody in the middle can read the traffic. Noxy breaks that tunnel into **two separate TLS sessions** and sits in between, with your middleware pipeline processing decoded HTTP traffic.
