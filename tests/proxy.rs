@@ -1005,3 +1005,104 @@ async fn max_connections_applies_backpressure() {
         "3 requests with max_connections=2 and 300ms upstream should take ~600ms, took {elapsed:?}"
     );
 }
+
+fn start_authenticated_proxy() -> noxy::ProxyBuilder {
+    Proxy::builder()
+        .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
+        .unwrap()
+        .danger_accept_invalid_upstream_certs()
+        .credential("admin", "secret")
+        .credential("user2", "pass2")
+}
+
+fn http_client_with_auth(
+    proxy_addr: SocketAddr,
+    username: &str,
+    password: &str,
+) -> reqwest::Client {
+    let ca_pem = std::fs::read("tests/dummy-cert.pem").unwrap();
+    let ca_cert = reqwest::tls::Certificate::from_pem(&ca_pem).unwrap();
+
+    reqwest::Client::builder()
+        .proxy(
+            reqwest::Proxy::https(format!("http://{proxy_addr}"))
+                .unwrap()
+                .basic_auth(username, password),
+        )
+        .add_root_certificate(ca_cert)
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn proxy_auth_rejects_missing_credentials() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = start_authenticated_proxy().build();
+    let proxy_addr = spawn_proxy(proxy).await;
+
+    // Client without credentials — should get rejected (connection error)
+    let client = http_client(proxy_addr);
+    let result = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected request without credentials to fail"
+    );
+}
+
+#[tokio::test]
+async fn proxy_auth_rejects_wrong_credentials() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = start_authenticated_proxy().build();
+    let proxy_addr = spawn_proxy(proxy).await;
+
+    let client = http_client_with_auth(proxy_addr, "admin", "wrong");
+    let result = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await;
+
+    assert!(
+        result.is_err(),
+        "expected request with wrong credentials to fail"
+    );
+}
+
+#[tokio::test]
+async fn proxy_auth_accepts_valid_credentials() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = start_authenticated_proxy().build();
+    let proxy_addr = spawn_proxy(proxy).await;
+
+    let client = http_client_with_auth(proxy_addr, "admin", "secret");
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn proxy_auth_accepts_second_credential() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy = start_authenticated_proxy().build();
+    let proxy_addr = spawn_proxy(proxy).await;
+
+    let client = http_client_with_auth(proxy_addr, "user2", "pass2");
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.text().await.unwrap(), "hello");
+}

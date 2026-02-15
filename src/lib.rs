@@ -24,6 +24,7 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 use tracing::Instrument;
 
+use base64::Engine;
 use http::{Body, BoxError, ForwardService, HttpService, UpstreamSender, incoming_to_body};
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
@@ -150,6 +151,7 @@ pub struct ProxyBuilder {
     idle_timeout: Option<Duration>,
     max_connections: Option<usize>,
     drain_timeout: Option<Duration>,
+    credentials: Vec<(String, String)>,
 }
 
 impl ProxyBuilder {
@@ -248,6 +250,14 @@ impl ProxyBuilder {
         self
     }
 
+    /// Require proxy authentication. Accepts Basic auth with the given
+    /// username/password pair. Can be called multiple times to allow multiple
+    /// credentials.
+    pub fn credential(mut self, username: impl Into<String>, password: impl Into<String>) -> Self {
+        self.credentials.push((username.into(), password.into()));
+        self
+    }
+
     /// Disable upstream TLS certificate verification. Useful for testing with
     /// self-signed upstream servers.
     pub fn danger_accept_invalid_upstream_certs(mut self) -> Self {
@@ -284,6 +294,11 @@ impl ProxyBuilder {
             idle_timeout: self.idle_timeout,
             max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
             drain_timeout: self.drain_timeout,
+            credentials: if self.credentials.is_empty() {
+                None
+            } else {
+                Some(Arc::new(self.credentials))
+            },
         }
     }
 }
@@ -329,6 +344,7 @@ pub struct Proxy {
     idle_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
     drain_timeout: Option<Duration>,
+    credentials: Option<Arc<Vec<(String, String)>>>,
 }
 
 impl Proxy {
@@ -342,6 +358,7 @@ impl Proxy {
             idle_timeout: None,
             max_connections: None,
             drain_timeout: None,
+            credentials: Vec::new(),
         }
     }
 
@@ -540,12 +557,43 @@ impl Proxy {
         }
         let target = parts[1]; // host:port
 
-        // Consume remaining headers (until empty line)
+        // Consume remaining headers, extracting Proxy-Authorization if present
+        let mut proxy_auth = None;
         loop {
             let mut line = String::new();
             reader.read_line(&mut line).await?;
             if line.trim().is_empty() {
                 break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("Proxy-Authorization") {
+                    proxy_auth = Some(value.trim().to_string());
+                }
+            }
+        }
+
+        // Validate credentials before sending 200
+        if let Some(ref creds) = self.credentials {
+            let authenticated = proxy_auth
+                .as_deref()
+                .and_then(|auth| auth.strip_prefix("Basic "))
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|decoded| {
+                    let (u, p) = decoded.split_once(':')?;
+                    Some(creds.iter().any(|(eu, ep)| eu == u && ep == p))
+                })
+                .unwrap_or(false);
+
+            if !authenticated {
+                let mut client_stream = reader.into_inner();
+                client_stream
+                    .write_all(
+                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
+                          Proxy-Authenticate: Basic realm=\"noxy\"\r\n\r\n",
+                    )
+                    .await?;
+                anyhow::bail!("proxy authentication failed");
             }
         }
 

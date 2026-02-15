@@ -44,6 +44,10 @@ struct Cli {
     #[arg(long)]
     accept_invalid_certs: bool,
 
+    /// Require proxy authentication (format: username:password, repeatable)
+    #[arg(long = "credential")]
+    credentials: Vec<String>,
+
     /// Output logs as JSON
     #[arg(long)]
     log_json: bool,
@@ -98,6 +102,16 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.accept_invalid_certs {
         config.accept_invalid_upstream_certs = true;
+    }
+
+    for cred in cli.credentials {
+        let (user, pass) = cred
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("credential must be username:password"))?;
+        config.credentials.push(noxy::config::CredentialConfig {
+            username: user.to_string(),
+            password: pass.to_string(),
+        });
     }
 
     // Convert CLI middleware flags to unconditional rules

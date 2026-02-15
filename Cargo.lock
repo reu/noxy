@@ -1795,6 +1795,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-server",
+ "base64",
  "bytes",
  "clap",
  "deno_ast",

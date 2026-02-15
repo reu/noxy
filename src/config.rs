@@ -35,6 +35,10 @@ pub struct ProxyConfig {
     /// Drain timeout for graceful shutdown, e.g. "30s".
     pub drain_timeout: Option<DurationValue>,
 
+    /// Proxy authentication credentials (Basic auth).
+    #[serde(default)]
+    pub credentials: Vec<CredentialConfig>,
+
     /// Ordered list of middleware rules.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
@@ -44,6 +48,12 @@ pub struct ProxyConfig {
 pub struct CaConfig {
     pub cert: String,
     pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CredentialConfig {
+    pub username: String,
+    pub password: String,
 }
 
 /// A single rule. Has an optional condition and one or more middleware configs.
@@ -223,6 +233,10 @@ impl ProxyConfig {
 
         if let Some(timeout) = self.drain_timeout {
             builder = builder.drain_timeout(timeout.0);
+        }
+
+        for cred in self.credentials {
+            builder = builder.credential(cred.username, cred.password);
         }
 
         for rule in self.rules {
@@ -476,6 +490,26 @@ mod tests {
         assert!(config.ca.is_none());
         assert!(!config.accept_invalid_upstream_certs);
         assert!(config.rules.is_empty());
+    }
+
+    #[test]
+    fn deserialize_credentials() {
+        let toml = r#"
+            [[credentials]]
+            username = "admin"
+            password = "secret"
+
+            [[credentials]]
+            username = "readonly"
+            password = "hunter2"
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.credentials.len(), 2);
+        assert_eq!(config.credentials[0].username, "admin");
+        assert_eq!(config.credentials[0].password, "secret");
+        assert_eq!(config.credentials[1].username, "readonly");
+        assert_eq!(config.credentials[1].password, "hunter2");
     }
 
     #[test]
