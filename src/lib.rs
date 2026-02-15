@@ -4,8 +4,9 @@ pub mod middleware;
 #[cfg(feature = "config")]
 pub mod config;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use ::http::{Request, Response};
 use hyper::body::Incoming;
@@ -222,6 +223,7 @@ impl ProxyBuilder {
             ca: Arc::new(ca),
             http_layers: Arc::new(self.http_layers),
             accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
+            server_config_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -258,6 +260,7 @@ pub struct Proxy {
     ca: Arc<CertificateAuthority>,
     http_layers: Arc<Vec<LayerFn>>,
     accept_invalid_upstream_certs: bool,
+    server_config_cache: Arc<RwLock<HashMap<String, Arc<ServerConfig>>>>,
 }
 
 impl Proxy {
@@ -286,6 +289,23 @@ impl Proxy {
                 }
             });
         }
+    }
+
+    fn server_config_for(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
+        if let Some(config) = self.server_config_cache.read().unwrap().get(hostname) {
+            return Ok(config.clone());
+        }
+        let (cert_der, key_der) = self.ca.generate_cert(hostname)?;
+        let mut config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)?;
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let config = Arc::new(config);
+        self.server_config_cache
+            .write()
+            .unwrap()
+            .insert(hostname.to_string(), config.clone());
+        Ok(config)
     }
 
     /// Handle a single CONNECT tunnel on an already-accepted stream.
@@ -355,13 +375,8 @@ impl Proxy {
             .alpn_protocol()
             .is_some_and(|p| p == b"h2");
 
-        // Generate fake cert for the host, signed by our CA
-        let (cert_der, key_der) = self.ca.generate_cert(host)?;
-        let mut server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)?;
-        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let server_config = self.server_config_for(host)?;
+        let acceptor = TlsAcceptor::from(server_config);
         let client_tls = acceptor.accept(client_stream).await?;
 
         // Hyper client handshake on upstream (protocol matches ALPN negotiation)
