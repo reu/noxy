@@ -27,50 +27,18 @@ Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT req
 - `HyperServiceAdapter` — bridges tower's `&mut self` call model to hyper's `&self` via `Arc<Mutex>`
 - `http_layer()` — accepts any `tower::Layer<HttpService>`, type-erased via `LayerFn` closures
 
+### Scripting middleware (`src/middleware/script.rs`, behind `scripting` feature)
+- `ScriptLayer` / `ScriptService` — tower Layer/Service that runs JS/TS scripts via embedded V8 (`deno_core`)
+- Dedicated V8 thread (since `JsRuntime` is `!Send`) communicating via `mpsc`/`oneshot` channels
+- TypeScript transpiled at construction time via `deno_ast`
+- JS runtime shim (`script_runtime.js`) provides `Headers`, `Request`, `Response` classes and the `__noxy_handle` orchestrator
+- User script exports a default async function receiving `(req, respond)` — `respond` forwards upstream, returning without it short-circuits
+
 ## TODO
 
-### Scripting middleware (`ScriptLayer`)
-Embed a TypeScript runtime via `deno_core` (behind a feature gate) so users can write middleware in `.ts` files.
-
-**API:**
-```typescript
-export default async function(req, respond) {
-  // Mutate headers directly
-  req.headers.set("X-Foo", "bar");
-
-  // req.body() returns a Promise — buffers on demand, zero-copy if never called
-  const body = await req.body();
-
-  // respond(req) forwards upstream with original body streaming through
-  // respond(req, newBody) forwards with a replacement body
-  const res = await respond(req, transform(body));
-
-  // Mutate response headers
-  res.headers.set("X-Proxied", "true");
-
-  // res.body() same lazy pattern as req.body()
-  return res;
-
-  // Or short-circuit without forwarding:
-  // return new Response("blocked", { status: 403 });
-}
-```
-
-**Decided:**
-- Single exported function receives `req` and `respond`
-- `respond` is an injected function (not a method on req) — calls the inner tower service
-- `respond(req)` forwards with original body untouched; `respond(req, newBody)` overrides body
-- `req.body()` / `res.body()` returns a `Promise` — buffers on demand; not calling it means zero-copy passthrough
-- Body handle stored as `Arc<Mutex<Option<Body>>>` on Rust side; the `body()` op drains it
-- Headers mutated directly on the req/res objects
-- Returning a `Response` without calling `respond` short-circuits (mock/block)
-- One V8 isolate reused across requests
-- Feature-gated to avoid V8 build times for users who don't need it
-
-**Future:**
 - Expose body as an async iterable for chunk-by-chunk streaming without full buffering
-- Config file integration (`script = "middleware.ts"` in rules)
-- External module support (`https://`, `jsr:`, `npm:`) — the current `ScriptModuleLoader` only serves the user script; supporting remote/registry modules would require HTTP fetching, transitive dependency resolution, and potentially `deno_node` for npm compatibility. Users can work around this today by bundling dependencies with `deno bundle` or `esbuild` into a single file.
+- Config file integration for scripting (`script = "middleware.ts"` in rules)
+- External module support (`https://`, `jsr:`, `npm:`) in scripting — currently only the user script is served; users can work around this by bundling dependencies into a single file
 
 ## Project Guidelines
 

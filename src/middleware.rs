@@ -11,3 +11,8 @@ pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;
 pub use set_response::SetResponse;
 pub use traffic_logger::TrafficLogger;
+
+#[cfg(feature = "scripting")]
+mod script;
+#[cfg(feature = "scripting")]
+pub use script::ScriptLayer;

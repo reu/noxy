@@ -5,7 +5,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 ## Features
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, and mock responses
+- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a path or path prefix
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - Per-host certificate generation on the fly, signed by a user-provided CA
@@ -174,6 +174,66 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `bandwidth` | Bytes per second throughput limit                         |
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
+
+## Scripting Middleware
+
+Write request/response manipulation logic in TypeScript or JavaScript. Scripts run in an embedded V8 engine via [deno_core](https://crates.io/crates/deno_core). Requires the `scripting` feature.
+
+```rust
+use noxy::Proxy;
+use noxy::middleware::ScriptLayer;
+
+let proxy = Proxy::builder()
+    .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+    .http_layer(ScriptLayer::from_file("middleware.ts")?)
+    .build();
+```
+
+The script exports a default async function that receives the request and a `respond` function to forward it upstream:
+
+```typescript
+// middleware.ts
+export default async function(req: Request, respond: Function) {
+  // Add a header before forwarding
+  req.headers.set("x-proxy", "noxy");
+
+  // Forward to upstream
+  const res = await respond(req);
+
+  // Modify the response
+  res.headers.set("x-intercepted", "true");
+
+  return res;
+}
+```
+
+Short-circuit responses without forwarding upstream:
+
+```typescript
+export default async function(req: Request, respond: Function) {
+  if (req.url === "/health") {
+    return new Response("ok", { status: 200 });
+  }
+  return await respond(req);
+}
+```
+
+Read request or response bodies (lazy -- only buffered if you call `body()`):
+
+```typescript
+export default async function(req: Request, respond: Function) {
+  const body = await req.body(); // Uint8Array
+  console.log("Request size:", body.length);
+
+  const res = await respond(req);
+  const resBody = await res.body(); // Uint8Array
+
+  return new Response(resBody, {
+    status: res.status,
+    headers: res.headers,
+  });
+}
+```
 
 ## How It Works
 

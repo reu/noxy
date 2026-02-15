@@ -21,11 +21,15 @@ required-features = ["cli"]
 [features]
 config = ["serde", "toml"]
 cli = ["clap", "config"]
+scripting = ["deno_core", "deno_ast", "deno_error", "serde"]
 
 [dependencies]
 anyhow = "1"
 bytes = "1"
 clap = { version = "4", features = ["derive"], optional = true }
+deno_core = { version = "0.385", optional = true }
+deno_ast = { version = "0.53", features = ["transpiling"], optional = true }
+deno_error = { version = "0.7", optional = true }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
