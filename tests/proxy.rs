@@ -214,10 +214,10 @@ async fn proxy_rejects_non_connect() {
         .unwrap()
         .get(format!("http://{proxy_addr}/"))
         .send()
-        .await;
+        .await
+        .unwrap();
 
-    // The proxy expects CONNECT and should reject/drop a plain GET
-    assert!(resp.is_err(), "expected plain GET to proxy to fail");
+    assert_eq!(resp.status(), 400);
 }
 
 /// A tower Service that adds a request header before forwarding.

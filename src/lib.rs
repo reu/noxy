@@ -4,6 +4,7 @@ pub mod middleware;
 #[cfg(feature = "config")]
 pub mod config;
 
+use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -11,12 +12,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ::http::{Request, Response};
+use base64::Engine;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -24,8 +25,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tower::Service;
 use tracing::Instrument;
 
-use base64::Engine;
-use http::{Body, BoxError, ForwardService, HttpService, UpstreamSender, incoming_to_body};
+use http::{
+    Body, BoxError, ForwardService, HttpService, UpstreamSender, empty_body, incoming_to_body,
+};
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
@@ -536,84 +538,111 @@ impl Proxy {
         Ok(())
     }
 
-    /// Perform the full handshake sequence: CONNECT parsing, TLS on both
-    /// sides, and hyper handshake. Returns the tower service and client TLS
-    /// stream ready for `serve_connection`.
+    /// Perform the full handshake sequence: CONNECT parsing via hyper, TLS on
+    /// both sides, and hyper handshake. Returns the tower service and client
+    /// TLS stream ready for `serve_connection`.
     async fn handshake(
         &self,
         stream: TcpStream,
     ) -> anyhow::Result<(
         HyperServiceAdapter,
-        tokio_rustls::server::TlsStream<TcpStream>,
+        tokio_rustls::server::TlsStream<TokioIo<hyper::upgrade::Upgraded>>,
     )> {
-        let mut reader = BufReader::new(stream);
+        type ConnectInfo = anyhow::Result<(String, hyper::upgrade::Upgraded)>;
+        let (connect_tx, connect_rx) = tokio::sync::oneshot::channel::<ConnectInfo>();
+        let connect_tx = Arc::new(Mutex::new(Some(connect_tx)));
+        let credentials = self.credentials.clone();
 
-        // Read the CONNECT request line
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).await?;
-        let parts: Vec<&str> = request_line.split_whitespace().collect();
-        if parts.len() < 3 || parts[0] != "CONNECT" {
-            anyhow::bail!("Expected CONNECT request, got: {request_line}");
-        }
-        let target = parts[1]; // host:port
+        let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let connect_tx = connect_tx.clone();
+            let credentials = credentials.clone();
+            async move {
+                let send_err = |msg: &str| {
+                    if let Some(tx) = connect_tx.lock().unwrap().take() {
+                        let _ = tx.send(Err(anyhow::anyhow!("{msg}")));
+                    }
+                };
 
-        // Consume remaining headers, extracting Proxy-Authorization if present
-        let mut proxy_auth = None;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).await?;
-            if line.trim().is_empty() {
-                break;
-            }
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("Proxy-Authorization") {
-                    proxy_auth = Some(value.trim().to_string());
+                if req.method() != ::http::Method::CONNECT {
+                    send_err(&format!("expected CONNECT, got {}", req.method()));
+                    return Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(::http::StatusCode::BAD_REQUEST)
+                            .body(empty_body())
+                            .unwrap(),
+                    );
                 }
-            }
-        }
 
-        // Validate credentials before sending 200
-        if let Some(ref creds) = self.credentials {
-            let authenticated = proxy_auth
-                .as_deref()
-                .and_then(|auth| auth.strip_prefix("Basic "))
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-                .and_then(|decoded| {
-                    let (u, p) = decoded.split_once(':')?;
-                    Some(creds.iter().any(|(eu, ep)| eu == u && ep == p))
-                })
-                .unwrap_or(false);
+                let authority = match req.uri().authority() {
+                    Some(a) => a.to_string(),
+                    None => {
+                        send_err("missing authority in CONNECT URI");
+                        return Ok(Response::builder()
+                            .status(::http::StatusCode::BAD_REQUEST)
+                            .body(empty_body())
+                            .unwrap());
+                    }
+                };
 
-            if !authenticated {
-                let mut client_stream = reader.into_inner();
-                client_stream
-                    .write_all(
-                        b"HTTP/1.1 407 Proxy Authentication Required\r\n\
-                          Proxy-Authenticate: Basic realm=\"noxy\"\r\n\r\n",
-                    )
-                    .await?;
-                anyhow::bail!("proxy authentication failed");
+                if let Some(ref creds) = credentials {
+                    let authenticated = req
+                        .headers()
+                        .get(::http::header::PROXY_AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|auth| auth.strip_prefix("Basic "))
+                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .and_then(|decoded| {
+                            let (u, p) = decoded.split_once(':')?;
+                            Some(creds.iter().any(|(eu, ep)| eu == u && ep == p))
+                        })
+                        .unwrap_or(false);
+
+                    if !authenticated {
+                        send_err("proxy authentication failed");
+                        return Ok(Response::builder()
+                            .status(::http::StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+                            .header(::http::header::PROXY_AUTHENTICATE, "Basic realm=\"noxy\"")
+                            .body(empty_body())
+                            .unwrap());
+                    }
+                }
+
+                tokio::spawn(async move {
+                    let result = hyper::upgrade::on(req)
+                        .await
+                        .map(|upgraded| (authority, upgraded))
+                        .map_err(|e| anyhow::anyhow!(e));
+                    if let Some(tx) = connect_tx.lock().unwrap().take() {
+                        let _ = tx.send(result);
+                    }
+                });
+
+                Ok(Response::new(empty_body()))
             }
-        }
+        });
+
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(stream), service)
+            .with_upgrades()
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let (authority, upgraded) = connect_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("CONNECT handler did not complete"))??;
 
         // Parse host and port
-        let (host, port) = if let Some(colon) = target.rfind(':') {
-            (&target[..colon], target[colon + 1..].parse::<u16>()?)
+        let (host, port) = if let Some(colon) = authority.rfind(':') {
+            (&authority[..colon], authority[colon + 1..].parse::<u16>()?)
         } else {
-            (target, 443u16)
+            (authority.as_str(), 443u16)
         };
         tracing::Span::current().record(
             "target",
             tracing::field::display(format_args!("{host}:{port}")),
         );
         tracing::debug!("CONNECT");
-
-        // Send 200 to client
-        let mut client_stream = reader.into_inner();
-        client_stream
-            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            .await?;
 
         let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
         let server_name: ServerName<'static> = host.to_string().try_into()?;
@@ -631,7 +660,7 @@ impl Proxy {
 
         let server_config = self.server_config_for(host)?;
         let acceptor = TlsAcceptor::from(server_config);
-        let client_tls = acceptor.accept(client_stream).await?;
+        let client_tls = acceptor.accept(TokioIo::new(upgraded)).await?;
 
         // Hyper client handshake on upstream (protocol matches ALPN negotiation)
         let upstream_io = TokioIo::new(upstream_tls);
