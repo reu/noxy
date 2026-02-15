@@ -277,29 +277,34 @@ Normal HTTPS creates an encrypted tunnel between client and server -- nobody in 
 
 ### The flow
 
-```
-Client (curl)            Noxy                       Server (example.com)
-     |                     |                                |
-     |--- CONNECT host --->|                                |
-     |<-- 200 OK ----------|                                |
-     |                     |--- TLS handshake ------------->|
-     |                     |   (real cert verified)         |
-     |                     |                                |
-     |   Noxy generates a  |                                |
-     |   fake cert for     |                                |
-     |   "example.com"     |                                |
-     |   signed by our CA  |                                |
-     |                     |                                |
-     |<- TLS handshake --->|                                |
-     |   (fake cert)       |                                |
-     |                     |                                |
-     |== TLS session 1 ====|======= TLS session 2 ==========|
-     |                     |                                |
-     | "GET / HTTP/1.1"    |  tower middleware pipeline     |
-     |--- encrypted ------>| [Layer] -> [Layer] -> upstream |
-     |                     |                                |
-     |                     |           response + layers    |
-     |<--- re-encrypted ---| upstream -> [Layer] -> [Layer] |
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as Noxy
+    participant S as Server
+
+    C->>N: CONNECT example.com:443
+    N-->>C: 200 OK
+
+    N->>S: TLS handshake (real cert verified)
+    S-->>N: TLS established
+
+    Note over N: Generate fake cert for<br/>example.com signed by CA
+
+    C->>N: TLS handshake (fake cert)
+    N-->>C: TLS established
+
+    rect rgb(40, 40, 40)
+        Note over C,S: TLS Session 1 ← Noxy → TLS Session 2
+
+        C->>N: GET / HTTP/1.1
+        Note over N: Tower middleware pipeline<br/>[Layer] → [Layer] → upstream
+        N->>S: Forwarded request
+
+        S-->>N: Response
+        Note over N: upstream → [Layer] → [Layer]
+        N-->>C: Modified response
+    end
 ```
 
 ### Step by step
