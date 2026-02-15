@@ -258,10 +258,25 @@ impl ProxyBuilder {
     /// Build the proxy. Panics if no CA has been set.
     pub fn build(self) -> Proxy {
         let ca = self.ca.expect("CertificateAuthority must be set");
+
+        let mut client_config = if self.accept_invalid_upstream_certs {
+            ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
+                .with_no_client_auth()
+        } else {
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            ClientConfig::builder()
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        };
+        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         Proxy {
             ca: Arc::new(ca),
             http_layers: Arc::new(self.http_layers),
-            accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
+            upstream_tls_connector: TlsConnector::from(Arc::new(client_config)),
             server_config_cache: Arc::new(RwLock::new(HashMap::new())),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
@@ -306,7 +321,7 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
 pub struct Proxy {
     ca: Arc<CertificateAuthority>,
     http_layers: Arc<Vec<LayerFn>>,
-    accept_invalid_upstream_certs: bool,
+    upstream_tls_connector: TlsConnector,
     server_config_cache: Arc<RwLock<HashMap<String, Arc<ServerConfig>>>>,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
@@ -552,25 +567,12 @@ impl Proxy {
             .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
 
-        // Connect upstream via TLS (advertise both h2 and http/1.1)
-        let mut client_config = if self.accept_invalid_upstream_certs {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
-                .with_no_client_auth()
-        } else {
-            let mut root_store = RootCertStore::empty();
-            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
-        client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let connector = TlsConnector::from(Arc::new(client_config));
-
         let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
         let server_name: ServerName<'static> = host.to_string().try_into()?;
-        let upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+        let upstream_tls = self
+            .upstream_tls_connector
+            .connect(server_name, upstream_tcp)
+            .await?;
 
         // Check which protocol was negotiated with upstream
         let upstream_is_h2 = upstream_tls
