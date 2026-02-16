@@ -33,7 +33,7 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 ///             .abort_rate(0.05)
 ///             .error_rate(0.1)
 ///     )
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```

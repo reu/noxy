@@ -267,9 +267,11 @@ impl ProxyBuilder {
         self
     }
 
-    /// Build the proxy. Panics if no CA has been set.
-    pub fn build(self) -> Proxy {
-        let ca = self.ca.expect("CertificateAuthority must be set");
+    /// Build the proxy. Returns an error if no CA has been set.
+    pub fn build(self) -> anyhow::Result<Proxy> {
+        let ca = self
+            .ca
+            .ok_or_else(|| anyhow::anyhow!("CertificateAuthority must be set"))?;
 
         let mut client_config = if self.accept_invalid_upstream_certs {
             ClientConfig::builder()
@@ -285,7 +287,7 @@ impl ProxyBuilder {
         };
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        Proxy {
+        Ok(Proxy {
             ca: Arc::new(ca),
             http_layers: Arc::new(self.http_layers),
             upstream_tls_connector: TlsConnector::from(Arc::new(client_config)),
@@ -301,7 +303,7 @@ impl ProxyBuilder {
             } else {
                 Some(Arc::new(self.credentials))
             },
-        }
+        })
     }
 }
 
@@ -466,7 +468,7 @@ impl Proxy {
                     tasks.spawn(
                         async move {
                             if let Err(e) = proxy
-                                .handle_connection_inner(stream, addr, rx)
+                                .handle_connection_inner(stream, rx)
                                 .await
                             {
                                 tracing::warn!(error = %e, "connection error");
@@ -526,13 +528,18 @@ impl Proxy {
         client_addr: SocketAddr,
     ) -> anyhow::Result<()> {
         let (_tx, rx) = tokio::sync::watch::channel(false);
-        self.handle_connection_inner(stream, client_addr, rx).await
+        self.handle_connection_inner(stream, rx)
+            .instrument(tracing::info_span!(
+                "connection",
+                client = %client_addr,
+                target = tracing::field::Empty,
+            ))
+            .await
     }
 
     async fn handle_connection_inner(
         &self,
         stream: TcpStream,
-        _client_addr: SocketAddr,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
         let (hyper_service, client_tls) = {

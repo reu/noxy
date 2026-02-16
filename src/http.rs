@@ -23,23 +23,23 @@ pub fn empty_body() -> Body {
 }
 
 /// Convert a hyper `Incoming` body into our boxed body type.
-pub fn incoming_to_body(incoming: Incoming) -> Body {
+pub(crate) fn incoming_to_body(incoming: Incoming) -> Body {
     incoming.map_err(|e| -> BoxError { Box::new(e) }).boxed()
 }
 
 /// Upstream sender that works with both HTTP/1.1 and HTTP/2.
-pub enum UpstreamSender {
+pub(crate) enum UpstreamSender {
     Http1(hyper::client::conn::http1::SendRequest<Body>),
     Http2(hyper::client::conn::http2::SendRequest<Body>),
 }
 
 /// Tower service that forwards requests to an upstream hyper connection.
-pub struct ForwardService {
+pub(crate) struct ForwardService {
     sender: UpstreamSender,
 }
 
 impl ForwardService {
-    pub fn new(sender: UpstreamSender) -> Self {
+    pub(crate) fn new(sender: UpstreamSender) -> Self {
         Self { sender }
     }
 }

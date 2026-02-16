@@ -56,7 +56,7 @@ async fn start_proxy(
         builder = builder.http_layer(BoxedLayer(layer));
     }
 
-    let proxy = builder.build();
+    let proxy = builder.build().unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

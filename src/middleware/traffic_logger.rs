@@ -26,7 +26,7 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
 ///     .http_layer(TrafficLogger::new())
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```

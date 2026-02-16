@@ -411,7 +411,7 @@ async fn handle_request(
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
 ///     .http_layer(ScriptLayer::from_file("middleware.ts")?)
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```

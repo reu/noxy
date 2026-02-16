@@ -28,7 +28,7 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 ///                 SetResponse::ok("healthy"),
 ///             )
 ///     )
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```

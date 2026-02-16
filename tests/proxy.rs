@@ -66,7 +66,7 @@ async fn start_proxy(
         builder = builder.http_layer(BoxedLayer(layer));
     }
 
-    let proxy = builder.build();
+    let proxy = builder.build().unwrap();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -883,7 +883,8 @@ async fn handshake_timeout_drops_slow_connection() {
         .unwrap()
         .danger_accept_invalid_upstream_certs()
         .handshake_timeout(Duration::from_millis(200))
-        .build();
+        .build()
+        .unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
 
     // Connect raw TCP and send CONNECT very slowly — the proxy should drop us
@@ -918,7 +919,8 @@ async fn handshake_timeout_allows_fast_connection() {
         .unwrap()
         .danger_accept_invalid_upstream_certs()
         .handshake_timeout(Duration::from_secs(10))
-        .build();
+        .build()
+        .unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
     let client = http_client(proxy_addr);
 
@@ -972,7 +974,8 @@ async fn max_connections_applies_backpressure() {
         .unwrap()
         .danger_accept_invalid_upstream_certs()
         .max_connections(2)
-        .build();
+        .build()
+        .unwrap();
 
     // Use the proxy's own listen() loop so the semaphore is enforced
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1038,7 +1041,7 @@ fn http_client_with_auth(
 async fn proxy_auth_rejects_missing_credentials() {
     let upstream_addr = start_upstream("hello").await;
 
-    let proxy = start_authenticated_proxy().build();
+    let proxy = start_authenticated_proxy().build().unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
 
     // Client without credentials — should get rejected (connection error)
@@ -1058,7 +1061,7 @@ async fn proxy_auth_rejects_missing_credentials() {
 async fn proxy_auth_rejects_wrong_credentials() {
     let upstream_addr = start_upstream("hello").await;
 
-    let proxy = start_authenticated_proxy().build();
+    let proxy = start_authenticated_proxy().build().unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
 
     let client = http_client_with_auth(proxy_addr, "admin", "wrong");
@@ -1077,7 +1080,7 @@ async fn proxy_auth_rejects_wrong_credentials() {
 async fn proxy_auth_accepts_valid_credentials() {
     let upstream_addr = start_upstream("hello").await;
 
-    let proxy = start_authenticated_proxy().build();
+    let proxy = start_authenticated_proxy().build().unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
 
     let client = http_client_with_auth(proxy_addr, "admin", "secret");
@@ -1094,7 +1097,7 @@ async fn proxy_auth_accepts_valid_credentials() {
 async fn proxy_auth_accepts_second_credential() {
     let upstream_addr = start_upstream("hello").await;
 
-    let proxy = start_authenticated_proxy().build();
+    let proxy = start_authenticated_proxy().build().unwrap();
     let proxy_addr = spawn_proxy(proxy).await;
 
     let client = http_client_with_auth(proxy_addr, "user2", "pass2");

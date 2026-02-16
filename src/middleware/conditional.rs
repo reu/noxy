@@ -45,7 +45,7 @@ struct Rule {
 ///             )
 ///             .mock(|req| req.uri().path() == "/health", "ok")
 ///     )
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```

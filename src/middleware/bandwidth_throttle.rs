@@ -28,7 +28,7 @@ use crate::http::{Body, BoxError, HttpService};
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
 ///     // Limit downloads to 100 KB/s
 ///     .http_layer(BandwidthThrottle::new(100 * 1024))
-///     .build();
+///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
