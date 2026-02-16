@@ -1,6 +1,5 @@
 pub mod http;
 pub mod middleware;
-pub(crate) mod pool;
 
 #[cfg(feature = "config")]
 pub mod config;
@@ -27,9 +26,9 @@ use tower::Service;
 use tracing::Instrument;
 
 use http::{
-    Body, BoxError, ForwardService, HttpService, UpstreamSender, empty_body, incoming_to_body,
+    Body, BoxError, ForwardService, HttpService, UpstreamClient, UpstreamConnector, empty_body,
+    incoming_to_body,
 };
-use pool::{ConnectionPool, PoolConfig, PooledConnection};
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
@@ -266,8 +265,8 @@ impl ProxyBuilder {
         self.http_layer(middleware::CircuitBreaker::global(threshold, recovery))
     }
 
-    /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
-    /// TCP connect, TLS handshakes, and hyper handshakes.
+    /// Set a timeout for the handshake phase before `serve_connection`:
+    /// CONNECT parsing and client-side TLS.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = Some(timeout);
         self
@@ -346,15 +345,21 @@ impl ProxyBuilder {
         };
         client_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
-        let connection_pool = ConnectionPool::new(PoolConfig {
-            max_idle_per_host: self.pool_max_idle_per_host,
-            idle_timeout: self.pool_idle_timeout,
-        });
+        let connector = UpstreamConnector {
+            tls: TlsConnector::from(Arc::new(client_config)),
+        };
+
+        let upstream_client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .pool_idle_timeout(self.pool_idle_timeout)
+                .pool_max_idle_per_host(self.pool_max_idle_per_host)
+                .pool_timer(hyper_util::rt::TokioTimer::new())
+                .build(connector);
 
         Ok(Proxy {
             ca: Arc::new(ca),
             http_layers: Arc::new(self.http_layers),
-            upstream_tls_connector: TlsConnector::from(Arc::new(client_config)),
+            upstream_client,
             server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(1024).unwrap(),
             ))),
@@ -367,7 +372,6 @@ impl ProxyBuilder {
             } else {
                 Some(Arc::new(self.credentials))
             },
-            connection_pool,
         })
     }
 }
@@ -449,20 +453,18 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
 pub struct Proxy {
     ca: Arc<CertificateAuthority>,
     http_layers: Arc<Vec<LayerFn>>,
-    upstream_tls_connector: TlsConnector,
+    upstream_client: UpstreamClient,
     server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
     drain_timeout: Option<Duration>,
     credentials: Option<Arc<Vec<(String, String)>>>,
-    connection_pool: ConnectionPool,
 }
 
 impl Proxy {
     /// Create a new builder.
     pub fn builder() -> ProxyBuilder {
-        let defaults = PoolConfig::default();
         ProxyBuilder {
             ca: None,
             http_layers: Vec::new(),
@@ -472,8 +474,8 @@ impl Proxy {
             max_connections: None,
             drain_timeout: None,
             credentials: Vec::new(),
-            pool_max_idle_per_host: defaults.max_idle_per_host,
-            pool_idle_timeout: defaults.idle_timeout,
+            pool_max_idle_per_host: 8,
+            pool_idle_timeout: Duration::from_secs(90),
         }
     }
 
@@ -762,64 +764,14 @@ impl Proxy {
         );
         tracing::debug!("CONNECT");
 
-        let pool_key = format!("{host}:{port}");
-
-        let sender = match self.connection_pool.checkout(&pool_key) {
-            PooledConnection::Reused(sender) => {
-                tracing::debug!("reusing pooled upstream connection");
-                sender
-            }
-            PooledConnection::Miss => {
-                let upstream_tcp = TcpStream::connect(format!("{host}:{port}")).await?;
-                let server_name: ServerName<'static> = host.to_string().try_into()?;
-                let upstream_tls = self
-                    .upstream_tls_connector
-                    .connect(server_name, upstream_tcp)
-                    .await?;
-
-                let upstream_is_h2 = upstream_tls
-                    .get_ref()
-                    .1
-                    .alpn_protocol()
-                    .is_some_and(|p| p == b"h2");
-
-                let upstream_io = TokioIo::new(upstream_tls);
-                if upstream_is_h2 {
-                    let (sender, conn) = hyper::client::conn::http2::handshake(
-                        hyper_util::rt::TokioExecutor::new(),
-                        upstream_io,
-                    )
-                    .await?;
-                    self.connection_pool
-                        .store_h2(pool_key.clone(), sender.clone());
-                    let pool = self.connection_pool.clone();
-                    let key = pool_key.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = conn.await {
-                            tracing::debug!(error = %e, "upstream connection closed");
-                        }
-                        pool.remove_h2(&key);
-                    });
-                    UpstreamSender::Http2(sender)
-                } else {
-                    let (sender, conn) = hyper::client::conn::http1::handshake(upstream_io).await?;
-                    tokio::spawn(async move {
-                        if let Err(e) = conn.with_upgrades().await {
-                            tracing::debug!(error = %e, "upstream connection closed");
-                        }
-                    });
-                    UpstreamSender::Http1(sender)
-                }
-            }
-        };
-
         let server_config = self.server_config_for(host)?;
         let acceptor = TlsAcceptor::from(server_config);
         let client_tls = acceptor.accept(TokioIo::new(upgraded)).await?;
 
-        // Build tower service chain for this connection
-        let forward =
-            ForwardService::new(sender).with_pool_return(pool_key, self.connection_pool.clone());
+        // Build tower service chain — upstream connection happens lazily via
+        // the pooled hyper-util Client when the first request arrives.
+        let authority: ::http::uri::Authority = format!("{host}:{port}").parse()?;
+        let forward = ForwardService::new(self.upstream_client.clone(), authority);
         let mut service: HttpService = tower::util::BoxService::new(forward);
         for layer_fn in self.http_layers.iter() {
             service = layer_fn(service);
