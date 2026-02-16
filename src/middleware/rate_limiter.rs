@@ -71,15 +71,20 @@ enum KeyMode {
 /// providing backpressure to clients while still eventually serving every
 /// request.
 ///
+/// For multi-window limiting, stack multiple layers:
+///
 /// # Examples
 ///
 /// ```rust,no_run
+/// use std::time::Duration;
 /// use noxy::{Proxy, middleware::RateLimiter};
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(RateLimiter::global(10.0))
+///     .http_layer(RateLimiter::global(30, Duration::from_secs(1)))
+///     .http_layer(RateLimiter::global(1500, Duration::from_secs(60)))
+///     .http_layer(RateLimiter::global(70000, Duration::from_secs(3600)))
 ///     .build()?;
 /// # Ok(())
 /// # }
@@ -91,32 +96,32 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Rate-limit per unique hostname. Each host gets its own token bucket.
-    pub fn per_host(rate: f64) -> Self {
+    fn new(key_mode: KeyMode, count: u32, window: Duration) -> Self {
+        let rate = count as f64 / window.as_secs_f64();
         Self {
             state: Arc::new(Mutex::new(SharedState {
                 buckets: HashMap::new(),
                 rate,
-                burst: rate,
+                burst: count as f64,
             })),
-            key_mode: KeyMode::PerHost,
+            key_mode,
         }
+    }
+
+    /// Rate-limit per unique hostname. Each host gets its own token bucket.
+    /// `count` requests are allowed per `window` duration.
+    pub fn per_host(count: u32, window: Duration) -> Self {
+        Self::new(KeyMode::PerHost, count, window)
     }
 
     /// Rate-limit globally across all hosts with a single shared bucket.
-    pub fn global(rate: f64) -> Self {
-        Self {
-            state: Arc::new(Mutex::new(SharedState {
-                buckets: HashMap::new(),
-                rate,
-                burst: rate,
-            })),
-            key_mode: KeyMode::Global,
-        }
+    /// `count` requests are allowed per `window` duration.
+    pub fn global(count: u32, window: Duration) -> Self {
+        Self::new(KeyMode::Global, count, window)
     }
 
-    /// Set the maximum burst size (max accumulated tokens). Defaults to the
-    /// rate value.
+    /// Set the maximum burst size (max accumulated tokens). Defaults to
+    /// `count`.
     pub fn burst(self, burst: u32) -> Self {
         self.state.lock().unwrap().burst = burst as f64;
         self
