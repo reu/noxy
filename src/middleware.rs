@@ -3,6 +3,7 @@ mod conditional;
 mod content_decoder;
 mod fault_injector;
 mod latency_injector;
+mod rate_limiter;
 mod set_response;
 mod traffic_logger;
 
@@ -11,6 +12,7 @@ pub use conditional::Conditional;
 pub use content_decoder::ContentDecoder;
 pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;
+pub use rate_limiter::RateLimiter;
 pub use set_response::SetResponse;
 pub use traffic_logger::TrafficLogger;
 

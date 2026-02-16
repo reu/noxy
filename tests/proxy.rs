@@ -13,7 +13,8 @@ use futures_util::stream::StreamExt;
 use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
 use noxy::middleware::{
-    BandwidthThrottle, Conditional, ContentDecoder, FaultInjector, LatencyInjector, TrafficLogger,
+    BandwidthThrottle, Conditional, ContentDecoder, FaultInjector, LatencyInjector, RateLimiter,
+    TrafficLogger,
 };
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
@@ -1320,4 +1321,36 @@ async fn proxy_relays_websocket() {
 
     // Clean close
     ws.close(None).await.unwrap();
+}
+
+#[tokio::test]
+async fn rate_limiter_delays_requests() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = RateLimiter::global(4.0).burst(1);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    let start = Instant::now();
+    for i in 0..4 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.text().await.unwrap(),
+            "hello",
+            "request {i} should succeed"
+        );
+    }
+    let elapsed = start.elapsed();
+
+    // Request 1: immediate (burst token). Requests 2-4: each ~250ms.
+    // Expected total: ~750ms, assert >= 600ms for CI slack.
+    assert!(
+        elapsed >= Duration::from_millis(600),
+        "4 requests at 4 req/s with burst=1 should take ~750ms, took {elapsed:?}"
+    );
 }
