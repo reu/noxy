@@ -72,6 +72,22 @@ struct Cli {
     #[arg(long = "pool-idle-timeout")]
     pool_idle_timeout: Option<String>,
 
+    /// Set a request header (format: "name: value", repeatable)
+    #[arg(long = "set-request-header")]
+    set_request_headers: Vec<String>,
+
+    /// Remove a request header (format: "name", repeatable)
+    #[arg(long = "remove-request-header")]
+    remove_request_headers: Vec<String>,
+
+    /// Set a response header (format: "name: value", repeatable)
+    #[arg(long = "set-response-header")]
+    set_response_headers: Vec<String>,
+
+    /// Remove a response header (format: "name", repeatable)
+    #[arg(long = "remove-response-header")]
+    remove_response_headers: Vec<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -219,6 +235,36 @@ async fn main() -> anyhow::Result<()> {
         cli_rules.push(parse_circuit_breaker_rule(&cb_str)?);
     }
 
+    {
+        let mut req_headers = noxy::config::HeaderOpsConfig::default();
+        let mut resp_headers = noxy::config::HeaderOpsConfig::default();
+
+        for h in cli.set_request_headers {
+            let (name, value) = parse_header_arg(&h)?;
+            req_headers.set.insert(name, value);
+        }
+        for name in cli.remove_request_headers {
+            req_headers.remove.push(name);
+        }
+        for h in cli.set_response_headers {
+            let (name, value) = parse_header_arg(&h)?;
+            resp_headers.set.insert(name, value);
+        }
+        for name in cli.remove_response_headers {
+            resp_headers.remove.push(name);
+        }
+
+        let has_req = !req_headers.set.is_empty() || !req_headers.remove.is_empty();
+        let has_resp = !resp_headers.set.is_empty() || !resp_headers.remove.is_empty();
+        if has_req || has_resp {
+            cli_rules.push(RuleConfig {
+                request_headers: if has_req { Some(req_headers) } else { None },
+                response_headers: if has_resp { Some(resp_headers) } else { None },
+                ..Default::default()
+            });
+        }
+    }
+
     config.append_rules(cli_rules);
 
     let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
@@ -228,6 +274,13 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await.ok();
         })
         .await
+}
+
+fn parse_header_arg(s: &str) -> anyhow::Result<(String, String)> {
+    let (name, value) = s
+        .split_once(':')
+        .ok_or_else(|| anyhow::anyhow!("header must be 'name: value', got '{s}'"))?;
+    Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
 fn parse_sliding_window_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {

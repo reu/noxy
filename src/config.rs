@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use crate::http::Body;
 use crate::middleware::{
-    BandwidthThrottle, CircuitBreaker, Conditional, FaultInjector, LatencyInjector, RateLimiter,
-    Retry, SetResponse, SlidingWindow, TrafficLogger,
+    BandwidthThrottle, CircuitBreaker, Conditional, FaultInjector, LatencyInjector, ModifyHeaders,
+    RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -78,6 +78,8 @@ pub struct RuleConfig {
     pub retry: Option<RetryConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub respond: Option<RespondConfig>,
+    pub request_headers: Option<HeaderOpsConfig>,
+    pub response_headers: Option<HeaderOpsConfig>,
 }
 
 /// Request matching condition.
@@ -162,6 +164,22 @@ pub struct RetryConfig {
     pub max_retries: Option<u32>,
     pub backoff: Option<DurationValue>,
     pub statuses: Option<Vec<u16>>,
+}
+
+/// Header modification operations: `set`, `append`, and `remove`.
+///
+/// ```toml
+/// request_headers = { set = { "x-proxy" = "noxy" }, remove = ["x-internal"] }
+/// response_headers = { set = { "x-served-by" = "noxy" }, append = { "via" = "noxy" }, remove = ["server"] }
+/// ```
+#[derive(Debug, Default, Deserialize)]
+pub struct HeaderOpsConfig {
+    #[serde(default)]
+    pub set: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub append: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -349,6 +367,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, responder);
     }
 
+    let modify = build_modify_headers(rule.request_headers, rule.response_headers);
+    if let Some(modify) = modify {
+        builder = apply_layer(builder, &predicate, modify);
+    }
+
     Ok(builder)
 }
 
@@ -443,6 +466,39 @@ fn build_circuit_breaker(config: CircuitBreakerConfig) -> CircuitBreaker {
     } else {
         cb
     }
+}
+
+fn build_modify_headers(
+    request: Option<HeaderOpsConfig>,
+    response: Option<HeaderOpsConfig>,
+) -> Option<ModifyHeaders> {
+    if request.is_none() && response.is_none() {
+        return None;
+    }
+    let mut m = ModifyHeaders::new();
+    if let Some(req) = request {
+        for (name, value) in req.set {
+            m = m.set_request(&name, &value);
+        }
+        for (name, value) in req.append {
+            m = m.append_request(&name, &value);
+        }
+        for name in req.remove {
+            m = m.remove_request(&name);
+        }
+    }
+    if let Some(resp) = response {
+        for (name, value) in resp.set {
+            m = m.set_response(&name, &value);
+        }
+        for (name, value) in resp.append {
+            m = m.append_response(&name, &value);
+        }
+        for name in resp.remove {
+            m = m.remove_response(&name);
+        }
+    }
+    Some(m)
 }
 
 fn build_retry(config: RetryConfig) -> Retry {
@@ -564,6 +620,14 @@ mod tests {
 
             [[rules]]
             circuit_breaker = { threshold = 3, recovery = "10s", half_open_probes = 2, per_host = true }
+
+            [[rules]]
+            request_headers = { set = { "x-proxy" = "noxy" }, remove = ["x-internal"] }
+            response_headers = { set = { "x-served-by" = "noxy" }, append = { "via" = "noxy" }, remove = ["server"] }
+
+            [[rules]]
+            match = { path_prefix = "/api" }
+            request_headers = { set = { "x-api-version" = "2" } }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -580,7 +644,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 16);
+        assert_eq!(config.rules.len(), 18);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -687,6 +751,20 @@ mod tests {
         assert_eq!(cb.recovery.0, Duration::from_secs(10));
         assert_eq!(cb.half_open_probes, Some(2));
         assert!(cb.per_host);
+
+        // Rule 16: request + response headers
+        let rh = config.rules[16].request_headers.as_ref().unwrap();
+        assert_eq!(rh.set.get("x-proxy").unwrap(), "noxy");
+        assert_eq!(rh.remove, vec!["x-internal"]);
+        let rsh = config.rules[16].response_headers.as_ref().unwrap();
+        assert_eq!(rsh.set.get("x-served-by").unwrap(), "noxy");
+        assert_eq!(rsh.append.get("via").unwrap(), "noxy");
+        assert_eq!(rsh.remove, vec!["server"]);
+
+        // Rule 17: conditional request headers
+        assert!(config.rules[17].match_config.is_some());
+        let rh = config.rules[17].request_headers.as_ref().unwrap();
+        assert_eq!(rh.set.get("x-api-version").unwrap(), "2");
     }
 
     #[test]

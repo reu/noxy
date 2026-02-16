@@ -265,6 +265,30 @@ impl ProxyBuilder {
         self.http_layer(middleware::CircuitBreaker::global(threshold, recovery))
     }
 
+    /// Set (insert or replace) a request header on all proxied requests.
+    ///
+    /// Use [`ModifyHeaders`](middleware::ModifyHeaders) directly with
+    /// [`http_layer`](Self::http_layer) for multiple operations or
+    /// response header modifications.
+    pub fn set_request_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.http_layer(middleware::ModifyHeaders::new().set_request(name, value))
+    }
+
+    /// Remove a request header from all proxied requests.
+    pub fn remove_request_header(self, name: impl AsRef<str>) -> Self {
+        self.http_layer(middleware::ModifyHeaders::new().remove_request(name))
+    }
+
+    /// Set (insert or replace) a response header on all proxied responses.
+    pub fn set_response_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
+        self.http_layer(middleware::ModifyHeaders::new().set_response(name, value))
+    }
+
+    /// Remove a response header from all proxied responses.
+    pub fn remove_response_header(self, name: impl AsRef<str>) -> Self {
+        self.http_layer(middleware::ModifyHeaders::new().remove_response(name))
+    }
+
     /// Set a timeout for the handshake phase before `serve_connection`:
     /// CONNECT parsing and client-side TLS.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
