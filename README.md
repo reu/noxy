@@ -22,11 +22,53 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 ### Forward proxy (TLS MITM)
 
 ```rust
+use std::time::Duration;
 use noxy::Proxy;
+use noxy::middleware::*;
 
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    .http_layer(my_tower_layer)
+    // Log all traffic with request/response bodies
+    .http_layer(TrafficLogger::new().log_bodies(true))
+    // Decode gzip/brotli/deflate/zstd response bodies
+    .http_layer(ContentDecoder::new())
+    // Add latency to every request
+    .http_layer(LatencyInjector::fixed(Duration::from_millis(200)))
+    // Limit bandwidth to 50 KB/s
+    .http_layer(BandwidthThrottle::new(50 * 1024))
+    // Global rate limit: 100 requests per second
+    .http_layer(RateLimiter::global(100, Duration::from_secs(1)))
+    // Per-host sliding window: 10 req/s per hostname
+    .http_layer(SlidingWindow::per_host(10, Duration::from_secs(1)))
+    // Retry 429/5xx responses up to 3 times with exponential backoff
+    .http_layer(Retry::default().max_retries(3))
+    // Trip circuit after 5 consecutive failures, recover in 30s
+    .http_layer(CircuitBreaker::global(5, Duration::from_secs(30)))
+    // Inject request/response headers
+    .http_layer(
+        ModifyHeaders::new()
+            .set_request("x-proxy", "noxy")
+            .remove_response("server"),
+    )
+    // Rewrite request paths
+    .http_layer(UrlRewrite::path("/api/v1/{*rest}", "/v2/{rest}")?)
+    // Block tracking domains
+    .http_layer(BlockList::new().host("*.tracking.com")?)
+    // 50% of requests to /flaky return 503
+    .http_layer(
+        Conditional::new()
+            .when_path("/flaky", FaultInjector::new().error_rate(0.5))
+    )
+    // Glob pattern: add latency to all paths under /api/*/slow
+    .http_layer(
+        Conditional::new()
+            .when_path_glob("/api/*/slow", LatencyInjector::fixed(Duration::from_millis(500)))?
+    )
+    // Return a fixed response for /health
+    .http_layer(
+        Conditional::new()
+            .when_path("/health", SetResponse::ok("ok"))
+    )
     .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
