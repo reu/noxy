@@ -8,6 +8,8 @@ use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use tower::Service;
 
+use crate::pool::ConnectionPool;
+
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 pub type HttpService = tower::util::BoxService<Request<Body>, Response<Body>, BoxError>;
@@ -33,14 +35,38 @@ pub(crate) enum UpstreamSender {
     Http2(hyper::client::conn::http2::SendRequest<Body>),
 }
 
+pub(crate) struct PoolReturn {
+    pub key: String,
+    pub pool: ConnectionPool,
+}
+
 /// Tower service that forwards requests to an upstream hyper connection.
 pub(crate) struct ForwardService {
-    sender: UpstreamSender,
+    sender: Option<UpstreamSender>,
+    pool_return: Option<PoolReturn>,
 }
 
 impl ForwardService {
     pub(crate) fn new(sender: UpstreamSender) -> Self {
-        Self { sender }
+        Self {
+            sender: Some(sender),
+            pool_return: None,
+        }
+    }
+
+    pub(crate) fn with_pool_return(mut self, key: String, pool: ConnectionPool) -> Self {
+        self.pool_return = Some(PoolReturn { key, pool });
+        self
+    }
+}
+
+impl Drop for ForwardService {
+    fn drop(&mut self) {
+        if let (Some(UpstreamSender::Http1(sender)), Some(ret)) =
+            (self.sender.take(), self.pool_return.take())
+        {
+            ret.pool.checkin_h1(ret.key, sender);
+        }
     }
 }
 
@@ -50,14 +76,14 @@ impl Service<Request<Body>> for ForwardService {
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match &mut self.sender {
+        match self.sender.as_mut().expect("sender used after drop") {
             UpstreamSender::Http1(s) => s.poll_ready(cx).map_err(|e| Box::new(e) as BoxError),
             UpstreamSender::Http2(s) => s.poll_ready(cx).map_err(|e| Box::new(e) as BoxError),
         }
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        match &mut self.sender {
+        match self.sender.as_mut().expect("sender used after drop") {
             UpstreamSender::Http1(s) => {
                 let fut = s.send_request(req);
                 Box::pin(async move {

@@ -40,6 +40,12 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub credentials: Vec<CredentialConfig>,
 
+    /// Max idle connections per host in the upstream pool (0 to disable). Default: 8.
+    pub pool_max_idle_per_host: Option<usize>,
+
+    /// Idle timeout for pooled upstream connections, e.g. "90s". Default: 90s.
+    pub pool_idle_timeout: Option<DurationValue>,
+
     /// Ordered list of middleware rules.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
@@ -277,6 +283,14 @@ impl ProxyConfig {
             builder = builder.credential(cred.username, cred.password);
         }
 
+        if let Some(max) = self.pool_max_idle_per_host {
+            builder = builder.pool_max_idle_per_host(max);
+        }
+
+        if let Some(timeout) = self.pool_idle_timeout {
+            builder = builder.pool_idle_timeout(timeout.0);
+        }
+
         for rule in self.rules {
             builder = apply_rule(builder, rule)?;
         }
@@ -489,6 +503,8 @@ mod tests {
         let toml = r#"
             listen = "127.0.0.1:9090"
             accept_invalid_upstream_certs = true
+            pool_max_idle_per_host = 16
+            pool_idle_timeout = "120s"
 
             [ca]
             cert = "cert.pem"
@@ -554,6 +570,11 @@ mod tests {
 
         assert_eq!(config.listen.as_deref(), Some("127.0.0.1:9090"));
         assert!(config.accept_invalid_upstream_certs);
+        assert_eq!(config.pool_max_idle_per_host, Some(16));
+        assert_eq!(
+            config.pool_idle_timeout.as_ref().unwrap().0,
+            Duration::from_secs(120)
+        );
 
         let ca = config.ca.unwrap();
         assert_eq!(ca.cert, "cert.pem");

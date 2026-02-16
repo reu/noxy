@@ -10,6 +10,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 - **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a path or path prefix
 - **TOML config file** -- configure the proxy and middleware rules declaratively
+- **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
 - Per-host certificate generation on the fly, signed by a user-provided CA
 - HTTP/1.1 and HTTP/2 support (auto-negotiated via ALPN)
 - Streaming bodies -- middleware can process data as it arrives without buffering
@@ -110,6 +111,8 @@ Options:
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
+      --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
+      --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
   -h, --help                   Print help
 
@@ -152,6 +155,12 @@ noxy --circuit-breaker 5/30s
 # Combine multiple flags
 noxy --log --latency 200ms --bandwidth 10240
 
+# Set upstream connection pool size per host (0 to disable)
+noxy --pool-max-idle 16
+
+# Set pool idle timeout
+noxy --pool-idle-timeout 120s
+
 # Accept invalid upstream certificates (e.g. self-signed)
 noxy --accept-invalid-certs
 
@@ -179,6 +188,8 @@ cert = "ca-cert.pem"
 key = "ca-key.pem"
 
 # accept_invalid_upstream_certs = true
+# pool_max_idle_per_host = 8
+# pool_idle_timeout = "90s"
 
 # Log all traffic
 [[rules]]

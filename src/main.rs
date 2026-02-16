@@ -64,6 +64,14 @@ struct Cli {
     #[arg(long = "circuit-breaker")]
     circuit_breaker: Option<String>,
 
+    /// Max idle connections per host in the upstream pool (default: 8, 0 to disable)
+    #[arg(long = "pool-max-idle")]
+    pool_max_idle: Option<usize>,
+
+    /// Idle timeout for pooled upstream connections (e.g., "90s")
+    #[arg(long = "pool-idle-timeout")]
+    pool_idle_timeout: Option<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -126,6 +134,16 @@ async fn main() -> anyhow::Result<()> {
 
     if cli.accept_invalid_certs {
         config.accept_invalid_upstream_certs = true;
+    }
+
+    if let Some(max) = cli.pool_max_idle {
+        config.pool_max_idle_per_host = Some(max);
+    }
+
+    if let Some(ref timeout_str) = cli.pool_idle_timeout {
+        let d = noxy::config::parse_duration(timeout_str)
+            .map_err(|e| anyhow::anyhow!("invalid pool-idle-timeout: {e}"))?;
+        config.pool_idle_timeout = Some(noxy::config::DurationValue(d));
     }
 
     for cred in cli.credentials {
