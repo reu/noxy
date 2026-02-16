@@ -8,7 +8,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
 - **Built-in middleware** -- traffic logging, header modification, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
-- **Conditional rules** -- apply middleware only to requests matching a path or path prefix
+- **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
 - Per-host certificate generation on the fly, signed by a user-provided CA
@@ -277,6 +277,22 @@ request_headers = { set = { "x-api-version" = "2" } }
 [[rules]]
 match = { path_prefix = "/fail" }
 respond = { status = 503, body = "service unavailable" }
+
+# Glob patterns in match conditions
+# Match any subdomain of example.com
+[[rules]]
+match = { host = "*.example.com" }
+latency = "100ms"
+
+# Match any single-segment path under /api/
+[[rules]]
+match = { path = "/api/*/users" }
+rate_limit = { count = 10, window = "1s" }
+
+# Match all paths recursively under /static/
+[[rules]]
+match = { path = "/static/**" }
+response_headers = { set = { "cache-control" = "public, max-age=86400" } }
 ```
 
 ### Rules
@@ -285,7 +301,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
-| `match`     | `{ path = "/exact" }` or `{ path_prefix = "/prefix" }`  |
+| `match`     | `{ host = "*.example.com", path = "/api/*/users" }` or `{ path_prefix = "/prefix" }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`) |
 | `log`       | `true` or `{ bodies = true }`                            |
 | `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |
 | `bandwidth` | Bytes per second throughput limit                         |

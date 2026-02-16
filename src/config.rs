@@ -2,6 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use globset::GlobMatcher;
 use http::Request;
 use serde::Deserialize;
 
@@ -82,14 +83,16 @@ pub struct RuleConfig {
     pub response_headers: Option<HeaderOpsConfig>,
 }
 
-/// Request matching condition.
+/// Request matching condition. The `host` and `path` fields support glob patterns
+/// (`*`, `**`, `?`, `[abc]`, `[a-z]`, `[!a-z]`). Literal strings with no metacharacters
+/// match exactly, preserving backward compatibility.
 #[derive(Debug, Deserialize)]
 pub struct MatchConfig {
-    /// Exact hostname match (port stripped).
+    /// Hostname glob (port stripped), e.g. `"*.example.com"`.
     pub host: Option<String>,
-    /// Exact path match.
+    /// Path glob, e.g. `"/api/*/users"`.
     pub path: Option<String>,
-    /// Path prefix match.
+    /// Path prefix match (unchanged, no glob).
     pub path_prefix: Option<String>,
 }
 
@@ -228,27 +231,39 @@ impl<'de> Deserialize<'de> for DurationOrRange {
 
 type Predicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
 
+fn compile_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
 impl MatchConfig {
-    fn into_predicate(self) -> Predicate {
-        Arc::new(move |req: &Request<Body>| {
-            if let Some(ref host) = self.host {
+    fn into_predicate(self) -> Result<Predicate, globset::Error> {
+        let host_matcher = self.host.as_deref().map(compile_glob).transpose()?;
+        let path_matcher = self.path.as_deref().map(compile_glob).transpose()?;
+        let path_prefix = self.path_prefix;
+
+        Ok(Arc::new(move |req: &Request<Body>| {
+            if let Some(ref m) = host_matcher {
                 let req_host = req
                     .uri()
                     .host()
                     .or_else(|| req.headers().get(http::header::HOST)?.to_str().ok())
                     .map(|h| h.split(':').next().unwrap_or(h));
-                if req_host != Some(host.as_str()) {
-                    return false;
+                match req_host {
+                    Some(h) if m.is_match(h) => {}
+                    _ => return false,
                 }
             }
-            if let Some(ref exact) = self.path {
-                return req.uri().path() == exact.as_str();
+            if let Some(ref m) = path_matcher {
+                return m.is_match(req.uri().path());
             }
-            if let Some(ref prefix) = self.path_prefix {
+            if let Some(ref prefix) = path_prefix {
                 return req.uri().path().starts_with(prefix.as_str());
             }
             true
-        })
+        }))
     }
 }
 
@@ -321,7 +336,7 @@ fn apply_rule(
     mut builder: crate::ProxyBuilder,
     rule: RuleConfig,
 ) -> anyhow::Result<crate::ProxyBuilder> {
-    let predicate = rule.match_config.map(|m| m.into_predicate());
+    let predicate = rule.match_config.map(|m| m.into_predicate()).transpose()?;
 
     if let Some(log_config) = rule.log {
         let logger = build_traffic_logger(log_config);
@@ -795,6 +810,111 @@ mod tests {
         assert_eq!(config.credentials[0].password, "secret");
         assert_eq!(config.credentials[1].username, "readonly");
         assert_eq!(config.credentials[1].password, "hunter2");
+    }
+
+    fn make_request(host: &str, path: &str) -> Request<Body> {
+        let uri = format!("https://{host}{path}");
+        Request::builder()
+            .uri(uri)
+            .body(crate::http::empty_body())
+            .unwrap()
+    }
+
+    #[test]
+    fn glob_exact_match() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/health".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/health")));
+        assert!(!pred(&make_request("example.com", "/healthz")));
+        assert!(!pred(&make_request("example.com", "/health/live")));
+    }
+
+    #[test]
+    fn glob_single_star() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/api/*/users".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/api/v1/users")));
+        assert!(pred(&make_request("example.com", "/api/v2/users")));
+        assert!(!pred(&make_request("example.com", "/api/v1/v2/users")));
+    }
+
+    #[test]
+    fn glob_double_star() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/api/**".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/api/v1/users")));
+        assert!(pred(&make_request("example.com", "/api/v1")));
+        assert!(!pred(&make_request("example.com", "/other")));
+    }
+
+    #[test]
+    fn glob_question_mark() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/api/v?".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/api/v1")));
+        assert!(pred(&make_request("example.com", "/api/v2")));
+        assert!(!pred(&make_request("example.com", "/api/v10")));
+    }
+
+    #[test]
+    fn glob_character_class() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/[abc].html".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/a.html")));
+        assert!(pred(&make_request("example.com", "/b.html")));
+        assert!(!pred(&make_request("example.com", "/d.html")));
+    }
+
+    #[test]
+    fn glob_host_wildcard() {
+        let pred = MatchConfig {
+            host: Some("*.example.com".into()),
+            path: None,
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("api.example.com", "/any")));
+        assert!(pred(&make_request("www.example.com", "/any")));
+        assert!(!pred(&make_request("example.com", "/any")));
+    }
+
+    #[test]
+    fn glob_star_does_not_cross_slash() {
+        let pred = MatchConfig {
+            host: None,
+            path: Some("/api/*".into()),
+            path_prefix: None,
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request("example.com", "/api/v1")));
+        assert!(!pred(&make_request("example.com", "/api/v1/users")));
     }
 
     #[test]
