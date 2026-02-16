@@ -77,15 +77,15 @@ impl Service<Request<Body>> for ContentDecoderService {
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_ascii_lowercase());
 
-            if let Some(enc) = encoding {
-                if is_supported(&enc) {
-                    resp.headers_mut().remove(http::header::CONTENT_ENCODING);
-                    resp.headers_mut().remove(http::header::CONTENT_LENGTH);
+            if let Some(enc) = encoding
+                && is_supported(&enc)
+            {
+                resp.headers_mut().remove(http::header::CONTENT_ENCODING);
+                resp.headers_mut().remove(http::header::CONTENT_LENGTH);
 
-                    let (parts, body) = resp.into_parts();
-                    let decoded = decode_body(body, &enc);
-                    return Ok(Response::from_parts(parts, decoded));
-                }
+                let (parts, body) = resp.into_parts();
+                let decoded = decode_body(body, &enc);
+                return Ok(Response::from_parts(parts, decoded));
             }
 
             Ok(resp)

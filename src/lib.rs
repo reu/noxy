@@ -368,28 +368,27 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
                 std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
                 let mut resp = svc.call(req).await?;
 
-                if resp.status() == ::http::StatusCode::SWITCHING_PROTOCOLS {
-                    if let Some(client_upgrade) = client_upgrade {
-                        let upstream_upgrade = hyper::upgrade::on(&mut resp);
-                        tokio::spawn(async move {
-                            let (client_io, upstream_io) =
-                                match tokio::try_join!(client_upgrade, upstream_upgrade) {
-                                    Ok(io) => io,
-                                    Err(e) => {
-                                        tracing::warn!(error = %e, "upgrade failed");
-                                        return;
-                                    }
-                                };
-                            let mut client_io = TokioIo::new(client_io);
-                            let mut upstream_io = TokioIo::new(upstream_io);
-                            if let Err(e) =
-                                tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io)
-                                    .await
-                            {
-                                tracing::debug!(error = %e, "upgrade stream ended");
-                            }
-                        });
-                    }
+                if resp.status() == ::http::StatusCode::SWITCHING_PROTOCOLS
+                    && let Some(client_upgrade) = client_upgrade
+                {
+                    let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                    tokio::spawn(async move {
+                        let (client_io, upstream_io) =
+                            match tokio::try_join!(client_upgrade, upstream_upgrade) {
+                                Ok(io) => io,
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "upgrade failed");
+                                    return;
+                                }
+                            };
+                        let mut client_io = TokioIo::new(client_io);
+                        let mut upstream_io = TokioIo::new(upstream_io);
+                        if let Err(e) =
+                            tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
+                        {
+                            tracing::debug!(error = %e, "upgrade stream ended");
+                        }
+                    });
                 }
 
                 Ok(resp)
