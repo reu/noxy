@@ -222,6 +222,16 @@ impl ProxyBuilder {
         self.http_layer(middleware::BandwidthThrottle::new(bytes_per_second))
     }
 
+    /// Rate-limit requests globally: `count` requests per `window`.
+    ///
+    /// Stack multiple calls for multi-window limiting (e.g., per-second +
+    /// per-minute). Use [`RateLimiter`](middleware::RateLimiter) directly
+    /// with [`http_layer`](Self::http_layer) for per-host keying or custom
+    /// burst.
+    pub fn rate_limit(self, count: u32, window: Duration) -> Self {
+        self.http_layer(middleware::RateLimiter::global(count, window))
+    }
+
     /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
     /// TCP connect, TLS handshakes, and hyper handshakes.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {

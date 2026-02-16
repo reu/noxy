@@ -7,7 +7,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 ## Features
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, mock responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, rate limiting, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a path or path prefix
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - Per-host certificate generation on the fly, signed by a user-provided CA
@@ -104,7 +104,9 @@ Options:
       --log-bodies             Log request/response bodies (implies --log)
       --latency <LATENCY>      Add global latency (e.g., "200ms", "100ms..500ms")
       --bandwidth <BANDWIDTH>  Global bandwidth limit in bytes per second
-      --accept-invalid-certs   Accept invalid upstream TLS certificates
+      --rate-limit <RATE>              Global rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
+      --per-host-rate-limit <RATE>     Per-host rate limit (e.g., "10/1s"). Repeatable.
+      --accept-invalid-certs           Accept invalid upstream TLS certificates
   -h, --help                   Print help
 
 # Log all traffic
@@ -121,6 +123,15 @@ noxy --latency 100ms..500ms
 
 # Limit bandwidth to 10 KB/s
 noxy --bandwidth 10240
+
+# Rate limit: 30 requests per second
+noxy --rate-limit 30/1s
+
+# Per-host rate limit: 10 requests per second per hostname
+noxy --per-host-rate-limit 10/1s
+
+# Multi-window rate limiting
+noxy --rate-limit 30/1s --rate-limit 1500/60s
 
 # Combine multiple flags
 noxy --log --latency 200ms --bandwidth 10240
@@ -182,6 +193,14 @@ fault = { error_rate = 0.5, abort_rate = 0.02 }
 match = { path = "/health" }
 respond = { body = "ok" }
 
+# Rate limit: 30 requests per second globally
+[[rules]]
+rate_limit = { count = 30, window = "1s" }
+
+# Rate limit: 1500 requests per minute, per host, with burst of 100
+[[rules]]
+rate_limit = { count = 1500, window = "60s", burst = 100, per_host = true }
+
 # Return 503 for all paths under /fail
 [[rules]]
 match = { path_prefix = "/fail" }
@@ -199,6 +218,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |
 | `bandwidth` | Bytes per second throughput limit                         |
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
+| `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
 
 ## Scripting Middleware

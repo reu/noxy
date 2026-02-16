@@ -53,6 +53,14 @@ Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT req
 
 ## Project Guidelines
 
+### Middleware checklist
+Every middleware should support all five surfaces:
+1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `http_layer()`
+2. **ProxyBuilder helper** — convenience method like `.rate_limit(30, Duration::from_secs(1))`
+3. **TOML config** — `rate_limit = { count = 30, window = "1s" }` in `[[rules]]` (`src/config.rs`)
+4. **CLI flag** — e.g. `--rate-limit 30/1s` (`src/main.rs`)
+5. **README** — update the features list, CLI options, example config, and rules table
+
 ### Comments
 - Avoid unnecessary comments, especially section dividers (e.g., `// -- Section name --`)
 - Only add comments that genuinely help understand the code, such as explanations of non-obvious logic, examples, or important caveats

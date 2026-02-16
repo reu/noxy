@@ -40,6 +40,14 @@ struct Cli {
     #[arg(long)]
     bandwidth: Option<u64>,
 
+    /// Global rate limit (e.g., "30/1s", "1500/60s"). Repeatable for multi-window.
+    #[arg(long = "rate-limit")]
+    rate_limits: Vec<String>,
+
+    /// Per-host rate limit (e.g., "10/1s", "500/60s"). Repeatable for multi-window.
+    #[arg(long = "per-host-rate-limit")]
+    per_host_rate_limits: Vec<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -146,6 +154,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    for rl_str in cli.rate_limits {
+        cli_rules.push(parse_rate_limit_rule(&rl_str, false)?);
+    }
+
+    for rl_str in cli.per_host_rate_limits {
+        cli_rules.push(parse_rate_limit_rule(&rl_str, true)?);
+    }
+
     config.append_rules(cli_rules);
 
     let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
@@ -155,4 +171,25 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await.ok();
         })
         .await
+}
+
+fn parse_rate_limit_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {
+    let (count_str, window_str) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("rate limit must be count/window (e.g. 30/1s)"))?;
+    let count: u32 = count_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid rate limit count: {e}"))?;
+    let window = noxy::config::parse_duration(window_str)
+        .map_err(|e| anyhow::anyhow!("invalid rate limit window: {e}"))?;
+
+    Ok(RuleConfig {
+        rate_limit: Some(noxy::config::RateLimitConfig {
+            count,
+            window: noxy::config::DurationValue(window),
+            burst: None,
+            per_host,
+        }),
+        ..Default::default()
+    })
 }

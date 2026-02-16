@@ -7,7 +7,8 @@ use serde::Deserialize;
 
 use crate::http::Body;
 use crate::middleware::{
-    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, SetResponse, TrafficLogger,
+    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, RateLimiter, SetResponse,
+    TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -66,6 +67,7 @@ pub struct RuleConfig {
     pub latency: Option<DurationOrRange>,
     pub bandwidth: Option<u64>,
     pub fault: Option<FaultConfig>,
+    pub rate_limit: Option<RateLimitConfig>,
     pub respond: Option<RespondConfig>,
 }
 
@@ -129,7 +131,16 @@ pub struct RespondConfig {
     pub status: Option<u16>,
 }
 
-fn parse_duration(s: &str) -> Result<Duration, String> {
+#[derive(Debug, Deserialize)]
+pub struct RateLimitConfig {
+    pub count: u32,
+    pub window: DurationValue,
+    pub burst: Option<u32>,
+    #[serde(default)]
+    pub per_host: bool,
+}
+
+pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let s = s.trim();
     if let Some(ms) = s.strip_suffix("ms") {
         let n: u64 = ms.parse().map_err(|e| format!("invalid duration: {e}"))?;
@@ -272,6 +283,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, injector);
     }
 
+    if let Some(rl_config) = rule.rate_limit {
+        let limiter = build_rate_limiter(rl_config);
+        builder = apply_layer(builder, &predicate, limiter);
+    }
+
     if let Some(respond_config) = rule.respond {
         let responder = build_set_response(respond_config)?;
         builder = apply_layer(builder, &predicate, responder);
@@ -337,6 +353,19 @@ fn build_set_response(config: RespondConfig) -> anyhow::Result<SetResponse> {
     let status = http::StatusCode::from_u16(status)
         .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
     Ok(SetResponse::new(status, config.body))
+}
+
+fn build_rate_limiter(config: RateLimitConfig) -> RateLimiter {
+    let limiter = if config.per_host {
+        RateLimiter::per_host(config.count, config.window.0)
+    } else {
+        RateLimiter::global(config.count, config.window.0)
+    };
+    if let Some(burst) = config.burst {
+        limiter.burst(burst)
+    } else {
+        limiter
+    }
 }
 
 #[cfg(test)]
@@ -417,6 +446,12 @@ mod tests {
             [[rules]]
             match = { host = "api.example.com", path_prefix = "/v2" }
             latency = "100ms"
+
+            [[rules]]
+            rate_limit = { count = 30, window = "1s" }
+
+            [[rules]]
+            rate_limit = { count = 1500, window = "60s", burst = 100, per_host = true }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -428,7 +463,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 8);
+        assert_eq!(config.rules.len(), 10);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -480,6 +515,20 @@ mod tests {
             config.rules[7].latency,
             Some(DurationOrRange::Fixed(d)) if d == Duration::from_millis(100)
         ));
+
+        // Rule 8: rate_limit global
+        let rl = config.rules[8].rate_limit.as_ref().unwrap();
+        assert_eq!(rl.count, 30);
+        assert_eq!(rl.window.0, Duration::from_secs(1));
+        assert_eq!(rl.burst, None);
+        assert!(!rl.per_host);
+
+        // Rule 9: rate_limit per-host with burst
+        let rl = config.rules[9].rate_limit.as_ref().unwrap();
+        assert_eq!(rl.count, 1500);
+        assert_eq!(rl.window.0, Duration::from_secs(60));
+        assert_eq!(rl.burst, Some(100));
+        assert!(rl.per_host);
     }
 
     #[test]
