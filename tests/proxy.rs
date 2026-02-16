@@ -1496,3 +1496,76 @@ async fn retry_retries_on_503() {
     assert_eq!(resp.text().await.unwrap(), "hello");
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 }
+
+#[tokio::test]
+async fn retry_custom_policy_inspects_body() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    // Returns 200 every time, but body says "error" for first 2 requests
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let counter = counter_clone.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    "error: temporary failure"
+                } else {
+                    "success"
+                }
+            }
+        }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Retry::default()
+            .max_retries(3)
+            .policy(|resp, _attempt| {
+                if resp.body().starts_with(b"error") {
+                    Some(Duration::from_millis(10))
+                } else {
+                    None
+                }
+            });
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "success");
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
