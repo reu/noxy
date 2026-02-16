@@ -61,6 +61,12 @@ Every middleware should support all five surfaces:
 4. **CLI flag** — e.g. `--rate-limit 30/1s` (`src/main.rs`)
 5. **README** — update the features list, CLI options, example config, and rules table
 
+### Middleware design
+- Prefer general, composable APIs over narrow ones. Middleware that operates on a per-request basis should accept a key function (`Fn(&Request<Body>) -> String`) so users can partition state by any criteria (global, per-host, per-header, per-API-key, etc.)
+- Provide convenience constructors for common cases: `::global(...)`, `::per_host(...)`, and `::keyed(...)` for custom key functions
+- Use builder methods for optional behavior (e.g., `.failure_policy(...)`, `.burst(...)`) rather than constructor parameters
+- Follow the shared-state pattern (`Arc<Mutex<HashMap<String, State>>>`) used by `RateLimiter`, `SlidingWindow`, and `CircuitBreaker` for keyed middleware
+
 ### Comments
 - Avoid unnecessary comments, especially section dividers (e.g., `// -- Section name --`)
 - Only add comments that genuinely help understand the code, such as explanations of non-obvious logic, examples, or important caveats
