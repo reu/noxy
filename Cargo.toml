@@ -53,6 +53,8 @@ toml = { version = "0.8", optional = true }
 base64 = "0.22"
 webpki-roots = "0.26"
 lru = "0.16.3"
+matchit = "0.8"
+regex = "1"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }

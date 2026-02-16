@@ -108,6 +108,14 @@ struct Cli {
     #[arg(long = "block-path")]
     block_paths: Vec<String>,
 
+    /// Rewrite request path (format: "pattern=replacement", repeatable)
+    #[arg(long = "rewrite-path")]
+    rewrite_paths: Vec<String>,
+
+    /// Rewrite request path using regex (format: "regex=replacement", repeatable)
+    #[arg(long = "rewrite-path-regex")]
+    rewrite_path_regexes: Vec<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -291,6 +299,34 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             });
         }
+    }
+
+    for rw in cli.rewrite_paths {
+        let (pattern, replace) = rw.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("rewrite-path must be 'pattern=replacement', got '{rw}'")
+        })?;
+        cli_rules.push(RuleConfig {
+            url_rewrite: Some(noxy::config::UrlRewriteConfig {
+                pattern: Some(pattern.to_string()),
+                regex: None,
+                replace: replace.to_string(),
+            }),
+            ..Default::default()
+        });
+    }
+
+    for rw in cli.rewrite_path_regexes {
+        let (regex, replace) = rw.split_once('=').ok_or_else(|| {
+            anyhow::anyhow!("rewrite-path-regex must be 'regex=replacement', got '{rw}'")
+        })?;
+        cli_rules.push(RuleConfig {
+            url_rewrite: Some(noxy::config::UrlRewriteConfig {
+                pattern: None,
+                regex: Some(regex.to_string()),
+                replace: replace.to_string(),
+            }),
+            ..Default::default()
+        });
     }
 
     if !cli.block_hosts.is_empty() || !cli.block_paths.is_empty() {

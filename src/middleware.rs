@@ -11,6 +11,7 @@ mod retry;
 mod set_response;
 mod sliding_window;
 mod traffic_logger;
+mod url_rewrite;
 
 pub use bandwidth_throttle::BandwidthThrottle;
 pub use block_list::BlockList;
@@ -25,6 +26,7 @@ pub use retry::Retry;
 pub use set_response::SetResponse;
 pub use sliding_window::SlidingWindow;
 pub use traffic_logger::TrafficLogger;
+pub use url_rewrite::UrlRewrite;
 
 #[cfg(feature = "scripting")]
 mod script;

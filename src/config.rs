@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::http::Body;
 use crate::middleware::{
     BandwidthThrottle, BlockList, CircuitBreaker, Conditional, FaultInjector, LatencyInjector,
-    ModifyHeaders, RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger,
+    ModifyHeaders, RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger, UrlRewrite,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -92,8 +92,16 @@ pub struct RuleConfig {
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub respond: Option<RespondConfig>,
     pub block: Option<BlockListConfig>,
+    pub url_rewrite: Option<UrlRewriteConfig>,
     pub request_headers: Option<HeaderOpsConfig>,
     pub response_headers: Option<HeaderOpsConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UrlRewriteConfig {
+    pub pattern: Option<String>,
+    pub regex: Option<String>,
+    pub replace: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -408,6 +416,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, cb);
     }
 
+    if let Some(rewrite_config) = rule.url_rewrite {
+        let rewrite = build_url_rewrite(rewrite_config)?;
+        builder = apply_layer(builder, &predicate, rewrite);
+    }
+
     if let Some(block_config) = rule.block {
         let block_list = build_block_list(block_config)?;
         builder = apply_layer(builder, &predicate, block_list);
@@ -572,6 +585,21 @@ fn build_modify_headers(
         }
     }
     Some(m)
+}
+
+fn build_url_rewrite(config: UrlRewriteConfig) -> anyhow::Result<UrlRewrite> {
+    match (config.pattern, config.regex) {
+        (Some(pattern), None) => UrlRewrite::path(&pattern, &config.replace)
+            .map_err(|e| anyhow::anyhow!("invalid rewrite pattern '{pattern}': {e}")),
+        (None, Some(regex)) => UrlRewrite::regex(&regex, &config.replace)
+            .map_err(|e| anyhow::anyhow!("invalid rewrite regex '{regex}': {e}")),
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "url_rewrite: specify either 'pattern' or 'regex', not both"
+        )),
+        (None, None) => Err(anyhow::anyhow!(
+            "url_rewrite: must specify either 'pattern' or 'regex'"
+        )),
+    }
 }
 
 fn build_retry(config: RetryConfig) -> Retry {

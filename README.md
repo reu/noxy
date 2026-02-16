@@ -9,7 +9,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Forward proxy** -- CONNECT tunnel with TLS MITM, per-host certificate generation signed by a user-provided CA
 - **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, header modification, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
@@ -143,6 +143,8 @@ Options:
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
+      --rewrite-path <SPEC>                Rewrite request path (e.g., "/old/{*rest}=/new/{rest}"). Repeatable.
+      --rewrite-path-regex <SPEC>        Rewrite request path via regex (e.g., "/api/v\d+/(.*)=/latest/$1"). Repeatable.
       --block-host <PATTERN>             Block hosts matching a glob pattern. Repeatable.
       --block-path <PATTERN>             Block paths matching a glob pattern. Repeatable.
       --set-request-header <HEADER>     Set a request header (e.g., "x-proxy: noxy"). Repeatable.
@@ -189,6 +191,12 @@ noxy --retry 3
 
 # Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
 noxy --circuit-breaker 5/30s
+
+# Rewrite request paths using matchit patterns
+noxy --upstream http://localhost:3000 --rewrite-path "/api/v1/{*rest}=/v2/{rest}"
+
+# Rewrite request paths using regex
+noxy --upstream http://localhost:3000 --rewrite-path-regex "/api/v\d+/(.*)=/latest/$1"
 
 # Block requests to tracking domains
 noxy --block-host "*.tracking.com" --block-host "ads.example.com"
@@ -340,6 +348,14 @@ response_headers = { remove = ["server"] }
 match = { path_prefix = "/api" }
 request_headers = { set = { "x-api-version" = "2" } }
 
+# Rewrite request paths using matchit patterns
+[[rules]]
+url_rewrite = { pattern = "/api/v1/{*rest}", replace = "/v2/{rest}" }
+
+# Rewrite request paths using regex
+[[rules]]
+url_rewrite = { regex = "/api/v\\d+/(.*)", replace = "/latest/$1" }
+
 # Block requests to tracking domains and admin paths
 [[rules]]
 block = { hosts = ["*.tracking.com", "ads.example.com"], paths = ["/admin/*"] }
@@ -377,6 +393,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
 | `match`     | `{ host = "*.example.com", path = "/api/*/users" }` or `{ path_prefix = "/prefix" }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`) |
+| `url_rewrite` | `{ pattern = "/old/{*rest}", replace = "/new/{rest}" }` or `{ regex = "/v\\d+/(.*)", replace = "/latest/$1" }` -- rewrite request paths |
 | `block`     | `{ hosts = ["*.tracking.com"], paths = ["/admin/*"] }` -- optional `status` and `body` fields (default: 403 empty) |
 | `log`       | `true` or `{ bodies = true }`                            |
 | `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |

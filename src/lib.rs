@@ -318,6 +318,16 @@ impl ProxyBuilder {
         Ok(self.http_layer(middleware::BlockList::hosts(patterns)?))
     }
 
+    /// Rewrite request paths using a `matchit`-style route pattern.
+    ///
+    /// Use [`UrlRewrite`](middleware::UrlRewrite) directly with
+    /// [`http_layer`](Self::http_layer) for regex rewrites or multiple rules.
+    pub fn rewrite_path(self, pattern: &str, replacement: &str) -> Self {
+        self.http_layer(
+            middleware::UrlRewrite::path(pattern, replacement).expect("invalid rewrite pattern"),
+        )
+    }
+
     /// Block requests to paths matching any of the given glob patterns.
     ///
     /// Blocked requests receive a `403 Forbidden` response. Use
