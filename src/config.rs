@@ -18,7 +18,13 @@ pub struct ProxyConfig {
     /// Listen address, e.g. "127.0.0.1:8080".
     pub listen: Option<String>,
 
-    /// CA certificate and key paths.
+    /// Fixed upstream URL for reverse proxy mode, e.g. "https://api.example.com".
+    pub upstream: Option<String>,
+
+    /// TLS certificate and key for serving HTTPS to clients (reverse proxy mode).
+    pub tls: Option<TlsConfig>,
+
+    /// CA certificate and key paths (forward proxy mode).
     pub ca: Option<CaConfig>,
 
     /// Accept invalid upstream TLS certificates.
@@ -54,6 +60,12 @@ pub struct ProxyConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct CaConfig {
+    pub cert: String,
+    pub key: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TlsConfig {
     pub cert: String,
     pub key: String,
 }
@@ -298,6 +310,14 @@ impl ProxyConfig {
     /// Build a [`ProxyBuilder`](crate::ProxyBuilder) from this config.
     pub fn into_builder(self) -> anyhow::Result<crate::ProxyBuilder> {
         let mut builder = crate::Proxy::builder();
+
+        if let Some(ref upstream) = self.upstream {
+            builder = builder.reverse_proxy(upstream)?;
+        }
+
+        if let Some(ref tls) = self.tls {
+            builder = builder.tls_identity(&tls.cert, &tls.key)?;
+        }
 
         if let Some(ca) = self.ca {
             builder = builder.ca_pem_files(&ca.cert, &ca.key)?;

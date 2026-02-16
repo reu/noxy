@@ -20,6 +20,7 @@ pub type Body = http_body_util::combinators::BoxBody<Bytes, BoxError>;
 pub type HttpService = tower::util::BoxService<Request<Body>, Response<Body>, BoxError>;
 
 pub(crate) type UpstreamClient = hyper_util::client::legacy::Client<UpstreamConnector, Body>;
+pub(crate) type UpstreamScheme = ::http::uri::Scheme;
 
 pub fn full_body(data: impl Into<Bytes>) -> Body {
     http_body_util::Full::new(data.into())
@@ -36,44 +37,64 @@ pub(crate) fn incoming_to_body(incoming: Incoming) -> Body {
     incoming.map_err(|e| -> BoxError { Box::new(e) }).boxed()
 }
 
-/// TLS stream wrapper that reports ALPN negotiation to hyper-util's pool.
-pub(crate) struct UpstreamTls(tokio_rustls::client::TlsStream<TcpStream>);
+/// Upstream I/O wrapper supporting both TLS and plain TCP connections.
+pub(crate) enum UpstreamIo {
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+    Plain(TcpStream),
+}
 
-impl Connection for UpstreamTls {
+impl Connection for UpstreamIo {
     fn connected(&self) -> hyper_util::client::legacy::connect::Connected {
-        let mut connected = hyper_util::client::legacy::connect::Connected::new();
-        if self.0.get_ref().1.alpn_protocol() == Some(b"h2") {
-            connected = connected.negotiated_h2();
+        match self {
+            UpstreamIo::Tls(tls) => {
+                let mut connected = hyper_util::client::legacy::connect::Connected::new();
+                if tls.get_ref().1.alpn_protocol() == Some(b"h2") {
+                    connected = connected.negotiated_h2();
+                }
+                connected
+            }
+            UpstreamIo::Plain(_) => hyper_util::client::legacy::connect::Connected::new(),
         }
-        connected
     }
 }
 
-impl AsyncRead for UpstreamTls {
+impl AsyncRead for UpstreamIo {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+        match self.get_mut() {
+            UpstreamIo::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            UpstreamIo::Plain(s) => Pin::new(s).poll_read(cx, buf),
+        }
     }
 }
 
-impl AsyncWrite for UpstreamTls {
+impl AsyncWrite for UpstreamIo {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        match self.get_mut() {
+            UpstreamIo::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            UpstreamIo::Plain(s) => Pin::new(s).poll_write(cx, buf),
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_flush(cx)
+        match self.get_mut() {
+            UpstreamIo::Tls(s) => Pin::new(s).poll_flush(cx),
+            UpstreamIo::Plain(s) => Pin::new(s).poll_flush(cx),
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        match self.get_mut() {
+            UpstreamIo::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            UpstreamIo::Plain(s) => Pin::new(s).poll_shutdown(cx),
+        }
     }
 }
 
@@ -84,7 +105,7 @@ pub(crate) struct UpstreamConnector {
 }
 
 impl Service<Uri> for UpstreamConnector {
-    type Response = TokioIo<UpstreamTls>;
+    type Response = TokioIo<UpstreamIo>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -94,13 +115,19 @@ impl Service<Uri> for UpstreamConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let tls = self.tls.clone();
+        let is_plain = uri.scheme_str() == Some("http");
         Box::pin(async move {
             let host = uri.host().ok_or("missing host in URI")?;
-            let port = uri.port_u16().unwrap_or(443);
+            let default_port = if is_plain { 80 } else { 443 };
+            let port = uri.port_u16().unwrap_or(default_port);
             let tcp = TcpStream::connect((host, port)).await?;
-            let server_name: ServerName<'static> = host.to_string().try_into()?;
-            let tls_stream = tls.connect(server_name, tcp).await?;
-            Ok(TokioIo::new(UpstreamTls(tls_stream)))
+            if is_plain {
+                Ok(TokioIo::new(UpstreamIo::Plain(tcp)))
+            } else {
+                let server_name: ServerName<'static> = host.to_string().try_into()?;
+                let tls_stream = tls.connect(server_name, tcp).await?;
+                Ok(TokioIo::new(UpstreamIo::Tls(Box::new(tls_stream))))
+            }
         })
     }
 }
@@ -109,11 +136,20 @@ impl Service<Uri> for UpstreamConnector {
 pub(crate) struct ForwardService {
     client: UpstreamClient,
     authority: ::http::uri::Authority,
+    scheme: UpstreamScheme,
 }
 
 impl ForwardService {
-    pub(crate) fn new(client: UpstreamClient, authority: ::http::uri::Authority) -> Self {
-        Self { client, authority }
+    pub(crate) fn new(
+        client: UpstreamClient,
+        authority: ::http::uri::Authority,
+        scheme: UpstreamScheme,
+    ) -> Self {
+        Self {
+            client,
+            authority,
+            scheme,
+        }
     }
 }
 
@@ -128,7 +164,7 @@ impl Service<Request<Body>> for ForwardService {
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
         let mut parts = req.uri().clone().into_parts();
-        parts.scheme = Some(::http::uri::Scheme::HTTPS);
+        parts.scheme = Some(self.scheme.clone());
         parts.authority = Some(self.authority.clone());
         if let Ok(uri) = ::http::Uri::from_parts(parts) {
             *req.uri_mut() = uri;

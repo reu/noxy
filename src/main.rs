@@ -24,6 +24,18 @@ struct Cli {
     #[arg(long)]
     generate: bool,
 
+    /// Reverse proxy mode: forward all traffic to this upstream URL
+    #[arg(long)]
+    upstream: Option<String>,
+
+    /// TLS certificate for client-facing HTTPS (reverse proxy mode)
+    #[arg(long = "tls-cert")]
+    tls_cert: Option<String>,
+
+    /// TLS private key for client-facing HTTPS (reverse proxy mode)
+    #[arg(long = "tls-key")]
+    tls_key: Option<String>,
+
     /// Enable traffic logging
     #[arg(long)]
     log: bool,
@@ -145,7 +157,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // CLI overrides for global settings
-    if config.ca.is_none() {
+    if let Some(upstream) = cli.upstream {
+        config.upstream = Some(upstream);
+    }
+
+    if let (Some(cert), Some(key)) = (cli.tls_cert, cli.tls_key) {
+        config.tls = Some(noxy::config::TlsConfig { cert, key });
+    }
+
+    if config.upstream.is_none() && config.ca.is_none() {
         config.ca = Some(noxy::config::CaConfig {
             cert: cli.cert,
             key: cli.key,

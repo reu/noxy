@@ -1,29 +1,32 @@
-# Noxy — TLS MITM Proxy
+# Noxy — HTTP Proxy
 
-Noxy is a TLS man-in-the-middle proxy written in Rust. It intercepts CONNECT requests, generates fake certificates signed by a local CA, and relays HTTP traffic between client and upstream through a tower middleware pipeline.
+Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and reverse proxy modes. In forward mode, it intercepts CONNECT requests, generates fake certificates signed by a local CA, and relays HTTP traffic. In reverse proxy mode, it forwards all incoming HTTP traffic to a fixed upstream. Both modes relay traffic through a tower middleware pipeline.
 
 ## Architecture
 
 ### Entry point (`src/main.rs`)
-- `main()` — CLI interface (behind `cli` feature), loads CA cert/key, builds proxy, runs accept loop
+- `main()` — CLI interface (behind `cli` feature), loads CA cert/key or upstream URL, builds proxy, runs accept loop
 - CA generation via `--generate` flag
+- `--upstream <URL>` enables reverse proxy mode; `--tls-cert`/`--tls-key` for client-facing TLS
 
 ### HTTP types and forwarding (`src/http.rs`)
 - `Body` — `BoxBody<Bytes, BoxError>`, supports both buffered and streaming access
 - `HttpService` — `BoxService<Request<Body>, Response<Body>, BoxError>`
-- `ForwardService` — innermost tower service, wraps a hyper `SendRequest` handle to forward requests upstream. Supports both HTTP/1.1 and HTTP/2 via `UpstreamSender` enum.
+- `UpstreamIo` — enum wrapping `TlsStream` (HTTPS) and plain `TcpStream` (HTTP) upstream connections
+- `ForwardService` — innermost tower service, wraps hyper-util's pooled `Client` to forward requests upstream. Takes authority + scheme to support both HTTP and HTTPS upstreams.
 - `incoming_to_body()` — converts hyper's `Incoming` to our `BoxBody`
 - `full_body()` / `empty_body()` — body construction helpers
 
 ### Proxy core (`src/lib.rs`)
 - `CertificateAuthority` — wraps CA cert/key, generates per-host leaf certificates
-- `ProxyBuilder` — configures CA, tower layers, upstream cert verification
-- `Proxy` — cloneable via internal `Arc`s, runs accept loop
-- `handle_connection()` — handles a single CONNECT tunnel:
-  1. Parses CONNECT request, establishes TLS on both sides (with ALPN for h2/http1.1)
-  2. Hyper client handshake on upstream (HTTP/1.1 or HTTP/2 based on ALPN)
-  3. Builds tower service chain: `ForwardService` → user layers
-  4. Hyper server auto-builder serves the client connection through the service chain
+- `ProxyMode` — enum: `Forward { ca, server_config_cache, credentials }` or `Reverse { upstream_authority, upstream_scheme, tls_acceptor }`
+- `ProxyBuilder` — configures CA (forward) or upstream URL (reverse), tower layers, upstream cert verification
+  - `.reverse_proxy(url)` — enables reverse proxy mode
+  - `.tls_identity(cert, key)` — client-facing TLS for reverse proxy
+- `Proxy` — cloneable via internal `Arc`s, runs accept loop, dispatches to mode-specific handlers
+- `handle_forward_connection()` — CONNECT tunnel: parses CONNECT, generates per-host cert, establishes TLS both sides, builds tower chain, serves via hyper
+- `handle_reverse_connection()` — reverse proxy: builds tower chain with fixed upstream, optionally TLS-accepts client, serves via hyper
+- `serve_client()` — shared hyper auto-builder + idle timeout + shutdown select, used by both modes
 - `HyperServiceAdapter` — bridges tower's `&mut self` call model to hyper's `&self` via `Arc<Mutex>`
 - `http_layer()` — accepts any `tower::Layer<HttpService>`, type-erased via `LayerFn` closures
 

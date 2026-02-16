@@ -2,35 +2,50 @@
 
 > *The darkness your packets pass through.*
 
-A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built on [tower](https://crates.io/crates/tower), noxy gives you full access to decoded HTTP requests and responses flowing through the proxy using standard tower `Service` and `Layer` abstractions -- including all existing [tower-http](https://crates.io/crates/tower-http) middleware out of the box.
+An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTPS via TLS MITM; reverse mode sits in front of a backend and forwards traffic directly. Built on top of [tower](https://crates.io/crates/tower), Noxy gives you full access to decoded HTTP requests and responses flowing through the proxy using standard tower `Service` and `Layer` abstractions -- including all existing [tower-http](https://crates.io/crates/tower-http) middleware out of the box.
 
 ## Features
 
+- **Forward proxy** -- CONNECT tunnel with TLS MITM, per-host certificate generation signed by a user-provided CA
+- **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
 - **Built-in middleware** -- traffic logging, header modification, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
-- Per-host certificate generation on the fly, signed by a user-provided CA
 - HTTP/1.1 and HTTP/2 support (auto-negotiated via ALPN)
 - Streaming bodies -- middleware can process data as it arrives without buffering
 - Async I/O with Tokio and Hyper
 
 ## Library Usage
 
+### Forward proxy (TLS MITM)
+
 ```rust
 use noxy::Proxy;
 
-// A custom tower layer that adds a header to every response
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
     .http_layer(my_tower_layer)
-    .build();
+    .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
 ```
 
-Any tower `Layer<HttpService>` works. The innermost service forwards requests to the upstream server; your layers wrap around it in an onion model and can inspect or modify requests before forwarding and responses after.
+### Reverse proxy
+
+```rust
+use noxy::Proxy;
+
+let proxy = Proxy::builder()
+    .reverse_proxy("http://localhost:3000")?
+    .http_layer(my_tower_layer)
+    .build()?;
+
+proxy.listen("127.0.0.1:8080").await?;
+```
+
+Any tower `Layer<HttpService>` works in both modes. The innermost service forwards requests to the upstream server; your layers wrap around it in an onion model and can inspect or modify requests before forwarding and responses after.
 
 ## Installation
 
@@ -58,7 +73,21 @@ cargo install noxy --features cli
 
 ## Quick Start
 
-### 1. Generate a CA certificate
+### Reverse proxy (simplest)
+
+No certificates needed -- just point Noxy at a backend:
+
+```bash
+# Start noxy in front of a local service
+noxy --upstream http://localhost:3000 --log
+
+# Requests go directly to noxy, no proxy configuration needed
+curl http://127.0.0.1:8080/api/users
+```
+
+### Forward proxy (TLS MITM)
+
+#### 1. Generate a CA certificate
 
 ```bash
 cargo run --features cli -- --generate
@@ -70,19 +99,19 @@ Or with OpenSSL:
 openssl req -x509 -newkey rsa:2048 -keyout ca-key.pem -out ca-cert.pem -days 365 -nodes -subj "/CN=Noxy CA"
 ```
 
-### 2. Run the proxy
+#### 2. Run the proxy
 
 ```bash
 cargo run --features cli
 ```
 
-### 3. Make a request through the proxy
+#### 3. Make a request through the proxy
 
 ```bash
 curl --proxy http://127.0.0.1:8080 --cacert ca-cert.pem https://example.com
 ```
 
-### Trusting the CA system-wide
+#### Trusting the CA system-wide
 
 Instead of passing `--cacert` every time, you can install `ca-cert.pem` into your OS or browser trust store. This lets any application use the proxy transparently.
 
@@ -101,6 +130,9 @@ Options:
       --key <KEY>              Path to CA private key PEM file [default: ca-key.pem]
       --listen <LISTEN>        Listen address [default: 127.0.0.1:8080]
       --generate               Generate a new CA cert+key pair and exit
+      --upstream <URL>         Reverse proxy mode: forward all traffic to this upstream URL
+      --tls-cert <PATH>        TLS cert for client-facing HTTPS (reverse proxy mode)
+      --tls-key <PATH>         TLS key for client-facing HTTPS (reverse proxy mode)
       --log                    Enable traffic logging
       --log-bodies             Log request/response bodies (implies --log)
       --latency <LATENCY>      Add global latency (e.g., "200ms", "100ms..500ms")
@@ -184,6 +216,15 @@ noxy --accept-invalid-certs
 
 # Custom listen address and CA paths
 noxy --listen 0.0.0.0:9090 --cert my-ca.pem --key my-ca-key.pem
+
+# Reverse proxy to a local backend
+noxy --upstream http://localhost:3000 --log
+
+# Reverse proxy to an HTTPS backend with rate limiting
+noxy --upstream https://api.example.com --rate-limit 100/1s
+
+# Reverse proxy with client-facing TLS
+noxy --upstream http://localhost:3000 --tls-cert server.pem --tls-key server-key.pem
 ```
 
 ## Config File
@@ -196,7 +237,25 @@ noxy --config proxy.toml
 
 CLI flags override config file settings for global options (listen address, CA paths, etc.) and append additional unconditional rules.
 
-### Example config
+### Reverse proxy config
+
+```toml
+listen = "127.0.0.1:8080"
+upstream = "http://localhost:3000"
+
+# Optional: serve HTTPS to clients
+# [tls]
+# cert = "server.pem"
+# key = "server-key.pem"
+
+[[rules]]
+log = true
+
+[[rules]]
+rate_limit = { count = 100, window = "1s" }
+```
+
+### Forward proxy config
 
 ```toml
 listen = "127.0.0.1:8080"
@@ -403,9 +462,11 @@ ScriptLayer::from_file("middleware.ts")?.shared()
 
 ## How It Works
 
-Normal HTTPS creates an encrypted tunnel between client and server -- nobody in the middle can read the traffic. Noxy breaks that tunnel into **two separate TLS sessions** and sits in between, with your middleware pipeline processing decoded HTTP traffic.
+Noxy operates in two modes. Both feed traffic through the same tower middleware pipeline -- the difference is how connections are established.
 
-### The flow
+### Forward proxy (TLS MITM)
+
+Normal HTTPS creates an encrypted tunnel between client and server -- nobody in the middle can read the traffic. Noxy breaks that tunnel into **two separate TLS sessions** and sits in between, with your middleware pipeline processing decoded HTTP traffic.
 
 ```mermaid
 sequenceDiagram
@@ -437,8 +498,6 @@ sequenceDiagram
     end
 ```
 
-### Step by step
-
 1. **HTTP CONNECT** -- the client sends an unencrypted `CONNECT example.com:443` request to the proxy. The proxy learns the target hostname from this plaintext request.
 
 2. **Upstream TLS** -- Noxy opens a real TLS connection to `example.com`, verifying the server's authentic certificate against Mozilla's root CAs.
@@ -448,6 +507,104 @@ sequenceDiagram
 4. **Client TLS** -- Noxy performs a TLS handshake with the client using the fake certificate. The client accepts it because it trusts the CA.
 
 5. **HTTP relay with middleware** -- with both TLS sessions established, Hyper handles the HTTP connection on both sides. Each request from the client passes through your tower middleware pipeline before being forwarded upstream, and each response passes back through the pipeline before being sent to the client.
+
+### Reverse proxy
+
+In reverse proxy mode, Noxy sits in front of a **fixed upstream** and forwards all incoming HTTP traffic directly. There is no CONNECT tunnel, no CA certificate, and no client-side proxy configuration -- clients talk to Noxy as if it were the real server.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as Noxy
+    participant S as Upstream (fixed)
+
+    C->>N: GET /api/users HTTP/1.1
+    Note over N: Tower middleware pipeline<br/>[Layer] → [Layer] → upstream
+    N->>S: GET /api/users HTTP/1.1
+
+    S-->>N: 200 OK
+    Note over N: upstream → [Layer] → [Layer]
+    N-->>C: 200 OK (modified)
+```
+
+1. **Direct HTTP** -- the client sends a plain HTTP request to Noxy's listen address. No CONNECT, no proxy configuration, no certificate trust needed.
+
+2. **Middleware pipeline** -- the request passes through the tower middleware stack (rate limiting, logging, header injection, etc.), exactly the same pipeline used in forward mode.
+
+3. **Upstream forwarding** -- Noxy forwards the request to the configured upstream. The upstream can be HTTP or HTTPS -- Noxy handles TLS to the backend transparently.
+
+4. **Response relay** -- the upstream response passes back through the middleware stack and is returned to the client.
+
+Optionally, Noxy can **serve HTTPS to clients** using a TLS certificate you provide (`--tls-cert` / `--tls-key`). This is independent of the upstream scheme -- you can terminate TLS at Noxy while forwarding to a plain HTTP backend, or chain TLS end-to-end.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant N as Noxy (TLS)
+    participant S as Upstream (HTTP)
+
+    C->>N: TLS handshake (your cert)
+    N-->>C: TLS established
+
+    C->>N: GET /api/users HTTP/1.1
+    Note over N: Middleware pipeline
+    N->>S: GET /api/users HTTP/1.1 (plain)
+
+    S-->>N: 200 OK
+    N-->>C: 200 OK (over TLS)
+```
+
+### Use cases
+
+**Sidecar proxy** -- put Noxy in front of a microservice to add rate limiting, circuit breaking, retry, and logging without modifying the service itself:
+
+```bash
+noxy --upstream http://localhost:3000 \
+     --rate-limit 100/1s \
+     --circuit-breaker 5/30s \
+     --retry 3 \
+     --log
+```
+
+**API gateway** -- terminate TLS and apply middleware before routing to a backend:
+
+```bash
+noxy --upstream http://localhost:8080 \
+     --tls-cert server.pem --tls-key server-key.pem \
+     --set-request-header "x-forwarded-proto: https" \
+     --remove-response-header server \
+     --rate-limit 1000/60s
+```
+
+**Testing and development** -- inject faults, latency, or mock responses in front of a real API to test client resilience:
+
+```bash
+# Simulate a flaky upstream
+noxy --upstream https://api.example.com \
+     --latency 200ms..800ms \
+     --log-bodies
+```
+
+```toml
+# Surgical fault injection via config file
+listen = "127.0.0.1:8080"
+upstream = "https://api.example.com"
+
+[[rules]]
+log = { bodies = true }
+
+[[rules]]
+match = { path = "/api/checkout" }
+fault = { error_rate = 0.3, error_status = 503 }
+
+[[rules]]
+match = { path_prefix = "/api/search" }
+latency = "500ms..2s"
+
+[[rules]]
+match = { path = "/api/health" }
+respond = { body = '{"status": "ok"}' }
+```
 
 ## License
 

@@ -26,8 +26,8 @@ use tower::Service;
 use tracing::Instrument;
 
 use http::{
-    Body, BoxError, ForwardService, HttpService, UpstreamClient, UpstreamConnector, empty_body,
-    incoming_to_body,
+    Body, BoxError, ForwardService, HttpService, UpstreamClient, UpstreamConnector, UpstreamScheme,
+    empty_body, incoming_to_body,
 };
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
@@ -145,6 +145,20 @@ impl CertificateAuthority {
     }
 }
 
+#[derive(Clone)]
+enum ProxyMode {
+    Forward {
+        ca: Arc<CertificateAuthority>,
+        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        credentials: Option<Arc<Vec<(String, String)>>>,
+    },
+    Reverse {
+        upstream_authority: ::http::uri::Authority,
+        upstream_scheme: UpstreamScheme,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
+    },
+}
+
 /// Builder for configuring a [`Proxy`].
 pub struct ProxyBuilder {
     ca: Option<CertificateAuthority>,
@@ -157,6 +171,8 @@ pub struct ProxyBuilder {
     credentials: Vec<(String, String)>,
     pool_max_idle_per_host: usize,
     pool_idle_timeout: Duration,
+    upstream_target: Option<(::http::uri::Authority, UpstreamScheme)>,
+    tls_identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
 }
 
 impl ProxyBuilder {
@@ -375,12 +391,43 @@ impl ProxyBuilder {
         self
     }
 
-    /// Build the proxy. Returns an error if no CA has been set.
-    pub fn build(self) -> anyhow::Result<Proxy> {
-        let ca = self
-            .ca
-            .ok_or_else(|| anyhow::anyhow!("CertificateAuthority must be set"))?;
+    /// Enable reverse proxy mode: forward all incoming HTTP traffic to the
+    /// given upstream URL (e.g. `"http://localhost:3000"` or
+    /// `"https://api.example.com"`). No CONNECT tunnel, no CA, no
+    /// client-side certificate configuration required.
+    pub fn reverse_proxy(mut self, url: &str) -> anyhow::Result<Self> {
+        let uri: ::http::Uri = url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid upstream URL: {e}"))?;
+        let scheme = uri.scheme().cloned().unwrap_or(::http::uri::Scheme::HTTP);
+        let authority = uri
+            .authority()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("upstream URL must contain a host"))?;
+        self.upstream_target = Some((authority, scheme));
+        Ok(self)
+    }
 
+    /// Set a TLS identity (cert + key) for serving HTTPS to clients in
+    /// reverse proxy mode.
+    pub fn tls_identity(
+        mut self,
+        cert_path: impl AsRef<std::path::Path>,
+        key_path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let cert_pem = std::fs::read(cert_path)?;
+        let key_pem = std::fs::read(key_path)?;
+        let certs: Vec<CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut &*cert_pem).collect::<Result<_, _>>()?;
+        let key = rustls_pemfile::private_key(&mut &*key_pem)?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in PEM file"))?;
+        self.tls_identity = Some((certs, key));
+        Ok(self)
+    }
+
+    /// Build the proxy. In forward mode, a CA must be set. In reverse proxy
+    /// mode (when `reverse_proxy()` has been called), no CA is needed.
+    pub fn build(self) -> anyhow::Result<Proxy> {
         let mut client_config = if self.accept_invalid_upstream_certs {
             ClientConfig::builder()
                 .dangerous()
@@ -406,22 +453,46 @@ impl ProxyBuilder {
                 .pool_timer(hyper_util::rt::TokioTimer::new())
                 .build(connector);
 
+        let mode = if let Some((authority, scheme)) = self.upstream_target {
+            let tls_acceptor = if let Some((certs, key)) = self.tls_identity {
+                let mut config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)?;
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                Some(Arc::new(TlsAcceptor::from(Arc::new(config))))
+            } else {
+                None
+            };
+            ProxyMode::Reverse {
+                upstream_authority: authority,
+                upstream_scheme: scheme,
+                tls_acceptor,
+            }
+        } else {
+            let ca = self
+                .ca
+                .ok_or_else(|| anyhow::anyhow!("CertificateAuthority must be set"))?;
+            ProxyMode::Forward {
+                ca: Arc::new(ca),
+                server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
+                    NonZeroUsize::new(1024).unwrap(),
+                ))),
+                credentials: if self.credentials.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(self.credentials))
+                },
+            }
+        };
+
         Ok(Proxy {
-            ca: Arc::new(ca),
+            mode,
             http_layers: Arc::new(self.http_layers),
             upstream_client,
-            server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
-                NonZeroUsize::new(1024).unwrap(),
-            ))),
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
             max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
             drain_timeout: self.drain_timeout,
-            credentials: if self.credentials.is_empty() {
-                None
-            } else {
-                Some(Arc::new(self.credentials))
-            },
         })
     }
 }
@@ -496,20 +567,19 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
     }
 }
 
-/// A configured TLS MITM proxy.
+/// A configured HTTP proxy supporting both forward (TLS MITM) and reverse
+/// proxy modes.
 ///
 /// Cheaply cloneable via internal `Arc`s.
 #[derive(Clone)]
 pub struct Proxy {
-    ca: Arc<CertificateAuthority>,
+    mode: ProxyMode,
     http_layers: Arc<Vec<LayerFn>>,
     upstream_client: UpstreamClient,
-    server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
     drain_timeout: Option<Duration>,
-    credentials: Option<Arc<Vec<(String, String)>>>,
 }
 
 impl Proxy {
@@ -526,6 +596,8 @@ impl Proxy {
             credentials: Vec::new(),
             pool_max_idle_per_host: 8,
             pool_idle_timeout: Duration::from_secs(90),
+            upstream_target: None,
+            tls_identity: None,
         }
     }
 
@@ -560,7 +632,22 @@ impl Proxy {
         shutdown: impl Future<Output = ()>,
     ) -> anyhow::Result<()> {
         let local_addr = listener.local_addr()?;
-        tracing::info!(%local_addr, "listening");
+        match &self.mode {
+            ProxyMode::Forward { .. } => {
+                tracing::info!(%local_addr, "listening (forward proxy)");
+            }
+            ProxyMode::Reverse {
+                upstream_authority,
+                upstream_scheme,
+                ..
+            } => {
+                tracing::info!(
+                    %local_addr,
+                    upstream = %format_args!("{upstream_scheme}://{upstream_authority}"),
+                    "listening (reverse proxy)",
+                );
+            }
+        }
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let mut tasks = JoinSet::new();
@@ -626,12 +713,16 @@ impl Proxy {
         Ok(())
     }
 
-    fn server_config_for(&self, hostname: &str) -> anyhow::Result<Arc<ServerConfig>> {
-        let mut cache = self.server_config_cache.lock().unwrap();
+    fn server_config_for(
+        ca: &CertificateAuthority,
+        cache: &Mutex<lru::LruCache<String, Arc<ServerConfig>>>,
+        hostname: &str,
+    ) -> anyhow::Result<Arc<ServerConfig>> {
+        let mut cache = cache.lock().unwrap();
         if let Some(config) = cache.get(hostname) {
             return Ok(config.clone());
         }
-        let (cert_der, key_der) = self.ca.generate_cert(hostname)?;
+        let (cert_der, key_der) = ca.generate_cert(hostname)?;
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
@@ -660,20 +751,62 @@ impl Proxy {
     async fn handle_connection_inner(
         &self,
         stream: TcpStream,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        match &self.mode {
+            ProxyMode::Forward {
+                ca,
+                server_config_cache,
+                credentials,
+            } => {
+                self.handle_forward_connection(
+                    stream,
+                    shutdown_rx,
+                    ca.clone(),
+                    server_config_cache.clone(),
+                    credentials.clone(),
+                )
+                .await
+            }
+            ProxyMode::Reverse {
+                upstream_authority,
+                upstream_scheme,
+                tls_acceptor,
+            } => {
+                self.handle_reverse_connection(
+                    stream,
+                    shutdown_rx,
+                    upstream_authority.clone(),
+                    upstream_scheme.clone(),
+                    tls_acceptor.clone(),
+                )
+                .await
+            }
+        }
+    }
+
+    fn build_service_chain(
+        &self,
+        authority: ::http::uri::Authority,
+        scheme: UpstreamScheme,
+    ) -> HttpService {
+        let forward = ForwardService::new(self.upstream_client.clone(), authority, scheme);
+        let mut service: HttpService = tower::util::BoxService::new(forward);
+        for layer_fn in self.http_layers.iter() {
+            service = layer_fn(service);
+        }
+        service
+    }
+
+    async fn serve_client<
+        I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    >(
+        &self,
+        client_io: I,
+        hyper_service: HyperServiceAdapter,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
-        let (hyper_service, client_tls) = {
-            let handshake = self.handshake(stream);
-            if let Some(timeout) = self.handshake_timeout {
-                tokio::time::timeout(timeout, handshake)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("handshake timed out"))??
-            } else {
-                handshake.await?
-            }
-        };
-
-        let client_io = TokioIo::new(client_tls);
+        let client_io = TokioIo::new(client_io);
         let mut builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
 
@@ -708,12 +841,60 @@ impl Proxy {
         Ok(())
     }
 
-    /// Perform the full handshake sequence: CONNECT parsing via hyper, TLS on
-    /// both sides, and hyper handshake. Returns the tower service and client
-    /// TLS stream ready for `serve_connection`.
+    async fn handle_forward_connection(
+        &self,
+        stream: TcpStream,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        ca: Arc<CertificateAuthority>,
+        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        credentials: Option<Arc<Vec<(String, String)>>>,
+    ) -> anyhow::Result<()> {
+        let (hyper_service, client_tls) = {
+            let handshake = self.handshake(stream, ca, server_config_cache, credentials);
+            if let Some(timeout) = self.handshake_timeout {
+                tokio::time::timeout(timeout, handshake)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("handshake timed out"))??
+            } else {
+                handshake.await?
+            }
+        };
+
+        self.serve_client(client_tls, hyper_service, shutdown_rx)
+            .await
+    }
+
+    async fn handle_reverse_connection(
+        &self,
+        stream: TcpStream,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+        upstream_authority: ::http::uri::Authority,
+        upstream_scheme: UpstreamScheme,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
+    ) -> anyhow::Result<()> {
+        let service = self.build_service_chain(upstream_authority, upstream_scheme);
+        let hyper_service = HyperServiceAdapter {
+            inner: Arc::new(tokio::sync::Mutex::new(service)),
+        };
+
+        if let Some(acceptor) = tls_acceptor {
+            let tls_stream = acceptor.accept(stream).await?;
+            self.serve_client(tls_stream, hyper_service, shutdown_rx)
+                .await
+        } else {
+            self.serve_client(stream, hyper_service, shutdown_rx).await
+        }
+    }
+
+    /// Perform the full handshake sequence for forward proxy mode: CONNECT
+    /// parsing via hyper, TLS on both sides. Returns the tower service and
+    /// client TLS stream ready for `serve_connection`.
     async fn handshake(
         &self,
         stream: TcpStream,
+        ca: Arc<CertificateAuthority>,
+        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        credentials: Option<Arc<Vec<(String, String)>>>,
     ) -> anyhow::Result<(
         HyperServiceAdapter,
         tokio_rustls::server::TlsStream<TokioIo<hyper::upgrade::Upgraded>>,
@@ -721,7 +902,6 @@ impl Proxy {
         type ConnectInfo = anyhow::Result<(String, hyper::upgrade::Upgraded)>;
         let (connect_tx, connect_rx) = tokio::sync::oneshot::channel::<ConnectInfo>();
         let connect_tx = Arc::new(Mutex::new(Some(connect_tx)));
-        let credentials = self.credentials.clone();
 
         let service = hyper::service::service_fn(move |req: Request<Incoming>| {
             let connect_tx = connect_tx.clone();
@@ -814,19 +994,12 @@ impl Proxy {
         );
         tracing::debug!("CONNECT");
 
-        let server_config = self.server_config_for(host)?;
+        let server_config = Self::server_config_for(&ca, &server_config_cache, host)?;
         let acceptor = TlsAcceptor::from(server_config);
         let client_tls = acceptor.accept(TokioIo::new(upgraded)).await?;
 
-        // Build tower service chain — upstream connection happens lazily via
-        // the pooled hyper-util Client when the first request arrives.
         let authority: ::http::uri::Authority = format!("{host}:{port}").parse()?;
-        let forward = ForwardService::new(self.upstream_client.clone(), authority);
-        let mut service: HttpService = tower::util::BoxService::new(forward);
-        for layer_fn in self.http_layers.iter() {
-            service = layer_fn(service);
-        }
-
+        let service = self.build_service_chain(authority, ::http::uri::Scheme::HTTPS);
         let hyper_service = HyperServiceAdapter {
             inner: Arc::new(tokio::sync::Mutex::new(service)),
         };
