@@ -2,10 +2,12 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use axum::Router;
+use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
 use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
@@ -14,7 +16,7 @@ use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
 use noxy::middleware::{
     BandwidthThrottle, Conditional, ContentDecoder, FaultInjector, LatencyInjector, RateLimiter,
-    SlidingWindow, TrafficLogger,
+    Retry, SlidingWindow, TrafficLogger,
 };
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
@@ -1427,4 +1429,70 @@ async fn sliding_window_blocks_excess_requests() {
         elapsed >= Duration::from_millis(400),
         "3 requests with sliding window of 2/500ms should take ~500ms, took {elapsed:?}"
     );
+}
+
+#[tokio::test]
+async fn retry_retries_on_503() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+
+    let app = Router::new().route(
+        "/",
+        get(move || {
+            let counter = counter_clone.clone();
+            async move {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    (http::StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+                } else {
+                    "hello".into_response()
+                }
+            }
+        }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Retry::on_statuses([503])
+            .max_retries(3)
+            .backoff(Duration::from_millis(10));
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello");
+    assert_eq!(counter.load(Ordering::SeqCst), 3);
 }

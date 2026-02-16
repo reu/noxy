@@ -7,7 +7,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 ## Features
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, mock responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a path or path prefix
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - Per-host certificate generation on the fly, signed by a user-provided CA
@@ -108,6 +108,7 @@ Options:
       --per-host-rate-limit <RATE>     Per-host rate limit (e.g., "10/1s"). Repeatable.
       --sliding-window <RATE>          Sliding window rate limit (e.g., "30/1s"). Repeatable.
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
+      --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --accept-invalid-certs           Accept invalid upstream TLS certificates
   -h, --help                   Print help
 
@@ -140,6 +141,9 @@ noxy --sliding-window 30/1s
 
 # Per-host sliding window: 10 requests per second per hostname
 noxy --per-host-sliding-window 10/1s
+
+# Retry failed requests up to 3 times with exponential backoff
+noxy --retry 3
 
 # Combine multiple flags
 noxy --log --latency 200ms --bandwidth 10240
@@ -217,6 +221,15 @@ sliding_window = { count = 10, window = "1s" }
 [[rules]]
 sliding_window = { count = 500, window = "60s", per_host = true }
 
+# Retry failed requests (429, 502, 503, 504) up to 3 times
+[[rules]]
+retry = { max_retries = 3, backoff = "1s" }
+
+# Retry only 503s with custom statuses
+[[rules]]
+match = { path_prefix = "/api" }
+retry = { max_retries = 5, backoff = "500ms", statuses = [503] }
+
 # Return 503 for all paths under /fail
 [[rules]]
 match = { path_prefix = "/fail" }
@@ -236,6 +249,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
 | `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
+| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses` to override |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
 
 ## Scripting Middleware

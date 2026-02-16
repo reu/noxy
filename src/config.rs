@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use crate::http::Body;
 use crate::middleware::{
-    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, RateLimiter, SetResponse,
-    SlidingWindow, TrafficLogger,
+    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, RateLimiter, Retry,
+    SetResponse, SlidingWindow, TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -69,6 +69,7 @@ pub struct RuleConfig {
     pub fault: Option<FaultConfig>,
     pub rate_limit: Option<RateLimitConfig>,
     pub sliding_window: Option<SlidingWindowConfig>,
+    pub retry: Option<RetryConfig>,
     pub respond: Option<RespondConfig>,
 }
 
@@ -147,6 +148,13 @@ pub struct SlidingWindowConfig {
     pub window: DurationValue,
     #[serde(default)]
     pub per_host: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RetryConfig {
+    pub max_retries: Option<u32>,
+    pub backoff: Option<DurationValue>,
+    pub statuses: Option<Vec<u16>>,
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -302,6 +310,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, limiter);
     }
 
+    if let Some(retry_config) = rule.retry {
+        let retry = build_retry(retry_config);
+        builder = apply_layer(builder, &predicate, retry);
+    }
+
     if let Some(respond_config) = rule.respond {
         let responder = build_set_response(respond_config)?;
         builder = apply_layer(builder, &predicate, responder);
@@ -388,6 +401,21 @@ fn build_rate_limiter(config: RateLimitConfig) -> RateLimiter {
     } else {
         limiter
     }
+}
+
+fn build_retry(config: RetryConfig) -> Retry {
+    let mut retry = if let Some(statuses) = config.statuses {
+        Retry::on_statuses(statuses)
+    } else {
+        Retry::default()
+    };
+    if let Some(max) = config.max_retries {
+        retry = retry.max_retries(max);
+    }
+    if let Some(backoff) = config.backoff {
+        retry = retry.backoff(backoff.0);
+    }
+    retry
 }
 
 #[cfg(test)]
@@ -480,6 +508,12 @@ mod tests {
 
             [[rules]]
             sliding_window = { count = 500, window = "60s", per_host = true }
+
+            [[rules]]
+            retry = {}
+
+            [[rules]]
+            retry = { max_retries = 5, backoff = "500ms", statuses = [503, 429] }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -491,7 +525,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 12);
+        assert_eq!(config.rules.len(), 14);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -569,6 +603,21 @@ mod tests {
         assert_eq!(sw.count, 500);
         assert_eq!(sw.window.0, Duration::from_secs(60));
         assert!(sw.per_host);
+
+        // Rule 12: retry with defaults
+        let retry = config.rules[12].retry.as_ref().unwrap();
+        assert!(retry.max_retries.is_none());
+        assert!(retry.backoff.is_none());
+        assert!(retry.statuses.is_none());
+
+        // Rule 13: retry with all options
+        let retry = config.rules[13].retry.as_ref().unwrap();
+        assert_eq!(retry.max_retries, Some(5));
+        assert_eq!(
+            retry.backoff.as_ref().unwrap().0,
+            Duration::from_millis(500)
+        );
+        assert_eq!(retry.statuses.as_ref().unwrap(), &[503, 429]);
     }
 
     #[test]

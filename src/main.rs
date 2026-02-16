@@ -56,6 +56,10 @@ struct Cli {
     #[arg(long = "per-host-sliding-window")]
     per_host_sliding_windows: Vec<String>,
 
+    /// Retry failed requests (429, 502, 503, 504) up to N times with exponential backoff
+    #[arg(long)]
+    retry: Option<u32>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -176,6 +180,17 @@ async fn main() -> anyhow::Result<()> {
 
     for sw_str in cli.per_host_sliding_windows {
         cli_rules.push(parse_sliding_window_rule(&sw_str, true)?);
+    }
+
+    if let Some(max_retries) = cli.retry {
+        cli_rules.push(RuleConfig {
+            retry: Some(noxy::config::RetryConfig {
+                max_retries: Some(max_retries),
+                backoff: None,
+                statuses: None,
+            }),
+            ..Default::default()
+        });
     }
 
     config.append_rules(cli_rules);

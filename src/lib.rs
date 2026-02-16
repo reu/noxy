@@ -243,6 +243,15 @@ impl ProxyBuilder {
         self.http_layer(middleware::SlidingWindow::global(count, window))
     }
 
+    /// Retry failed requests up to `max_retries` times with exponential
+    /// backoff. Retries on 429, 502, 503, and 504 by default.
+    ///
+    /// Use [`Retry`](middleware::Retry) directly with
+    /// [`http_layer`](Self::http_layer) for custom status codes or backoff.
+    pub fn retry(self, max_retries: u32) -> Self {
+        self.http_layer(middleware::Retry::default().max_retries(max_retries))
+    }
+
     /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
     /// TCP connect, TLS handshakes, and hyper handshakes.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
