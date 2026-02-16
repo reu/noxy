@@ -86,6 +86,22 @@ impl Conditional {
         let path = path.into();
         self.when(move |req| req.uri().path() == path, layer)
     }
+
+    /// Shorthand: when the request path matches a glob pattern, apply the given
+    /// layer. Uses `*` (single segment), `**` (cross-segment), `?`, and `[a-z]`.
+    pub fn when_path_glob<L>(self, pattern: &str, layer: L) -> Result<Self, globset::Error>
+    where
+        L: tower::Layer<HttpService> + Send + Sync + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send,
+    {
+        let matcher = globset::GlobBuilder::new(pattern)
+            .literal_separator(true)
+            .build()?
+            .compile_matcher();
+        Ok(self.when(move |req| matcher.is_match(req.uri().path()), layer))
+    }
 }
 
 impl Default for Conditional {
