@@ -104,6 +104,64 @@ impl Conditional {
     }
 }
 
+/// Extension trait that lets any tower layer add a condition directly.
+///
+/// Instead of wrapping in `Conditional::new()`:
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use noxy::{Proxy, middleware::{BandwidthThrottle, ConditionalLayer}};
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let proxy = Proxy::builder()
+///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+///     .http_layer(BandwidthThrottle::new(50 * 1024).when_path("/downloads"))
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+pub trait ConditionalLayer: tower::Layer<HttpService> + Send + Sync + 'static
+where
+    <Self as tower::Layer<HttpService>>::Service:
+        Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+    <<Self as tower::Layer<HttpService>>::Service as Service<Request<Body>>>::Future: Send,
+{
+    /// Apply this layer only when the predicate matches.
+    fn when(
+        self,
+        predicate: impl Fn(&Request<Body>) -> bool + Send + Sync + 'static,
+    ) -> Conditional;
+
+    /// Apply this layer only when the request path matches exactly.
+    fn when_path(self, path: impl Into<String>) -> Conditional;
+
+    /// Apply this layer only when the request path matches a glob pattern.
+    fn when_path_glob(self, pattern: &str) -> Result<Conditional, globset::Error>;
+}
+
+impl<L> ConditionalLayer for L
+where
+    L: tower::Layer<HttpService> + Send + Sync + 'static,
+    L::Service:
+        Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+    <L::Service as Service<Request<Body>>>::Future: Send,
+{
+    fn when(
+        self,
+        predicate: impl Fn(&Request<Body>) -> bool + Send + Sync + 'static,
+    ) -> Conditional {
+        Conditional::new().when(predicate, self)
+    }
+
+    fn when_path(self, path: impl Into<String>) -> Conditional {
+        Conditional::new().when_path(path, self)
+    }
+
+    fn when_path_glob(self, pattern: &str) -> Result<Conditional, globset::Error> {
+        Conditional::new().when_path_glob(pattern, self)
+    }
+}
+
 impl Default for Conditional {
     fn default() -> Self {
         Self::new()

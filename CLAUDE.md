@@ -72,6 +72,11 @@ Every middleware should support all five surfaces:
 - Avoid unnecessary comments, especially section dividers (e.g., `// -- Section name --`)
 - Only add comments that genuinely help understand the code, such as explanations of non-obvious logic, examples, or important caveats
 
+### Doc-tests
+- The README is included as crate-level docs (`#![doc = include_str!("../README.md")]`), so all `rust` code blocks are compiled as doc-tests
+- In source-level doc comments (`///`), never use `` ```rust,ignore `` — use `` ```rust,no_run `` with hidden boilerplate (`# fn main() -> anyhow::Result<()> {`) so examples are compile-checked and catch API drift
+- In `README.md`, use `` ```rust,ignore `` — hidden `# ` lines clutter the GitHub rendering, and the README is primarily read on GitHub
+
 ### After every Rust file change
 - Run `cargo fmt` to format the code
 - Run `cargo clippy` and fix all warnings before considering the task done

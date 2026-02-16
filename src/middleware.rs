@@ -16,7 +16,7 @@ mod url_rewrite;
 pub use bandwidth_throttle::BandwidthThrottle;
 pub use block_list::BlockList;
 pub use circuit_breaker::CircuitBreaker;
-pub use conditional::Conditional;
+pub use conditional::{Conditional, ConditionalLayer};
 pub use content_decoder::ContentDecoder;
 pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;

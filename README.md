@@ -21,7 +21,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 
 ### Forward proxy (TLS MITM)
 
-```rust
+```rust,ignore
 use std::time::Duration;
 use noxy::Proxy;
 use noxy::middleware::*;
@@ -55,20 +55,11 @@ let proxy = Proxy::builder()
     // Block tracking domains
     .http_layer(BlockList::new().host("*.tracking.com")?)
     // 50% of requests to /flaky return 503
-    .http_layer(
-        Conditional::new()
-            .when_path("/flaky", FaultInjector::new().error_rate(0.5))
-    )
+    .http_layer(FaultInjector::new().error_rate(0.5).when_path("/flaky"))
     // Glob pattern: add latency to all paths under /api/*/slow
-    .http_layer(
-        Conditional::new()
-            .when_path_glob("/api/*/slow", LatencyInjector::fixed(Duration::from_millis(500)))?
-    )
+    .http_layer(LatencyInjector::fixed(Duration::from_millis(500)).when_path_glob("/api/*/slow")?)
     // Return a fixed response for /health
-    .http_layer(
-        Conditional::new()
-            .when_path("/health", SetResponse::ok("ok"))
-    )
+    .http_layer(SetResponse::ok("ok").when_path("/health"))
     .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
@@ -76,7 +67,7 @@ proxy.listen("127.0.0.1:8080").await?;
 
 ### Reverse proxy
 
-```rust
+```rust,ignore
 use noxy::Proxy;
 
 let proxy = Proxy::builder()
@@ -453,7 +444,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 
 Write request/response manipulation logic in TypeScript or JavaScript. Scripts run in an embedded V8 engine via [deno_core](https://crates.io/crates/deno_core). Requires the `scripting` feature.
 
-```rust
+```rust,ignore
 use noxy::Proxy;
 use noxy::middleware::ScriptLayer;
 
@@ -511,7 +502,7 @@ export default async function(req: Request, respond: Function) {
 
 By default, each connection gets its own V8 isolate, so global state in the script (like variables declared outside the handler) is scoped per connection. Use `.shared()` to reuse a single isolate across all connections:
 
-```rust
+```rust,ignore
 // Per-connection (default) -- each connection gets a fresh isolate
 ScriptLayer::from_file("middleware.ts")?
 
