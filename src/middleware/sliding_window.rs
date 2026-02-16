@@ -73,10 +73,7 @@ impl SharedState {
     fn take(&mut self, key: &str) -> Option<Duration> {
         let now = Instant::now();
         let cutoff = now - self.window;
-        let timestamps = self
-            .windows
-            .entry(key.to_string())
-            .or_default();
+        let timestamps = self.windows.entry(key.to_string()).or_default();
 
         // Drain entries older than the window
         while timestamps.front().is_some_and(|&t| t <= cutoff) {
@@ -169,11 +166,12 @@ impl Service<Request<Body>> for SlidingWindowService {
         let delay = self.state.lock().unwrap().take(&key);
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            if let Some(delay) = delay {
+        match delay {
+            None => fut,
+            Some(delay) => Box::pin(async move {
                 tokio::time::sleep(delay).await;
-            }
-            fut.await
-        })
+                fut.await
+            }),
+        }
     }
 }

@@ -198,11 +198,12 @@ impl Service<Request<Body>> for RateLimiterService {
         let delay = self.state.lock().unwrap().take(&key);
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            if let Some(delay) = delay {
+        match delay {
+            None => fut,
+            Some(delay) => Box::pin(async move {
                 tokio::time::sleep(delay).await;
-            }
-            fut.await
-        })
+                fut.await
+            }),
+        }
     }
 }
