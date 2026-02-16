@@ -9,7 +9,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Forward proxy** -- CONNECT tunnel with TLS MITM, per-host certificate generation signed by a user-provided CA
 - **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, fixed responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
@@ -593,7 +593,7 @@ noxy --upstream http://localhost:8080 \
      --rate-limit 1000/60s
 ```
 
-**Testing and development** -- inject faults, latency, or mock responses in front of a real API to test client resilience:
+**Testing and development** -- inject faults, latency, or fixed responses in front of a real API to test client resilience:
 
 ```bash
 # Simulate a flaky upstream

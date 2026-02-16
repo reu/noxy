@@ -3,11 +3,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use http::{Request, Response};
 use tower::Service;
 
-use super::SetResponse;
 use crate::http::{Body, BoxError, HttpService};
 
 type Predicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
@@ -28,7 +26,7 @@ struct Rule {
 ///
 /// ```rust,no_run
 /// use std::time::Duration;
-/// use noxy::{Proxy, middleware::{Conditional, LatencyInjector, FaultInjector}};
+/// use noxy::{Proxy, middleware::{Conditional, LatencyInjector, FaultInjector, SetResponse}};
 ///
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
@@ -43,7 +41,7 @@ struct Rule {
 ///                 |req| req.uri().path() == "/flaky",
 ///                 FaultInjector::new().error_rate(0.5),
 ///             )
-///             .mock(|req| req.uri().path() == "/health", "ok")
+///             .when_path("/health", SetResponse::ok("ok"))
 ///     )
 ///     .build()?;
 /// # Ok(())
@@ -77,21 +75,16 @@ impl Conditional {
         self
     }
 
-    /// Shorthand: when the predicate matches, return a canned `200 OK`
-    /// response with the given body without forwarding upstream.
-    pub fn mock(
-        self,
-        predicate: impl Fn(&Request<Body>) -> bool + Send + Sync + 'static,
-        body: impl Into<Bytes>,
-    ) -> Self {
-        self.when(predicate, SetResponse::ok(body))
-    }
-
-    /// Shorthand: when the request path matches exactly, return a canned
-    /// `200 OK` response with the given body.
-    pub fn mock_path(self, path: impl Into<String>, body: impl Into<Bytes>) -> Self {
+    /// Shorthand: when the request path matches exactly, apply the given layer.
+    pub fn when_path<L>(self, path: impl Into<String>, layer: L) -> Self
+    where
+        L: tower::Layer<HttpService> + Send + Sync + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send,
+    {
         let path = path.into();
-        self.mock(move |req| req.uri().path() == path, body)
+        self.when(move |req| req.uri().path() == path, layer)
     }
 }
 

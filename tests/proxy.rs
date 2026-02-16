@@ -16,7 +16,7 @@ use http_body_util::BodyExt;
 use noxy::http::{Body, BoxError, HttpService, full_body};
 use noxy::middleware::{
     BandwidthThrottle, BlockList, CircuitBreaker, Conditional, ContentDecoder, FaultInjector,
-    LatencyInjector, RateLimiter, Retry, SlidingWindow, TrafficLogger,
+    LatencyInjector, RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger,
 };
 use noxy::{CertificateAuthority, Proxy};
 use rcgen::{CertificateParams, KeyPair};
@@ -674,7 +674,7 @@ async fn conditional_mock_returns_canned_response() {
     let upstream_addr = start_upstream("real response").await;
 
     let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
-        let cond = Conditional::new().mock_path("/mocked", "fake response");
+        let cond = Conditional::new().when_path("/mocked", SetResponse::ok("fake response"));
         tower::util::BoxService::new(cond.layer(inner))
     })])
     .await;

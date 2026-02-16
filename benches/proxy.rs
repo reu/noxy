@@ -6,7 +6,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use criterion::{Criterion, criterion_group, criterion_main};
 use noxy::Proxy;
 use noxy::http::HttpService;
-use noxy::middleware::{Conditional, TrafficLogger};
+use noxy::middleware::{Conditional, SetResponse, TrafficLogger};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -185,7 +185,7 @@ fn proxy_benchmarks(c: &mut Criterion) {
                 tower::util::BoxService::new(logger.layer(inner))
             }),
             Box::new(|inner: HttpService| {
-                let layer = Conditional::new().mock_path("/mocked", "fake");
+                let layer = Conditional::new().when_path("/mocked", SetResponse::ok("fake"));
                 tower::util::BoxService::new(layer.layer(inner))
             }),
         ]));

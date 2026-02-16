@@ -46,9 +46,7 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 
 ### Middleware ideas (`src/middleware/`, tower layers)
 - Script injection — inject JS/CSS into HTML responses
-- URL rewriting — rewrite URLs in requests or response bodies
 - Find & replace — regex replacement in response bodies
-- Block list — reject requests to certain domains/URL patterns
 - Cache — cache responses, serve on subsequent matching requests
 - Sensitive data scanner — flag responses containing API keys, tokens, SSNs, etc.
 - Cookie tracker — log and analyze cookies across domains
