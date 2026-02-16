@@ -12,6 +12,15 @@ use crate::http::{Body, BoxError, HttpService};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
 
+/// Token bucket algorithm: tokens refill continuously at `rate` tokens/sec,
+/// capped at `burst`. Each request consumes one token. If tokens go negative,
+/// the request sleeps for the deficit (reservation model — concurrent callers
+/// get correctly increasing delays).
+///
+/// This produces a steady rate, not a windowed counter. For example,
+/// `global(10, 60s)` with burst=10: the first 10 requests are instant (burst),
+/// then each subsequent request waits ~6s (1/rate). There's no "minute
+/// boundary" that resets — tokens trickle back at 0.167/s continuously.
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
