@@ -10,6 +10,8 @@ use tower::Service;
 
 use crate::http::{Body, BoxError, HttpService};
 
+type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
+
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
@@ -59,17 +61,16 @@ impl SharedState {
     }
 }
 
-#[derive(Clone)]
-enum KeyMode {
-    PerHost,
-    Global,
-}
-
 /// Tower layer that rate-limits requests using a token bucket algorithm.
 ///
 /// Requests that exceed the configured rate are delayed (not rejected),
 /// providing backpressure to clients while still eventually serving every
 /// request.
+///
+/// The rate limit key is derived from each request by a user-provided
+/// function. Use [`global`](Self::global) or [`per_host`](Self::per_host)
+/// for common strategies, or [`keyed`](Self::keyed) for custom keying
+/// (e.g., per API key).
 ///
 /// For multi-window limiting, stack multiple layers:
 ///
@@ -83,20 +84,39 @@ enum KeyMode {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
 ///     .http_layer(RateLimiter::global(30, Duration::from_secs(1)))
-///     .http_layer(RateLimiter::global(1500, Duration::from_secs(60)))
-///     .http_layer(RateLimiter::global(70000, Duration::from_secs(3600)))
+///     .http_layer(RateLimiter::keyed(100, Duration::from_secs(1), |req| {
+///         req.headers()
+///             .get("x-api-key")
+///             .and_then(|v| v.to_str().ok())
+///             .unwrap_or("anonymous")
+///             .to_string()
+///     }))
 ///     .build()?;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
 pub struct RateLimiter {
     state: Arc<Mutex<SharedState>>,
-    key_mode: KeyMode,
+    key_fn: KeyFn,
+}
+
+impl Clone for RateLimiter {
+    fn clone(&self) -> Self {
+        Self {
+            state: self.state.clone(),
+            key_fn: self.key_fn.clone(),
+        }
+    }
 }
 
 impl RateLimiter {
-    fn new(key_mode: KeyMode, count: u32, window: Duration) -> Self {
+    /// Rate-limit with a custom key function. Each distinct key gets its own
+    /// token bucket. `count` requests are allowed per `window` duration.
+    pub fn keyed(
+        count: u32,
+        window: Duration,
+        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
+    ) -> Self {
         let rate = count as f64 / window.as_secs_f64();
         Self {
             state: Arc::new(Mutex::new(SharedState {
@@ -104,20 +124,20 @@ impl RateLimiter {
                 rate,
                 burst: count as f64,
             })),
-            key_mode,
+            key_fn: Arc::new(key_fn),
         }
-    }
-
-    /// Rate-limit per unique hostname. Each host gets its own token bucket.
-    /// `count` requests are allowed per `window` duration.
-    pub fn per_host(count: u32, window: Duration) -> Self {
-        Self::new(KeyMode::PerHost, count, window)
     }
 
     /// Rate-limit globally across all hosts with a single shared bucket.
     /// `count` requests are allowed per `window` duration.
     pub fn global(count: u32, window: Duration) -> Self {
-        Self::new(KeyMode::Global, count, window)
+        Self::keyed(count, window, |_| String::new())
+    }
+
+    /// Rate-limit per unique hostname. Each host gets its own token bucket.
+    /// `count` requests are allowed per `window` duration.
+    pub fn per_host(count: u32, window: Duration) -> Self {
+        Self::keyed(count, window, extract_host)
     }
 
     /// Set the maximum burst size (max accumulated tokens). Defaults to
@@ -144,7 +164,7 @@ impl tower::Layer<HttpService> for RateLimiter {
         RateLimiterService {
             inner,
             state: self.state.clone(),
-            key_mode: self.key_mode.clone(),
+            key_fn: self.key_fn.clone(),
         }
     }
 }
@@ -152,7 +172,7 @@ impl tower::Layer<HttpService> for RateLimiter {
 pub struct RateLimiterService {
     inner: HttpService,
     state: Arc<Mutex<SharedState>>,
-    key_mode: KeyMode,
+    key_fn: KeyFn,
 }
 
 impl Service<Request<Body>> for RateLimiterService {
@@ -165,11 +185,7 @@ impl Service<Request<Body>> for RateLimiterService {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let key = match &self.key_mode {
-            KeyMode::PerHost => extract_host(&req),
-            KeyMode::Global => "*".to_string(),
-        };
-
+        let key = (self.key_fn)(&req);
         let delay = self.state.lock().unwrap().take(&key);
         let fut = self.inner.call(req);
 
