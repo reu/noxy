@@ -252,6 +252,16 @@ impl ProxyBuilder {
         self.http_layer(middleware::Retry::default().max_retries(max_retries))
     }
 
+    /// Circuit breaker that trips after `threshold` consecutive 5xx failures
+    /// and recovers after `recovery` duration.
+    ///
+    /// Use [`CircuitBreaker`](middleware::CircuitBreaker) directly with
+    /// [`http_layer`](Self::http_layer) for per-host keying, custom failure
+    /// policies, or half-open probe configuration.
+    pub fn circuit_breaker(self, threshold: u32, recovery: Duration) -> Self {
+        self.http_layer(middleware::CircuitBreaker::global(threshold, recovery))
+    }
+
     /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
     /// TCP connect, TLS handshakes, and hyper handshakes.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {

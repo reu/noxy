@@ -7,8 +7,8 @@ use serde::Deserialize;
 
 use crate::http::Body;
 use crate::middleware::{
-    BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, RateLimiter, Retry,
-    SetResponse, SlidingWindow, TrafficLogger,
+    BandwidthThrottle, CircuitBreaker, Conditional, FaultInjector, LatencyInjector, RateLimiter,
+    Retry, SetResponse, SlidingWindow, TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -70,6 +70,7 @@ pub struct RuleConfig {
     pub rate_limit: Option<RateLimitConfig>,
     pub sliding_window: Option<SlidingWindowConfig>,
     pub retry: Option<RetryConfig>,
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub respond: Option<RespondConfig>,
 }
 
@@ -155,6 +156,15 @@ pub struct RetryConfig {
     pub max_retries: Option<u32>,
     pub backoff: Option<DurationValue>,
     pub statuses: Option<Vec<u16>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CircuitBreakerConfig {
+    pub threshold: u32,
+    pub recovery: DurationValue,
+    pub half_open_probes: Option<u32>,
+    #[serde(default)]
+    pub per_host: bool,
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -315,6 +325,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, retry);
     }
 
+    if let Some(cb_config) = rule.circuit_breaker {
+        let cb = build_circuit_breaker(cb_config);
+        builder = apply_layer(builder, &predicate, cb);
+    }
+
     if let Some(respond_config) = rule.respond {
         let responder = build_set_response(respond_config)?;
         builder = apply_layer(builder, &predicate, responder);
@@ -400,6 +415,19 @@ fn build_rate_limiter(config: RateLimitConfig) -> RateLimiter {
         limiter.burst(burst)
     } else {
         limiter
+    }
+}
+
+fn build_circuit_breaker(config: CircuitBreakerConfig) -> CircuitBreaker {
+    let cb = if config.per_host {
+        CircuitBreaker::per_host(config.threshold, config.recovery.0)
+    } else {
+        CircuitBreaker::global(config.threshold, config.recovery.0)
+    };
+    if let Some(probes) = config.half_open_probes {
+        cb.half_open_probes(probes)
+    } else {
+        cb
     }
 }
 
@@ -514,6 +542,12 @@ mod tests {
 
             [[rules]]
             retry = { max_retries = 5, backoff = "500ms", statuses = [503, 429] }
+
+            [[rules]]
+            circuit_breaker = { threshold = 5, recovery = "30s" }
+
+            [[rules]]
+            circuit_breaker = { threshold = 3, recovery = "10s", half_open_probes = 2, per_host = true }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -525,7 +559,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 14);
+        assert_eq!(config.rules.len(), 16);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -618,6 +652,20 @@ mod tests {
             Duration::from_millis(500)
         );
         assert_eq!(retry.statuses.as_ref().unwrap(), &[503, 429]);
+
+        // Rule 14: circuit_breaker global
+        let cb = config.rules[14].circuit_breaker.as_ref().unwrap();
+        assert_eq!(cb.threshold, 5);
+        assert_eq!(cb.recovery.0, Duration::from_secs(30));
+        assert_eq!(cb.half_open_probes, None);
+        assert!(!cb.per_host);
+
+        // Rule 15: circuit_breaker per-host with half_open_probes
+        let cb = config.rules[15].circuit_breaker.as_ref().unwrap();
+        assert_eq!(cb.threshold, 3);
+        assert_eq!(cb.recovery.0, Duration::from_secs(10));
+        assert_eq!(cb.half_open_probes, Some(2));
+        assert!(cb.per_host);
     }
 
     #[test]

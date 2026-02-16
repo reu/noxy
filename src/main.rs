@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long)]
     retry: Option<u32>,
 
+    /// Circuit breaker: trip after N failures, recover after duration (e.g., "5/30s")
+    #[arg(long = "circuit-breaker")]
+    circuit_breaker: Option<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -193,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    if let Some(cb_str) = cli.circuit_breaker {
+        cli_rules.push(parse_circuit_breaker_rule(&cb_str)?);
+    }
+
     config.append_rules(cli_rules);
 
     let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
@@ -219,6 +227,27 @@ fn parse_sliding_window_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConf
             count,
             window: noxy::config::DurationValue(window),
             per_host,
+        }),
+        ..Default::default()
+    })
+}
+
+fn parse_circuit_breaker_rule(s: &str) -> anyhow::Result<RuleConfig> {
+    let (threshold_str, recovery_str) = s.split_once('/').ok_or_else(|| {
+        anyhow::anyhow!("circuit breaker must be threshold/recovery (e.g. 5/30s)")
+    })?;
+    let threshold: u32 = threshold_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid circuit breaker threshold: {e}"))?;
+    let recovery = noxy::config::parse_duration(recovery_str)
+        .map_err(|e| anyhow::anyhow!("invalid circuit breaker recovery: {e}"))?;
+
+    Ok(RuleConfig {
+        circuit_breaker: Some(noxy::config::CircuitBreakerConfig {
+            threshold,
+            recovery: noxy::config::DurationValue(recovery),
+            half_open_probes: None,
+            per_host: false,
         }),
         ..Default::default()
     })
