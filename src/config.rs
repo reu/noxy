@@ -8,8 +8,8 @@ use serde::Deserialize;
 
 use crate::http::Body;
 use crate::middleware::{
-    BandwidthThrottle, CircuitBreaker, Conditional, FaultInjector, LatencyInjector, ModifyHeaders,
-    RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger,
+    BandwidthThrottle, BlockList, CircuitBreaker, Conditional, FaultInjector, LatencyInjector,
+    ModifyHeaders, RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -79,8 +79,19 @@ pub struct RuleConfig {
     pub retry: Option<RetryConfig>,
     pub circuit_breaker: Option<CircuitBreakerConfig>,
     pub respond: Option<RespondConfig>,
+    pub block: Option<BlockListConfig>,
     pub request_headers: Option<HeaderOpsConfig>,
     pub response_headers: Option<HeaderOpsConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct BlockListConfig {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    pub status: Option<u16>,
+    pub body: Option<String>,
 }
 
 /// Request matching condition. The `host` and `path` fields support glob patterns
@@ -377,6 +388,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, cb);
     }
 
+    if let Some(block_config) = rule.block {
+        let block_list = build_block_list(block_config)?;
+        builder = apply_layer(builder, &predicate, block_list);
+    }
+
     if let Some(respond_config) = rule.respond {
         let responder = build_set_response(respond_config)?;
         builder = apply_layer(builder, &predicate, responder);
@@ -440,6 +456,28 @@ fn build_fault_injector(config: FaultConfig) -> anyhow::Result<FaultInjector> {
     }
 
     Ok(injector)
+}
+
+fn build_block_list(config: BlockListConfig) -> anyhow::Result<BlockList> {
+    let mut bl = BlockList::new();
+    for pattern in &config.hosts {
+        bl = bl
+            .host(pattern)
+            .map_err(|e| anyhow::anyhow!("invalid block host pattern '{pattern}': {e}"))?;
+    }
+    for pattern in &config.paths {
+        bl = bl
+            .path(pattern)
+            .map_err(|e| anyhow::anyhow!("invalid block path pattern '{pattern}': {e}"))?;
+    }
+    if config.status.is_some() || config.body.is_some() {
+        let status = config.status.unwrap_or(403);
+        let status = http::StatusCode::from_u16(status)
+            .map_err(|e| anyhow::anyhow!("invalid block status: {e}"))?;
+        let body = config.body.unwrap_or_default();
+        bl = bl.response(status, body);
+    }
+    Ok(bl)
 }
 
 fn build_set_response(config: RespondConfig) -> anyhow::Result<SetResponse> {
@@ -643,6 +681,12 @@ mod tests {
             [[rules]]
             match = { path_prefix = "/api" }
             request_headers = { set = { "x-api-version" = "2" } }
+
+            [[rules]]
+            block = { hosts = ["*.tracking.com", "ads.example.com"], paths = ["/admin/*"] }
+
+            [[rules]]
+            block = { hosts = ["internal.corp.com"], status = 404, body = "not found" }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -659,7 +703,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 18);
+        assert_eq!(config.rules.len(), 20);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -780,6 +824,20 @@ mod tests {
         assert!(config.rules[17].match_config.is_some());
         let rh = config.rules[17].request_headers.as_ref().unwrap();
         assert_eq!(rh.set.get("x-api-version").unwrap(), "2");
+
+        // Rule 18: block with hosts and paths
+        let bl = config.rules[18].block.as_ref().unwrap();
+        assert_eq!(bl.hosts, vec!["*.tracking.com", "ads.example.com"]);
+        assert_eq!(bl.paths, vec!["/admin/*"]);
+        assert_eq!(bl.status, None);
+        assert_eq!(bl.body, None);
+
+        // Rule 19: block with custom status and body
+        let bl = config.rules[19].block.as_ref().unwrap();
+        assert_eq!(bl.hosts, vec!["internal.corp.com"]);
+        assert!(bl.paths.is_empty());
+        assert_eq!(bl.status, Some(404));
+        assert_eq!(bl.body.as_deref(), Some("not found"));
     }
 
     #[test]

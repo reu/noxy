@@ -88,6 +88,14 @@ struct Cli {
     #[arg(long = "remove-response-header")]
     remove_response_headers: Vec<String>,
 
+    /// Block requests to hosts matching a glob pattern (repeatable)
+    #[arg(long = "block-host")]
+    block_hosts: Vec<String>,
+
+    /// Block requests to paths matching a glob pattern (repeatable)
+    #[arg(long = "block-path")]
+    block_paths: Vec<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -263,6 +271,18 @@ async fn main() -> anyhow::Result<()> {
                 ..Default::default()
             });
         }
+    }
+
+    if !cli.block_hosts.is_empty() || !cli.block_paths.is_empty() {
+        cli_rules.push(RuleConfig {
+            block: Some(noxy::config::BlockListConfig {
+                hosts: cli.block_hosts,
+                paths: cli.block_paths,
+                status: None,
+                body: None,
+            }),
+            ..Default::default()
+        });
     }
 
     config.append_rules(cli_rules);

@@ -289,6 +289,32 @@ impl ProxyBuilder {
         self.http_layer(middleware::ModifyHeaders::new().remove_response(name))
     }
 
+    /// Block requests to hosts matching any of the given glob patterns.
+    ///
+    /// Blocked requests receive a `403 Forbidden` response. Use
+    /// [`BlockList`](middleware::BlockList) directly with
+    /// [`http_layer`](Self::http_layer) for custom status codes, response
+    /// bodies, or path-based blocking.
+    pub fn block_hosts(
+        self,
+        patterns: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, globset::Error> {
+        Ok(self.http_layer(middleware::BlockList::hosts(patterns)?))
+    }
+
+    /// Block requests to paths matching any of the given glob patterns.
+    ///
+    /// Blocked requests receive a `403 Forbidden` response. Use
+    /// [`BlockList`](middleware::BlockList) directly with
+    /// [`http_layer`](Self::http_layer) for custom status codes, response
+    /// bodies, or host-based blocking.
+    pub fn block_paths(
+        self,
+        patterns: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, globset::Error> {
+        Ok(self.http_layer(middleware::BlockList::paths(patterns)?))
+    }
+
     /// Set a timeout for the handshake phase before `serve_connection`:
     /// CONNECT parsing and client-side TLS.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {

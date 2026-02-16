@@ -19,7 +19,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-config = ["serde", "toml", "globset"]
+config = ["serde", "toml"]
 cli = ["clap", "config", "tracing-subscriber"]
 scripting = ["deno_core", "deno_ast", "deno_error", "serde"]
 
@@ -36,7 +36,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "service", "server-auto", "client-legacy", "http1", "http2"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "deflate"] }
-globset = { version = "0.4", optional = true }
+globset = "0.4"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"

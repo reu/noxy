@@ -1,4 +1,5 @@
 mod bandwidth_throttle;
+mod block_list;
 mod circuit_breaker;
 mod conditional;
 mod content_decoder;
@@ -12,6 +13,7 @@ mod sliding_window;
 mod traffic_logger;
 
 pub use bandwidth_throttle::BandwidthThrottle;
+pub use block_list::BlockList;
 pub use circuit_breaker::CircuitBreaker;
 pub use conditional::Conditional;
 pub use content_decoder::ContentDecoder;

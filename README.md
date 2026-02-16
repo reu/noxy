@@ -7,7 +7,7 @@ A TLS man-in-the-middle proxy with a pluggable HTTP middleware pipeline. Built o
 ## Features
 
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, header modification, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, header modification, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, mock responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
@@ -111,6 +111,8 @@ Options:
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
+      --block-host <PATTERN>             Block hosts matching a glob pattern. Repeatable.
+      --block-path <PATTERN>             Block paths matching a glob pattern. Repeatable.
       --set-request-header <HEADER>     Set a request header (e.g., "x-proxy: noxy"). Repeatable.
       --remove-request-header <NAME>   Remove a request header. Repeatable.
       --set-response-header <HEADER>   Set a response header (e.g., "x-served-by: noxy"). Repeatable.
@@ -155,6 +157,12 @@ noxy --retry 3
 
 # Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
 noxy --circuit-breaker 5/30s
+
+# Block requests to tracking domains
+noxy --block-host "*.tracking.com" --block-host "ads.example.com"
+
+# Block requests to admin paths
+noxy --block-path "/admin/*" --block-path "/debug/**"
 
 # Add a request header to all proxied requests
 noxy --set-request-header "x-proxy: noxy"
@@ -273,6 +281,14 @@ response_headers = { remove = ["server"] }
 match = { path_prefix = "/api" }
 request_headers = { set = { "x-api-version" = "2" } }
 
+# Block requests to tracking domains and admin paths
+[[rules]]
+block = { hosts = ["*.tracking.com", "ads.example.com"], paths = ["/admin/*"] }
+
+# Block with custom status and body
+[[rules]]
+block = { hosts = ["internal.corp.com"], status = 404, body = "not found" }
+
 # Return 503 for all paths under /fail
 [[rules]]
 match = { path_prefix = "/fail" }
@@ -302,6 +318,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
 | `match`     | `{ host = "*.example.com", path = "/api/*/users" }` or `{ path_prefix = "/prefix" }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`) |
+| `block`     | `{ hosts = ["*.tracking.com"], paths = ["/admin/*"] }` -- optional `status` and `body` fields (default: 403 empty) |
 | `log`       | `true` or `{ bodies = true }`                            |
 | `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |
 | `bandwidth` | Bytes per second throughput limit                         |
