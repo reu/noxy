@@ -1,12 +1,12 @@
 [package]
 name = "noxy"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 authors = ["Rodrigo Navarro <rnavarro@rnavarro.com.br>"]
-description = "TLS man-in-the-middle proxy with a pluggable middleware pipeline"
+description = "HTTP forward and reverse proxy with a pluggable tower middleware pipeline"
 license = "MIT"
 repository = "https://github.com/reu/noxy"
-keywords = ["proxy", "tls", "mitm", "middleware", "https"]
+keywords = ["proxy", "tls", "mitm", "middleware", "reverse-proxy"]
 categories = ["network-programming"]
 
 [lib]
