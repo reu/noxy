@@ -232,6 +232,17 @@ impl ProxyBuilder {
         self.http_layer(middleware::RateLimiter::global(count, window))
     }
 
+    /// Sliding window rate-limit: hard-cap `count` requests per `window`
+    /// globally. Unlike [`rate_limit`](Self::rate_limit) (token bucket), this
+    /// enforces a strict count with no burst or smoothing.
+    ///
+    /// Use [`SlidingWindow`](middleware::SlidingWindow) directly with
+    /// [`http_layer`](Self::http_layer) for per-host keying or custom key
+    /// functions.
+    pub fn sliding_window(self, count: u32, window: Duration) -> Self {
+        self.http_layer(middleware::SlidingWindow::global(count, window))
+    }
+
     /// Set a timeout for everything before `serve_connection`: CONNECT parsing,
     /// TCP connect, TLS handshakes, and hyper handshakes.
     pub fn handshake_timeout(mut self, timeout: Duration) -> Self {

@@ -48,6 +48,14 @@ struct Cli {
     #[arg(long = "per-host-rate-limit")]
     per_host_rate_limits: Vec<String>,
 
+    /// Global sliding window rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
+    #[arg(long = "sliding-window")]
+    sliding_windows: Vec<String>,
+
+    /// Per-host sliding window rate limit (e.g., "10/1s"). Repeatable.
+    #[arg(long = "per-host-sliding-window")]
+    per_host_sliding_windows: Vec<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -162,6 +170,14 @@ async fn main() -> anyhow::Result<()> {
         cli_rules.push(parse_rate_limit_rule(&rl_str, true)?);
     }
 
+    for sw_str in cli.sliding_windows {
+        cli_rules.push(parse_sliding_window_rule(&sw_str, false)?);
+    }
+
+    for sw_str in cli.per_host_sliding_windows {
+        cli_rules.push(parse_sliding_window_rule(&sw_str, true)?);
+    }
+
     config.append_rules(cli_rules);
 
     let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
@@ -171,6 +187,26 @@ async fn main() -> anyhow::Result<()> {
             tokio::signal::ctrl_c().await.ok();
         })
         .await
+}
+
+fn parse_sliding_window_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {
+    let (count_str, window_str) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("sliding window must be count/window (e.g. 30/1s)"))?;
+    let count: u32 = count_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid sliding window count: {e}"))?;
+    let window = noxy::config::parse_duration(window_str)
+        .map_err(|e| anyhow::anyhow!("invalid sliding window window: {e}"))?;
+
+    Ok(RuleConfig {
+        sliding_window: Some(noxy::config::SlidingWindowConfig {
+            count,
+            window: noxy::config::DurationValue(window),
+            per_host,
+        }),
+        ..Default::default()
+    })
 }
 
 fn parse_rate_limit_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {

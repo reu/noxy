@@ -8,7 +8,7 @@ use serde::Deserialize;
 use crate::http::Body;
 use crate::middleware::{
     BandwidthThrottle, Conditional, FaultInjector, LatencyInjector, RateLimiter, SetResponse,
-    TrafficLogger,
+    SlidingWindow, TrafficLogger,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -68,6 +68,7 @@ pub struct RuleConfig {
     pub bandwidth: Option<u64>,
     pub fault: Option<FaultConfig>,
     pub rate_limit: Option<RateLimitConfig>,
+    pub sliding_window: Option<SlidingWindowConfig>,
     pub respond: Option<RespondConfig>,
 }
 
@@ -136,6 +137,14 @@ pub struct RateLimitConfig {
     pub count: u32,
     pub window: DurationValue,
     pub burst: Option<u32>,
+    #[serde(default)]
+    pub per_host: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SlidingWindowConfig {
+    pub count: u32,
+    pub window: DurationValue,
     #[serde(default)]
     pub per_host: bool,
 }
@@ -288,6 +297,11 @@ fn apply_rule(
         builder = apply_layer(builder, &predicate, limiter);
     }
 
+    if let Some(sw_config) = rule.sliding_window {
+        let limiter = build_sliding_window(sw_config);
+        builder = apply_layer(builder, &predicate, limiter);
+    }
+
     if let Some(respond_config) = rule.respond {
         let responder = build_set_response(respond_config)?;
         builder = apply_layer(builder, &predicate, responder);
@@ -353,6 +367,14 @@ fn build_set_response(config: RespondConfig) -> anyhow::Result<SetResponse> {
     let status = http::StatusCode::from_u16(status)
         .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
     Ok(SetResponse::new(status, config.body))
+}
+
+fn build_sliding_window(config: SlidingWindowConfig) -> SlidingWindow {
+    if config.per_host {
+        SlidingWindow::per_host(config.count, config.window.0)
+    } else {
+        SlidingWindow::global(config.count, config.window.0)
+    }
 }
 
 fn build_rate_limiter(config: RateLimitConfig) -> RateLimiter {
@@ -452,6 +474,12 @@ mod tests {
 
             [[rules]]
             rate_limit = { count = 1500, window = "60s", burst = 100, per_host = true }
+
+            [[rules]]
+            sliding_window = { count = 10, window = "1s" }
+
+            [[rules]]
+            sliding_window = { count = 500, window = "60s", per_host = true }
         "#;
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
@@ -463,7 +491,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 10);
+        assert_eq!(config.rules.len(), 12);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -529,6 +557,18 @@ mod tests {
         assert_eq!(rl.window.0, Duration::from_secs(60));
         assert_eq!(rl.burst, Some(100));
         assert!(rl.per_host);
+
+        // Rule 10: sliding_window global
+        let sw = config.rules[10].sliding_window.as_ref().unwrap();
+        assert_eq!(sw.count, 10);
+        assert_eq!(sw.window.0, Duration::from_secs(1));
+        assert!(!sw.per_host);
+
+        // Rule 11: sliding_window per-host
+        let sw = config.rules[11].sliding_window.as_ref().unwrap();
+        assert_eq!(sw.count, 500);
+        assert_eq!(sw.window.0, Duration::from_secs(60));
+        assert!(sw.per_host);
     }
 
     #[test]

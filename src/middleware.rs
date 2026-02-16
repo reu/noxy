@@ -5,6 +5,7 @@ mod fault_injector;
 mod latency_injector;
 mod rate_limiter;
 mod set_response;
+mod sliding_window;
 mod traffic_logger;
 
 pub use bandwidth_throttle::BandwidthThrottle;
@@ -14,6 +15,7 @@ pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;
 pub use rate_limiter::RateLimiter;
 pub use set_response::SetResponse;
+pub use sliding_window::SlidingWindow;
 pub use traffic_logger::TrafficLogger;
 
 #[cfg(feature = "scripting")]
