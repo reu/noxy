@@ -122,7 +122,7 @@ impl RateLimiter {
     /// Rate-limit with a custom key function. Each distinct key gets its own
     /// token bucket. `count` requests are allowed per `window` duration.
     pub fn keyed(
-        count: u32,
+        count: u64,
         window: Duration,
         key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
     ) -> Self {
@@ -139,19 +139,19 @@ impl RateLimiter {
 
     /// Rate-limit globally across all hosts with a single shared bucket.
     /// `count` requests are allowed per `window` duration.
-    pub fn global(count: u32, window: Duration) -> Self {
+    pub fn global(count: u64, window: Duration) -> Self {
         Self::keyed(count, window, |_| String::new())
     }
 
     /// Rate-limit per unique hostname. Each host gets its own token bucket.
     /// `count` requests are allowed per `window` duration.
-    pub fn per_host(count: u32, window: Duration) -> Self {
+    pub fn per_host(count: u64, window: Duration) -> Self {
         Self::keyed(count, window, extract_host)
     }
 
     /// Set the maximum burst size (max accumulated tokens). Defaults to
     /// `count`.
-    pub fn burst(self, burst: u32) -> Self {
+    pub fn burst(self, burst: u64) -> Self {
         self.state.lock().unwrap().burst = burst as f64;
         self
     }

@@ -228,7 +228,7 @@ impl ProxyBuilder {
     /// per-minute). Use [`RateLimiter`](middleware::RateLimiter) directly
     /// with [`http_layer`](Self::http_layer) for per-host keying or custom
     /// burst.
-    pub fn rate_limit(self, count: u32, window: Duration) -> Self {
+    pub fn rate_limit(self, count: u64, window: Duration) -> Self {
         self.http_layer(middleware::RateLimiter::global(count, window))
     }
 
@@ -239,7 +239,7 @@ impl ProxyBuilder {
     /// Use [`SlidingWindow`](middleware::SlidingWindow) directly with
     /// [`http_layer`](Self::http_layer) for per-host keying or custom key
     /// functions.
-    pub fn sliding_window(self, count: u32, window: Duration) -> Self {
+    pub fn sliding_window(self, count: u64, window: Duration) -> Self {
         self.http_layer(middleware::SlidingWindow::global(count, window))
     }
 

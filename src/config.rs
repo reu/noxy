@@ -134,16 +134,16 @@ pub struct RespondConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct RateLimitConfig {
-    pub count: u32,
+    pub count: u64,
     pub window: DurationValue,
-    pub burst: Option<u32>,
+    pub burst: Option<u64>,
     #[serde(default)]
     pub per_host: bool,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SlidingWindowConfig {
-    pub count: u32,
+    pub count: u64,
     pub window: DurationValue,
     #[serde(default)]
     pub per_host: bool,

@@ -193,7 +193,7 @@ fn parse_sliding_window_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConf
     let (count_str, window_str) = s
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("sliding window must be count/window (e.g. 30/1s)"))?;
-    let count: u32 = count_str
+    let count: u64 = count_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid sliding window count: {e}"))?;
     let window = noxy::config::parse_duration(window_str)
@@ -213,7 +213,7 @@ fn parse_rate_limit_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> 
     let (count_str, window_str) = s
         .split_once('/')
         .ok_or_else(|| anyhow::anyhow!("rate limit must be count/window (e.g. 30/1s)"))?;
-    let count: u32 = count_str
+    let count: u64 = count_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid rate limit count: {e}"))?;
     let window = noxy::config::parse_duration(window_str)

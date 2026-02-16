@@ -65,7 +65,7 @@ impl Clone for SlidingWindow {
 
 struct SharedState {
     windows: HashMap<String, VecDeque<Instant>>,
-    count: u32,
+    count: u64,
     window: Duration,
 }
 
@@ -73,8 +73,6 @@ impl SharedState {
     fn take(&mut self, key: &str) -> Option<Duration> {
         let now = Instant::now();
         let cutoff = now - self.window;
-        let count = self.count as usize;
-
         let timestamps = self
             .windows
             .entry(key.to_string())
@@ -85,7 +83,7 @@ impl SharedState {
             timestamps.pop_front();
         }
 
-        if timestamps.len() < count {
+        if (timestamps.len() as u64) < self.count {
             timestamps.push_back(now);
             None
         } else {
@@ -103,7 +101,7 @@ impl SlidingWindow {
     /// Rate-limit with a custom key function. Each distinct key gets its own
     /// sliding window. `count` requests are allowed per `window` duration.
     pub fn keyed(
-        count: u32,
+        count: u64,
         window: Duration,
         key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
     ) -> Self {
@@ -119,13 +117,13 @@ impl SlidingWindow {
 
     /// Rate-limit globally across all hosts with a single shared window.
     /// `count` requests are allowed per `window` duration.
-    pub fn global(count: u32, window: Duration) -> Self {
+    pub fn global(count: u64, window: Duration) -> Self {
         Self::keyed(count, window, |_| String::new())
     }
 
     /// Rate-limit per unique hostname. Each host gets its own sliding window.
     /// `count` requests are allowed per `window` duration.
-    pub fn per_host(count: u32, window: Duration) -> Self {
+    pub fn per_host(count: u64, window: Duration) -> Self {
         Self::keyed(count, window, extract_host)
     }
 }
