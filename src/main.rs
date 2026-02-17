@@ -120,6 +120,11 @@ struct Cli {
     #[arg(long = "rewrite-path-regex")]
     rewrite_path_regexes: Vec<String>,
 
+    /// Path to a JS/TS middleware script (requires scripting feature)
+    #[cfg(feature = "scripting")]
+    #[arg(long)]
+    script: Option<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -343,6 +348,17 @@ async fn main() -> anyhow::Result<()> {
                 paths: cli.block_paths,
                 status: None,
                 body: None,
+            }),
+            ..Default::default()
+        });
+    }
+
+    #[cfg(feature = "scripting")]
+    if let Some(script_path) = cli.script {
+        cli_rules.push(RuleConfig {
+            script: Some(noxy::config::ScriptConfig {
+                file: script_path,
+                shared: false,
             }),
             ..Default::default()
         });

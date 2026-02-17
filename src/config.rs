@@ -102,6 +102,8 @@ pub struct RuleConfig {
     pub url_rewrite: Option<UrlRewriteConfig>,
     pub request_headers: Option<HeaderOpsConfig>,
     pub response_headers: Option<HeaderOpsConfig>,
+    #[cfg(feature = "scripting")]
+    pub script: Option<ScriptConfig>,
 }
 
 /// Upstream URL(s) for routing: either a single string or a list of strings.
@@ -238,6 +240,14 @@ pub struct CircuitBreakerConfig {
     pub half_open_probes: Option<u32>,
     #[serde(default)]
     pub per_host: bool,
+}
+
+#[cfg(feature = "scripting")]
+#[derive(Debug, Deserialize)]
+pub struct ScriptConfig {
+    pub file: String,
+    #[serde(default)]
+    pub shared: bool,
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -465,6 +475,15 @@ fn apply_rule(
     let modify = build_modify_headers(rule.request_headers, rule.response_headers);
     if let Some(modify) = modify {
         builder = apply_layer(builder, &predicate, modify);
+    }
+
+    #[cfg(feature = "scripting")]
+    if let Some(script_config) = rule.script {
+        let mut layer = crate::middleware::ScriptLayer::from_file(&script_config.file)?;
+        if script_config.shared {
+            layer = layer.shared();
+        }
+        builder = apply_layer(builder, &predicate, layer);
     }
 
     Ok(builder)
@@ -1154,5 +1173,36 @@ mod tests {
             LoadBalanceStrategy::Random
         ));
         assert!(parse_balance_strategy("unknown").is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "scripting")]
+    fn deserialize_script_config() {
+        let toml = r#"
+            [[rules]]
+            script = { file = "middleware.ts" }
+
+            [[rules]]
+            script = { file = "middleware.ts", shared = true }
+
+            [[rules]]
+            match = { host = "api.example.com" }
+            script = { file = "api.ts" }
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.rules.len(), 3);
+
+        let s0 = config.rules[0].script.as_ref().unwrap();
+        assert_eq!(s0.file, "middleware.ts");
+        assert!(!s0.shared);
+
+        let s1 = config.rules[1].script.as_ref().unwrap();
+        assert_eq!(s1.file, "middleware.ts");
+        assert!(s1.shared);
+
+        let s2 = config.rules[2].script.as_ref().unwrap();
+        assert_eq!(s2.file, "api.ts");
+        assert!(config.rules[2].match_config.is_some());
     }
 }

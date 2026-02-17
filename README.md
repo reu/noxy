@@ -208,6 +208,7 @@ Options:
       --remove-request-header <NAME>   Remove a request header. Repeatable.
       --set-response-header <HEADER>   Set a response header (e.g., "x-served-by: noxy"). Repeatable.
       --remove-response-header <NAME>  Remove a response header. Repeatable.
+      --script <PATH>                  Path to a JS/TS middleware script (requires scripting feature)
       --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
       --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
@@ -290,6 +291,9 @@ noxy --upstream https://api.example.com --rate-limit 100/1s
 
 # Reverse proxy with client-facing TLS
 noxy --upstream http://localhost:3000 --tls-cert server.pem --tls-key server-key.pem
+
+# Run a TypeScript middleware script (requires scripting feature)
+noxy --upstream http://localhost:3000 --script middleware.ts
 ```
 
 ## Config File
@@ -446,6 +450,15 @@ block = { hosts = ["*.tracking.com", "ads.example.com"], paths = ["/admin/*"] }
 [[rules]]
 block = { hosts = ["internal.corp.com"], status = 404, body = "not found" }
 
+# Run a TypeScript middleware script (requires scripting feature)
+# [[rules]]
+# script = { file = "middleware.ts" }
+
+# Run a script with a shared V8 isolate across all connections
+# [[rules]]
+# match = { path_prefix = "/api" }
+# script = { file = "api_middleware.ts", shared = true }
+
 # Return 503 for all paths under /fail
 [[rules]]
 match = { path_prefix = "/fail" }
@@ -490,6 +503,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
+| `script`    | `{ file = "middleware.ts" }` -- optional `shared = true` for single V8 isolate (requires `scripting` feature) |
 
 ## Scripting Middleware
 
