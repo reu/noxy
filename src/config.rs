@@ -420,8 +420,9 @@ fn apply_rule(
         }
     }
 
-    if let Some(log_config) = rule.log {
-        let logger = build_traffic_logger(log_config);
+    if let Some(log_config) = rule.log
+        && let Some(logger) = build_traffic_logger(log_config)
+    {
         builder = apply_layer(builder, &predicate, logger);
     }
 
@@ -517,11 +518,11 @@ where
     }
 }
 
-fn build_traffic_logger(config: LogConfig) -> TrafficLogger {
+fn build_traffic_logger(config: LogConfig) -> Option<TrafficLogger> {
     match config {
-        LogConfig::Enabled(true) => TrafficLogger::new(),
-        LogConfig::Enabled(false) => TrafficLogger::new(), // no-op but included
-        LogConfig::Detailed(detail) => TrafficLogger::new().log_bodies(detail.bodies),
+        LogConfig::Enabled(true) => Some(TrafficLogger::new()),
+        LogConfig::Enabled(false) => None,
+        LogConfig::Detailed(detail) => Some(TrafficLogger::new().log_bodies(detail.bodies)),
     }
 }
 
@@ -1182,6 +1183,12 @@ mod tests {
             LoadBalanceStrategy::Random
         ));
         assert!(parse_balance_strategy("unknown").is_err());
+    }
+
+    #[test]
+    fn build_traffic_logger_respects_disabled_flag() {
+        assert!(build_traffic_logger(LogConfig::Enabled(false)).is_none());
+        assert!(build_traffic_logger(LogConfig::Enabled(true)).is_some());
     }
 
     #[test]

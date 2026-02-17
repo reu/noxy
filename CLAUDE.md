@@ -40,7 +40,6 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ## TODO
 
 ### Performance
-- Fix config behavior for `log = false` so traffic logging middleware is not installed (currently still pays formatting/locking overhead)
 - Improve route dispatch scaling by avoiding linear predicate scans for large routing tables (evaluate indexed/prefix/glob-aware routing structure)
 
 ### Security
