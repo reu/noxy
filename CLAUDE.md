@@ -42,6 +42,14 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ### Performance
 - Improve route dispatch scaling by avoiding linear predicate scans for large routing tables (evaluate indexed/prefix/glob-aware routing structure)
 
+### Benchmarking
+- Expanded workload matrix:
+  - body sizes: `0B`, `1KB`, `64KB`, `1MB`
+  - concurrency levels: `1`, `32`, `256`
+  - key distributions: hot-key and high-cardinality
+- Capture req/s, ns/op, p50/p95; optionally allocation metrics in a separate profile
+- Add CI guardrails for meaningful regressions (avoid failing on small noise)
+
 ### Security
 - Redact sensitive headers by default in traffic logs (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, etc.)
 - Use constant-time credential comparison for proxy auth checks
@@ -49,7 +57,6 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 
 ### Scripting
 - Expose body as an async iterable for chunk-by-chunk streaming without full buffering
-- Config file integration for scripting (`script = "middleware.ts"` in rules)
 - External module support (`https://`, `jsr:`, `npm:`) in scripting — currently only the user script is served; users can work around this by bundling dependencies into a single file
 
 ### Middleware ideas (`src/middleware/`, tower layers)

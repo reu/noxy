@@ -71,5 +71,5 @@ tokio-tungstenite = "0.26"
 zstd = "0.13"
 
 [[bench]]
-name = "proxy"
+name = "middleware"
 harness = false

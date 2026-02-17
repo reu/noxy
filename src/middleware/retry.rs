@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
+use http_body::Body as _;
 use http_body::Frame;
 use http_body_util::BodyExt;
 use tower::Service;
@@ -283,8 +284,13 @@ impl Service<Request<Body>> for RetryService {
             let version = parts.version;
             let headers = parts.headers;
             let capture = Arc::new(Mutex::new(ReplayCapture::new(max_replay_body_bytes)));
+            let body_known_empty = body.size_hint().exact() == Some(0);
             let mut first_body = Some(body);
-            let mut replay_bytes: Option<Bytes> = None;
+            let mut replay_bytes: Option<Bytes> = if body_known_empty {
+                Some(Bytes::new())
+            } else {
+                None
+            };
 
             for attempt in 0..=max_retries {
                 let mut builder = Request::builder()
@@ -294,7 +300,11 @@ impl Service<Request<Body>> for RetryService {
                 *builder.headers_mut().unwrap() = headers.clone();
                 let req_body = if attempt == 0 {
                     let body = first_body.take().unwrap_or_else(crate::http::empty_body);
-                    RecordingBody::new(body, capture.clone()).boxed()
+                    if body_known_empty {
+                        body
+                    } else {
+                        RecordingBody::new(body, capture.clone()).boxed()
+                    }
                 } else {
                     full_body(replay_bytes.clone().unwrap_or_default())
                 };

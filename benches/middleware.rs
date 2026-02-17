@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
@@ -6,7 +7,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use criterion::{Criterion, criterion_group, criterion_main};
 use noxy::Proxy;
 use noxy::http::HttpService;
-use noxy::middleware::{Conditional, SetResponse, TrafficLogger};
+use noxy::middleware::{Conditional, RateLimiter, Retry, SetResponse, TrafficLogger};
 use rcgen::{CertificateParams, KeyPair};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
@@ -94,70 +95,95 @@ impl tower::Layer<HttpService> for BoxedLayer {
     }
 }
 
-fn proxy_benchmarks(c: &mut Criterion) {
+fn bench_get(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    rt: &Runtime,
+    bench_name: &str,
+    proxy_addr: SocketAddr,
+    url: String,
+) {
+    let client = http_client(proxy_addr);
+    group.bench_function(bench_name, |b| {
+        b.to_async(rt).iter(|| {
+            let client = client.clone();
+            let url = url.clone();
+            async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
+        });
+    });
+}
+
+fn middleware_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
     let upstream_addr = rt.block_on(start_upstream("hello world"));
     let url = format!("https://localhost:{}/", upstream_addr.port());
 
-    let mut group = c.benchmark_group("proxy");
+    let mut group = c.benchmark_group("middleware");
+    group.measurement_time(Duration::from_secs(10));
 
-    // baseline: no middleware
-    {
-        let proxy_addr = rt.block_on(start_proxy(vec![]));
-        let client = http_client(proxy_addr);
-        let url = url.clone();
+    let baseline_proxy = rt.block_on(start_proxy(vec![]));
+    bench_get(&mut group, &rt, "baseline", baseline_proxy, url.clone());
 
-        group.bench_function("baseline", |b| {
-            b.to_async(&rt).iter(|| {
-                let client = client.clone();
-                let url = url.clone();
-                async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
-            });
-        });
-    }
+    let logger_off_proxy = rt.block_on(start_proxy(vec![]));
+    bench_get(&mut group, &rt, "logger_off", logger_off_proxy, url.clone());
 
-    // traffic_logger: header formatting + lock overhead, no I/O
-    {
-        let proxy_addr = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+    let logger_on_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let logger = TrafficLogger::new().writer(std::io::sink());
+        tower::util::BoxService::new(logger.layer(inner))
+    })]));
+    bench_get(&mut group, &rt, "logger_on", logger_on_proxy, url.clone());
+
+    let rate_limiter_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let limiter = RateLimiter::global(1_000_000, Duration::from_secs(1));
+        tower::util::BoxService::new(limiter.layer(inner))
+    })]));
+    bench_get(
+        &mut group,
+        &rt,
+        "rate_limiter",
+        rate_limiter_proxy,
+        url.clone(),
+    );
+
+    let retry_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let retry = Retry::default().max_retries(3);
+        tower::util::BoxService::new(retry.layer(inner))
+    })]));
+    bench_get(&mut group, &rt, "retry_no_retry", retry_proxy, url.clone());
+
+    let conditional_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Conditional::new().when(|_| true, TrafficLogger::new().writer(std::io::sink()));
+        tower::util::BoxService::new(layer.layer(inner))
+    })]));
+    bench_get(
+        &mut group,
+        &rt,
+        "conditional_logger_on",
+        conditional_proxy,
+        url.clone(),
+    );
+
+    let stacked_proxy = rt.block_on(start_proxy(vec![
+        Box::new(|inner: HttpService| {
             let logger = TrafficLogger::new().writer(std::io::sink());
             tower::util::BoxService::new(logger.layer(inner))
-        })]));
-        let client = http_client(proxy_addr);
-        let url = url.clone();
-
-        group.bench_function("traffic_logger", |b| {
-            b.to_async(&rt).iter(|| {
-                let client = client.clone();
-                let url = url.clone();
-                async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
-            });
-        });
-    }
-
-    // conditional: predicate eval + dispatch + inner layer
-    {
-        let proxy_addr = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
-            let layer =
-                Conditional::new().when(|_| true, TrafficLogger::new().writer(std::io::sink()));
+        }),
+        Box::new(|inner: HttpService| {
+            let layer = Conditional::new().when_path("/mocked", SetResponse::ok("fake"));
             tower::util::BoxService::new(layer.layer(inner))
-        })]));
-        let client = http_client(proxy_addr);
-        let url = url.clone();
+        }),
+    ]));
+    bench_get(
+        &mut group,
+        &rt,
+        "stacked_common",
+        stacked_proxy,
+        url.clone(),
+    );
 
-        group.bench_function("conditional", |b| {
-            b.to_async(&rt).iter(|| {
-                let client = client.clone();
-                let url = url.clone();
-                async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
-            });
-        });
-    }
-
-    // script_passthrough: V8 round-trip cost
     #[cfg(feature = "scripting")]
     {
-        let proxy_addr = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let script_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
             let layer = noxy::middleware::ScriptLayer::from_source(
                 "export default async (req, respond) => respond(req)",
             )
@@ -165,44 +191,11 @@ fn proxy_benchmarks(c: &mut Criterion) {
             .shared();
             tower::util::BoxService::new(layer.layer(inner))
         })]));
-        let client = http_client(proxy_addr);
-        let url = url.clone();
-
-        group.bench_function("script_passthrough", |b| {
-            b.to_async(&rt).iter(|| {
-                let client = client.clone();
-                let url = url.clone();
-                async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
-            });
-        });
-    }
-
-    // stacked: multi-layer composition overhead
-    {
-        let proxy_addr = rt.block_on(start_proxy(vec![
-            Box::new(|inner: HttpService| {
-                let logger = TrafficLogger::new().writer(std::io::sink());
-                tower::util::BoxService::new(logger.layer(inner))
-            }),
-            Box::new(|inner: HttpService| {
-                let layer = Conditional::new().when_path("/mocked", SetResponse::ok("fake"));
-                tower::util::BoxService::new(layer.layer(inner))
-            }),
-        ]));
-        let client = http_client(proxy_addr);
-        let url = url.clone();
-
-        group.bench_function("stacked", |b| {
-            b.to_async(&rt).iter(|| {
-                let client = client.clone();
-                let url = url.clone();
-                async move { client.get(&url).send().await.unwrap().text().await.unwrap() }
-            });
-        });
+        bench_get(&mut group, &rt, "script_no_body", script_proxy, url);
     }
 
     group.finish();
 }
 
-criterion_group!(benches, proxy_benchmarks);
+criterion_group!(benches, middleware_benchmarks);
 criterion_main!(benches);
