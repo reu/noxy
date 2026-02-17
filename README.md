@@ -184,7 +184,8 @@ Options:
       --config <CONFIG>        Path to TOML config file
       --cert <CERT>            Path to CA certificate PEM file [default: ca-cert.pem]
       --key <KEY>              Path to CA private key PEM file [default: ca-key.pem]
-      --listen <LISTEN>        Listen address [default: 127.0.0.1:8080]
+  -p, --port <PORT>            Port to listen on [default: 8080]
+      --bind <BIND>            Bind address [default: 0.0.0.0]
       --generate               Generate a new CA cert+key pair and exit
       --upstream <URL>         Reverse proxy mode: forward all traffic to this upstream URL
       --tls-cert <PATH>        TLS cert for client-facing HTTPS (reverse proxy mode)
@@ -278,8 +279,8 @@ noxy --pool-idle-timeout 120s
 # Accept invalid upstream certificates (e.g. self-signed)
 noxy --accept-invalid-certs
 
-# Custom listen address and CA paths
-noxy --listen 0.0.0.0:9090 --cert my-ca.pem --key my-ca-key.pem
+# Custom port, bind address, and CA paths
+noxy --port 9090 --bind 127.0.0.1 --cert my-ca.pem --key my-ca-key.pem
 
 # Reverse proxy to a local backend
 noxy --upstream http://localhost:3000 --log
@@ -299,12 +300,12 @@ For conditional rules and more complex setups, use a TOML config file.
 noxy --config proxy.toml
 ```
 
-CLI flags override config file settings for global options (listen address, CA paths, etc.) and append additional unconditional rules.
+CLI flags override config file settings for global options (port, bind address, CA paths, etc.) and append additional unconditional rules.
 
 ### Reverse proxy config
 
 ```toml
-listen = "127.0.0.1:8080"
+port = 8080
 upstream = "http://localhost:3000"
 
 # Optional: serve HTTPS to clients
@@ -322,7 +323,7 @@ rate_limit = { count = 100, window = "1s" }
 ### Multi-upstream routing config
 
 ```toml
-listen = "127.0.0.1:8080"
+port = 8080
 upstream = "http://default:3000"
 
 # Route /api to a dedicated backend with rate limiting
@@ -347,7 +348,7 @@ balance = "random"
 ### Forward proxy config
 
 ```toml
-listen = "127.0.0.1:8080"
+port = 8080
 
 [ca]
 cert = "ca-cert.pem"
@@ -627,7 +628,7 @@ sequenceDiagram
     N-->>C: 200 OK (modified)
 ```
 
-1. **Direct HTTP** -- the client sends a plain HTTP request to Noxy's listen address. No CONNECT, no proxy configuration, no certificate trust needed.
+1. **Direct HTTP** -- the client sends a plain HTTP request to Noxy's address. No CONNECT, no proxy configuration, no certificate trust needed.
 
 2. **Middleware pipeline** -- the request passes through the tower middleware stack (rate limiting, logging, header injection, etc.), exactly the same pipeline used in forward mode.
 
@@ -678,7 +679,8 @@ noxy --upstream http://localhost:8080 \
 
 ```toml
 # Multi-backend gateway via config file
-listen = "0.0.0.0:443"
+port = 443
+bind = "0.0.0.0"
 upstream = "http://web:3000"
 
 [tls]
@@ -707,7 +709,7 @@ noxy --upstream https://api.example.com \
 
 ```toml
 # Surgical fault injection via config file
-listen = "127.0.0.1:8080"
+port = 8080
 upstream = "https://api.example.com"
 
 [[rules]]

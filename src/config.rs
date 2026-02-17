@@ -16,8 +16,11 @@ use crate::middleware::{
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
 #[derive(Debug, Default, Deserialize)]
 pub struct ProxyConfig {
-    /// Listen address, e.g. "127.0.0.1:8080".
-    pub listen: Option<String>,
+    /// Port to listen on, e.g. 8080.
+    pub port: Option<u16>,
+
+    /// Bind address, e.g. "0.0.0.0" or "127.0.0.1".
+    pub bind: Option<String>,
 
     /// Fixed upstream URL for reverse proxy mode, e.g. "https://api.example.com".
     pub upstream: Option<String>,
@@ -696,7 +699,8 @@ mod tests {
     #[test]
     fn deserialize_full_config() {
         let toml = r#"
-            listen = "127.0.0.1:9090"
+            port = 9090
+            bind = "127.0.0.1"
             accept_invalid_upstream_certs = true
             pool_max_idle_per_host = 16
             pool_idle_timeout = "120s"
@@ -777,7 +781,8 @@ mod tests {
 
         let config: ProxyConfig = toml::from_str(toml).unwrap();
 
-        assert_eq!(config.listen.as_deref(), Some("127.0.0.1:9090"));
+        assert_eq!(config.port, Some(9090));
+        assert_eq!(config.bind.as_deref(), Some("127.0.0.1"));
         assert!(config.accept_invalid_upstream_certs);
         assert_eq!(config.pool_max_idle_per_host, Some(16));
         assert_eq!(
@@ -930,7 +935,8 @@ mod tests {
     fn deserialize_minimal_config() {
         let toml = "";
         let config: ProxyConfig = toml::from_str(toml).unwrap();
-        assert!(config.listen.is_none());
+        assert!(config.port.is_none());
+        assert!(config.bind.is_none());
         assert!(config.ca.is_none());
         assert!(!config.accept_invalid_upstream_certs);
         assert!(config.rules.is_empty());

@@ -5,7 +5,7 @@ use noxy::config::{ProxyConfig, RuleConfig};
 #[command(name = "noxy", about = "TLS man-in-the-middle proxy")]
 struct Cli {
     /// Path to TOML config file
-    #[arg(long)]
+    #[arg(short, long)]
     config: Option<String>,
 
     /// Path to CA certificate PEM file
@@ -16,9 +16,13 @@ struct Cli {
     #[arg(long = "key", default_value = "ca-key.pem")]
     key: String,
 
-    /// Listen address
-    #[arg(long, default_value = "127.0.0.1:8080")]
-    listen: String,
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 8080)]
+    port: u16,
+
+    /// Bind address
+    #[arg(long, default_value = "0.0.0.0")]
+    bind: String,
 
     /// Generate a new CA cert+key pair and exit
     #[arg(long)]
@@ -180,8 +184,11 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    if config.listen.is_none() {
-        config.listen = Some(cli.listen.clone());
+    if config.port.is_none() {
+        config.port = Some(cli.port);
+    }
+    if config.bind.is_none() {
+        config.bind = Some(cli.bind.clone());
     }
 
     if cli.accept_invalid_certs {
@@ -343,7 +350,9 @@ async fn main() -> anyhow::Result<()> {
 
     config.append_rules(cli_rules);
 
-    let listen = config.listen.clone().unwrap_or_else(|| cli.listen.clone());
+    let bind = config.bind.as_deref().unwrap_or(&cli.bind);
+    let port = config.port.unwrap_or(cli.port);
+    let listen = format!("{bind}:{port}");
     let proxy = config.into_builder()?.build()?;
     proxy
         .listen_with_shutdown(&listen, async {
