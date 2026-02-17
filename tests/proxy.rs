@@ -625,9 +625,10 @@ async fn proxy_relays_websocket() {
     async fn echo_ws(mut socket: WebSocket) {
         while let Some(Ok(msg)) = socket.recv().await {
             if matches!(msg, Message::Text(_) | Message::Binary(_))
-                && socket.send(msg).await.is_err() {
-                    break;
-                }
+                && socket.send(msg).await.is_err()
+            {
+                break;
+            }
         }
     }
 

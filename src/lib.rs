@@ -788,16 +788,27 @@ impl Proxy {
         cache: &Mutex<lru::LruCache<String, Arc<ServerConfig>>>,
         hostname: &str,
     ) -> anyhow::Result<Arc<ServerConfig>> {
-        let mut cache = cache.lock().unwrap();
-        if let Some(config) = cache.get(hostname) {
-            return Ok(config.clone());
+        // Fast path: hit cache under a short lock.
+        {
+            let mut cache = cache.lock().unwrap();
+            if let Some(config) = cache.get(hostname) {
+                return Ok(config.clone());
+            }
         }
+
+        // Miss path: generate certificate/config outside the cache lock.
         let (cert_der, key_der) = ca.generate_cert(hostname)?;
         let mut config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der], key_der)?;
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         let config = Arc::new(config);
+
+        // Re-check in case another task inserted while we were generating.
+        let mut cache = cache.lock().unwrap();
+        if let Some(existing) = cache.get(hostname) {
+            return Ok(existing.clone());
+        }
         cache.put(hostname.to_string(), config.clone());
         Ok(config)
     }
