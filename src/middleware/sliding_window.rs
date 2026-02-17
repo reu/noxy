@@ -11,6 +11,9 @@ use tower::Service;
 use crate::http::{Body, BoxError, HttpService};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
+const DEFAULT_MAX_KEYS: usize = 10_000;
+const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Sliding window log algorithm: stores a `VecDeque<Instant>` of request
 /// timestamps per key. On each request, entries older than `window` are
@@ -64,16 +67,64 @@ impl Clone for SlidingWindow {
 }
 
 struct SharedState {
-    windows: HashMap<String, VecDeque<Instant>>,
+    windows: HashMap<String, WindowState>,
     count: u64,
     window: Duration,
+    max_keys: usize,
+    idle_ttl: Duration,
+    next_cleanup: Instant,
+}
+
+struct WindowState {
+    timestamps: VecDeque<Instant>,
+    last_seen: Instant,
 }
 
 impl SharedState {
+    fn effective_ttl(&self) -> Duration {
+        self.idle_ttl.max(self.window)
+    }
+
+    fn maybe_cleanup(&mut self, now: Instant) {
+        if now < self.next_cleanup {
+            return;
+        }
+        let ttl = self.effective_ttl();
+        self.windows
+            .retain(|_, state| now.saturating_duration_since(state.last_seen) <= ttl);
+        self.next_cleanup = now + CLEANUP_INTERVAL;
+    }
+
+    fn evict_if_needed(&mut self, key: &str, now: Instant) {
+        if self.windows.contains_key(key) || self.windows.len() < self.max_keys {
+            return;
+        }
+        let ttl = self.effective_ttl();
+        if let Some(oldest_key) = self
+            .windows
+            .iter()
+            .filter(|(_, state)| now.saturating_duration_since(state.last_seen) > ttl)
+            .min_by_key(|(_, state)| state.last_seen)
+            .map(|(k, _)| k.clone())
+        {
+            self.windows.remove(&oldest_key);
+        }
+    }
+
     fn take(&mut self, key: &str) -> Option<Duration> {
         let now = Instant::now();
+        self.maybe_cleanup(now);
+        self.evict_if_needed(key, now);
         let cutoff = now - self.window;
-        let timestamps = self.windows.entry(key.to_string()).or_default();
+        let state = self
+            .windows
+            .entry(key.to_string())
+            .or_insert_with(|| WindowState {
+                timestamps: VecDeque::new(),
+                last_seen: now,
+            });
+        state.last_seen = now;
+        let timestamps = &mut state.timestamps;
 
         // Drain entries older than the window
         while timestamps.front().is_some_and(|&t| t <= cutoff) {
@@ -107,6 +158,9 @@ impl SlidingWindow {
                 windows: HashMap::new(),
                 count,
                 window,
+                max_keys: DEFAULT_MAX_KEYS,
+                idle_ttl: DEFAULT_IDLE_TTL,
+                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
             })),
             key_fn: Arc::new(key_fn),
         }
@@ -122,6 +176,20 @@ impl SlidingWindow {
     /// `count` requests are allowed per `window` duration.
     pub fn per_host(count: u64, window: Duration) -> Self {
         Self::keyed(count, window, extract_host)
+    }
+
+    /// Soft cap for distinct keys tracked in memory.
+    /// Idle keys are evicted first; if all keys are active, the map may
+    /// temporarily exceed this value to preserve window correctness.
+    pub fn max_keys(self, max: usize) -> Self {
+        self.state.lock().unwrap().max_keys = max.max(1);
+        self
+    }
+
+    /// Drop key state that has been idle longer than this duration.
+    pub fn idle_ttl(self, ttl: Duration) -> Self {
+        self.state.lock().unwrap().idle_ttl = ttl;
+        self
     }
 }
 
@@ -173,5 +241,86 @@ impl Service<Request<Body>> for SlidingWindowService {
                 fut.await
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_state_preserves_active_keys_when_over_capacity() {
+        let mut state = SharedState {
+            windows: HashMap::new(),
+            count: 1,
+            window: Duration::from_secs(1),
+            max_keys: 2,
+            idle_ttl: Duration::from_secs(60),
+            next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+        };
+
+        let _ = state.take("a");
+        let _ = state.take("b");
+        let _ = state.take("c");
+        assert!(state.windows.contains_key("a"));
+        assert!(state.windows.contains_key("b"));
+        assert!(state.windows.contains_key("c"));
+    }
+
+    #[test]
+    fn shared_state_evicts_idle_keys() {
+        let mut state = SharedState {
+            windows: HashMap::new(),
+            count: 1,
+            window: Duration::from_secs(1),
+            max_keys: 10,
+            idle_ttl: Duration::from_millis(1),
+            next_cleanup: Instant::now(),
+        };
+
+        let _ = state.take("a");
+        for v in state.windows.values_mut() {
+            v.last_seen = Instant::now() - Duration::from_secs(5);
+        }
+        state.next_cleanup = Instant::now();
+        let _ = state.take("b");
+        assert!(!state.windows.contains_key("a"));
+    }
+
+    #[test]
+    fn shared_state_preserves_until_window_expires() {
+        let mut state = SharedState {
+            windows: HashMap::new(),
+            count: 1,
+            window: Duration::from_secs(10),
+            max_keys: 10,
+            idle_ttl: Duration::from_millis(1),
+            next_cleanup: Instant::now(),
+        };
+
+        let _ = state.take("a");
+        state.windows.get_mut("a").unwrap().last_seen = Instant::now() - Duration::from_secs(5);
+        state.next_cleanup = Instant::now();
+        let _ = state.take("b");
+
+        assert!(state.windows.contains_key("a"));
+    }
+
+    #[test]
+    fn shared_state_does_not_evict_active_key_at_capacity() {
+        let mut state = SharedState {
+            windows: HashMap::new(),
+            count: 1,
+            window: Duration::from_secs(10),
+            max_keys: 1,
+            idle_ttl: Duration::from_secs(600),
+            next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+        };
+
+        let _ = state.take("a");
+        let _ = state.take("b");
+
+        assert!(state.windows.contains_key("a"));
+        assert!(state.windows.contains_key("b"));
     }
 }

@@ -12,6 +12,9 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
 type FailurePolicy = Arc<dyn Fn(&Response<Body>) -> bool + Send + Sync>;
+const DEFAULT_MAX_KEYS: usize = 10_000;
+const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
 enum State {
     Closed { consecutive_failures: u32 },
@@ -25,20 +28,77 @@ enum Action {
 }
 
 struct SharedState {
-    circuits: HashMap<String, State>,
+    circuits: HashMap<String, CircuitEntry>,
     threshold: u32,
     recovery: Duration,
     half_open_probes: u32,
+    max_keys: usize,
+    idle_ttl: Duration,
+    next_cleanup: Instant,
+}
+
+struct CircuitEntry {
+    state: State,
+    last_seen: Instant,
 }
 
 impl SharedState {
+    fn maybe_cleanup(&mut self, now: Instant) {
+        if now < self.next_cleanup {
+            return;
+        }
+        let idle_ttl = self.idle_ttl;
+        self.circuits.retain(|_, entry| {
+            let idle_ok = now.saturating_duration_since(entry.last_seen) <= idle_ttl;
+            match entry.state {
+                State::Open { until } => idle_ok || now < until,
+                _ => idle_ok,
+            }
+        });
+        self.next_cleanup = now + CLEANUP_INTERVAL;
+    }
+
+    fn can_evict_entry(&self, entry: &CircuitEntry, now: Instant) -> bool {
+        let idle = now.saturating_duration_since(entry.last_seen);
+        if idle <= self.idle_ttl {
+            return false;
+        }
+        match entry.state {
+            State::Open { until } => now >= until,
+            _ => true,
+        }
+    }
+
+    fn evict_if_needed(&mut self, key: &str, now: Instant) {
+        if self.circuits.contains_key(key) || self.circuits.len() < self.max_keys {
+            return;
+        }
+        if let Some(oldest_key) = self
+            .circuits
+            .iter()
+            .filter(|(_, entry)| self.can_evict_entry(entry, now))
+            .min_by_key(|(_, entry)| entry.last_seen)
+            .map(|(k, _)| k.clone())
+        {
+            self.circuits.remove(&oldest_key);
+        }
+    }
+
     fn check(&mut self, key: &str) -> Action {
-        let state = self
+        let now = Instant::now();
+        self.maybe_cleanup(now);
+        self.evict_if_needed(key, now);
+        let entry = self
             .circuits
             .entry(key.to_string())
-            .or_insert(State::Closed {
-                consecutive_failures: 0,
+            .or_insert(CircuitEntry {
+                state: State::Closed {
+                    consecutive_failures: 0,
+                },
+                last_seen: now,
             });
+        entry.last_seen = now;
+        let state = &mut entry.state;
 
         match state {
             State::Closed { .. } => Action::Allow,
@@ -62,14 +122,22 @@ impl SharedState {
     }
 
     fn record(&mut self, key: &str, success: bool) {
+        let now = Instant::now();
+        self.maybe_cleanup(now);
+        self.evict_if_needed(key, now);
         let recovery = self.recovery;
         let threshold = self.threshold;
-        let state = self
+        let entry = self
             .circuits
             .entry(key.to_string())
-            .or_insert(State::Closed {
-                consecutive_failures: 0,
+            .or_insert(CircuitEntry {
+                state: State::Closed {
+                    consecutive_failures: 0,
+                },
+                last_seen: now,
             });
+        entry.last_seen = now;
+        let state = &mut entry.state;
 
         match state {
             State::Closed {
@@ -163,6 +231,9 @@ impl CircuitBreaker {
                 threshold,
                 recovery,
                 half_open_probes: 1,
+                max_keys: DEFAULT_MAX_KEYS,
+                idle_ttl: DEFAULT_IDLE_TTL,
+                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
             })),
             key_fn: Arc::new(key_fn),
             failure_policy: Arc::new(|resp| resp.status().is_server_error()),
@@ -214,6 +285,21 @@ impl CircuitBreaker {
     /// Defaults to "circuit breaker open".
     pub fn reject_body(mut self, body: impl Into<String>) -> Self {
         self.reject_body = body.into();
+        self
+    }
+
+    /// Soft cap for distinct keys tracked in memory.
+    /// Idle circuits are evicted first; if all tracked circuits are active
+    /// (including open circuits before recovery), the map may temporarily
+    /// exceed this value to preserve breaker correctness.
+    pub fn max_keys(self, max: usize) -> Self {
+        self.state.lock().unwrap().max_keys = max.max(1);
+        self
+    }
+
+    /// Drop key state that has been idle longer than this duration.
+    pub fn idle_ttl(self, ttl: Duration) -> Self {
+        self.state.lock().unwrap().idle_ttl = ttl;
         self
     }
 }
@@ -289,5 +375,102 @@ impl Service<Request<Body>> for CircuitBreakerService {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_state_preserves_active_keys_when_over_capacity() {
+        let mut state = SharedState {
+            circuits: HashMap::new(),
+            threshold: 1,
+            recovery: Duration::from_secs(1),
+            half_open_probes: 1,
+            max_keys: 2,
+            idle_ttl: Duration::from_secs(60),
+            next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+        };
+
+        let _ = state.check("a");
+        let _ = state.check("b");
+        let _ = state.check("c");
+        assert!(state.circuits.contains_key("a"));
+        assert!(state.circuits.contains_key("b"));
+        assert!(state.circuits.contains_key("c"));
+    }
+
+    #[test]
+    fn shared_state_evicts_idle_keys() {
+        let mut state = SharedState {
+            circuits: HashMap::new(),
+            threshold: 1,
+            recovery: Duration::from_secs(1),
+            half_open_probes: 1,
+            max_keys: 10,
+            idle_ttl: Duration::from_millis(1),
+            next_cleanup: Instant::now(),
+        };
+
+        let _ = state.check("a");
+        for v in state.circuits.values_mut() {
+            v.last_seen = Instant::now() - Duration::from_secs(5);
+        }
+        state.next_cleanup = Instant::now();
+        let _ = state.check("b");
+        assert!(!state.circuits.contains_key("a"));
+    }
+
+    #[test]
+    fn shared_state_keeps_open_circuit_until_recovery_deadline() {
+        let mut state = SharedState {
+            circuits: HashMap::new(),
+            threshold: 1,
+            recovery: Duration::from_secs(30),
+            half_open_probes: 1,
+            max_keys: 10,
+            idle_ttl: Duration::from_millis(1),
+            next_cleanup: Instant::now(),
+        };
+
+        let _ = state.check("a");
+        {
+            let entry = state.circuits.get_mut("a").unwrap();
+            entry.state = State::Open {
+                until: Instant::now() + Duration::from_secs(20),
+            };
+            entry.last_seen = Instant::now() - Duration::from_secs(10);
+        }
+
+        state.next_cleanup = Instant::now();
+        let _ = state.check("b");
+        assert!(state.circuits.contains_key("a"));
+    }
+
+    #[test]
+    fn shared_state_does_not_evict_open_circuit_at_capacity() {
+        let mut state = SharedState {
+            circuits: HashMap::new(),
+            threshold: 1,
+            recovery: Duration::from_secs(30),
+            half_open_probes: 1,
+            max_keys: 1,
+            idle_ttl: Duration::from_secs(600),
+            next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+        };
+
+        let _ = state.check("a");
+        {
+            let entry = state.circuits.get_mut("a").unwrap();
+            entry.state = State::Open {
+                until: Instant::now() + Duration::from_secs(20),
+            };
+        }
+
+        let _ = state.check("b");
+        assert!(state.circuits.contains_key("a"));
+        assert!(state.circuits.contains_key("b"));
     }
 }
