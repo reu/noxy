@@ -11,7 +11,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Multi-upstream routing** -- route requests to different backends by path prefix, host, or custom predicates. Load balance across multiple backends with round-robin or random strategies.
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
 - **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff and retry budget, circuit breaker, fixed responses, and TypeScript scripting
-- **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
+- **Conditional rules** -- apply middleware only to requests matching a host, path, or HTTP method (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
 - HTTP/1.1 and HTTP/2 support (auto-negotiated via ALPN)
@@ -490,6 +490,11 @@ rate_limit = { count = 10, window = "1s" }
 [[rules]]
 match = { path = "/static/**" }
 response_headers = { set = { "cache-control" = "public, max-age=86400" } }
+
+# Match by HTTP method
+[[rules]]
+match = { methods = ["POST", "PUT", "DELETE"], path_prefix = "/api" }
+rate_limit = { count = 10, window = "1s" }
 ```
 
 ### Rules
@@ -498,7 +503,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
-| `match`     | `{ host = "*.example.com", path = "/api/*/users" }` or `{ path_prefix = "/prefix" }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`) |
+| `match`     | `{ host = "*.example.com", path = "/api/*/users" }`, `{ path_prefix = "/prefix" }`, or `{ methods = ["GET", "POST"] }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`); `methods` filters by HTTP method (case-insensitive) |
 | `upstream`  | `"http://api:8080"` or `["http://a:8080", "http://b:8080"]` -- route matched requests to a different upstream |
 | `balance`   | `"round-robin"` or `"random"` -- load balancing strategy for multi-upstream rules (default: round-robin) |
 | `url_rewrite` | `{ pattern = "/old/{*rest}", replace = "/new/{rest}" }` or `{ regex = "/v\\d+/(.*)", replace = "/latest/$1" }` -- rewrite request paths |

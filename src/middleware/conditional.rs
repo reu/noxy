@@ -9,6 +9,14 @@ use tower::Service;
 use crate::http::{Body, BoxError, HttpService};
 
 type Predicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
+
+fn method_predicate(method: http::Method) -> impl Fn(&Request<Body>) -> bool + Send + Sync {
+    move |req: &Request<Body>| *req.method() == method
+}
+
+fn methods_predicate(methods: Vec<http::Method>) -> impl Fn(&Request<Body>) -> bool + Send + Sync {
+    move |req: &Request<Body>| methods.contains(req.method())
+}
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 
 struct Rule {
@@ -102,6 +110,29 @@ impl Conditional {
             .compile_matcher();
         Ok(self.when(move |req| matcher.is_match(req.uri().path()), layer))
     }
+
+    /// Shorthand: when the request HTTP method matches, apply the given layer.
+    pub fn when_method<L>(self, method: http::Method, layer: L) -> Self
+    where
+        L: tower::Layer<HttpService> + Send + Sync + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send,
+    {
+        self.when(method_predicate(method), layer)
+    }
+
+    /// Shorthand: when the request HTTP method is one of the given set, apply
+    /// the given layer.
+    pub fn when_methods<L>(self, methods: impl Into<Vec<http::Method>>, layer: L) -> Self
+    where
+        L: tower::Layer<HttpService> + Send + Sync + 'static,
+        L::Service:
+            Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
+        <L::Service as Service<Request<Body>>>::Future: Send,
+    {
+        self.when(methods_predicate(methods.into()), layer)
+    }
 }
 
 /// Extension trait that lets any tower layer add a condition directly.
@@ -137,6 +168,12 @@ where
 
     /// Apply this layer only when the request path matches a glob pattern.
     fn when_path_glob(self, pattern: &str) -> Result<Conditional, globset::Error>;
+
+    /// Apply this layer only when the request HTTP method matches.
+    fn when_method(self, method: http::Method) -> Conditional;
+
+    /// Apply this layer only when the request HTTP method is one of the given set.
+    fn when_methods(self, methods: impl Into<Vec<http::Method>>) -> Conditional;
 }
 
 impl<L> ConditionalLayer for L
@@ -159,6 +196,14 @@ where
 
     fn when_path_glob(self, pattern: &str) -> Result<Conditional, globset::Error> {
         Conditional::new().when_path_glob(pattern, self)
+    }
+
+    fn when_method(self, method: http::Method) -> Conditional {
+        Conditional::new().when_method(method, self)
+    }
+
+    fn when_methods(self, methods: impl Into<Vec<http::Method>>) -> Conditional {
+        Conditional::new().when_methods(methods, self)
     }
 }
 

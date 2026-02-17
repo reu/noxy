@@ -142,6 +142,9 @@ pub struct MatchConfig {
     pub path: Option<String>,
     /// Path prefix match (unchanged, no glob).
     pub path_prefix: Option<String>,
+    /// HTTP methods to match, e.g. `["GET", "POST"]`. Case-insensitive.
+    #[serde(default)]
+    pub methods: Vec<String>,
 }
 
 /// Log configuration: `true` for defaults, or `{ bodies = true }` for detail.
@@ -301,12 +304,23 @@ fn compile_glob(pattern: &str) -> Result<GlobMatcher, globset::Error> {
 }
 
 impl MatchConfig {
-    fn into_predicate(self) -> Result<Predicate, globset::Error> {
+    fn into_predicate(self) -> Result<Predicate, anyhow::Error> {
         let host_matcher = self.host.as_deref().map(compile_glob).transpose()?;
         let path_matcher = self.path.as_deref().map(compile_glob).transpose()?;
         let path_prefix = self.path_prefix;
+        let methods: Vec<http::Method> = self
+            .methods
+            .iter()
+            .map(|m| {
+                http::Method::from_bytes(m.to_ascii_uppercase().as_bytes())
+                    .map_err(|e| anyhow::anyhow!("invalid HTTP method '{m}': {e}"))
+            })
+            .collect::<Result<_, _>>()?;
 
         Ok(Arc::new(move |req: &Request<Body>| {
+            if !methods.is_empty() && !methods.contains(req.method()) {
+                return false;
+            }
             if let Some(ref m) = host_matcher {
                 let req_host = req
                     .uri()
@@ -1015,12 +1029,22 @@ mod tests {
             .unwrap()
     }
 
+    fn make_request_with_method(method: http::Method, host: &str, path: &str) -> Request<Body> {
+        let uri = format!("https://{host}{path}");
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(crate::http::empty_body())
+            .unwrap()
+    }
+
     #[test]
     fn glob_exact_match() {
         let pred = MatchConfig {
             host: None,
             path: Some("/health".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1035,6 +1059,7 @@ mod tests {
             host: None,
             path: Some("/api/*/users".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1049,6 +1074,7 @@ mod tests {
             host: None,
             path: Some("/api/**".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1063,6 +1089,7 @@ mod tests {
             host: None,
             path: Some("/api/v?".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1077,6 +1104,7 @@ mod tests {
             host: None,
             path: Some("/[abc].html".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1091,6 +1119,7 @@ mod tests {
             host: Some("*.example.com".into()),
             path: None,
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
@@ -1105,11 +1134,129 @@ mod tests {
             host: None,
             path: Some("/api/*".into()),
             path_prefix: None,
+            methods: vec![],
         }
         .into_predicate()
         .unwrap();
         assert!(pred(&make_request("example.com", "/api/v1")));
         assert!(!pred(&make_request("example.com", "/api/v1/users")));
+    }
+
+    #[test]
+    fn methods_single_match() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec!["GET".into()],
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_method(
+            http::Method::GET,
+            "example.com",
+            "/any"
+        )));
+        assert!(!pred(&make_request_with_method(
+            http::Method::POST,
+            "example.com",
+            "/any"
+        )));
+    }
+
+    #[test]
+    fn methods_multiple_match() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: Some("/api".into()),
+            methods: vec!["GET".into(), "POST".into()],
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_method(
+            http::Method::GET,
+            "example.com",
+            "/api/users"
+        )));
+        assert!(pred(&make_request_with_method(
+            http::Method::POST,
+            "example.com",
+            "/api/users"
+        )));
+        assert!(!pred(&make_request_with_method(
+            http::Method::DELETE,
+            "example.com",
+            "/api/users"
+        )));
+        assert!(!pred(&make_request_with_method(
+            http::Method::GET,
+            "example.com",
+            "/other"
+        )));
+    }
+
+    #[test]
+    fn methods_case_insensitive() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec!["get".into()],
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_method(
+            http::Method::GET,
+            "example.com",
+            "/any"
+        )));
+    }
+
+    #[test]
+    fn methods_empty_matches_all() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec![],
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_method(
+            http::Method::GET,
+            "example.com",
+            "/any"
+        )));
+        assert!(pred(&make_request_with_method(
+            http::Method::DELETE,
+            "example.com",
+            "/any"
+        )));
+    }
+
+    #[test]
+    fn methods_invalid_rejected() {
+        let result = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec!["NOT\nVALID".into()],
+        }
+        .into_predicate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_methods_match() {
+        let toml = r#"
+            [[rules]]
+            match = { methods = ["GET", "HEAD"], path_prefix = "/api" }
+            latency = "100ms"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        let m = config.rules[0].match_config.as_ref().unwrap();
+        assert_eq!(m.methods, vec!["GET", "HEAD"]);
     }
 
     #[test]
