@@ -214,6 +214,7 @@ pub struct SlidingWindowConfig {
 pub struct RetryConfig {
     pub max_retries: Option<u32>,
     pub backoff: Option<DurationValue>,
+    pub max_backoff: Option<DurationValue>,
     pub statuses: Option<Vec<u16>>,
     pub max_replay_body_bytes: Option<usize>,
     pub budget: Option<f64>,
@@ -682,6 +683,9 @@ fn build_retry(config: RetryConfig) -> Retry {
     }
     if let Some(backoff) = config.backoff {
         retry = retry.backoff(backoff.0);
+    }
+    if let Some(max_backoff) = config.max_backoff {
+        retry = retry.max_backoff(max_backoff.0);
     }
     if let Some(max_bytes) = config.max_replay_body_bytes {
         retry = retry.max_replay_body_bytes(max_bytes);

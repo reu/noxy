@@ -13,7 +13,7 @@ use tower::Service;
 
 use crate::http::{Body, BoxError, HttpService, full_body};
 
-const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BUDGET_WINDOW: Duration = Duration::from_secs(10);
 const DEFAULT_BUDGET_MIN_RETRIES: u32 = 30;
 
@@ -120,6 +120,7 @@ pub struct Retry {
     statuses: Vec<StatusCode>,
     max_retries: u32,
     backoff: Duration,
+    max_backoff: Duration,
     policy: Option<PolicyKind>,
     max_replay_body_bytes: usize,
     budget_ratio: Option<f64>,
@@ -134,6 +135,7 @@ impl Clone for Retry {
             statuses: self.statuses.clone(),
             max_retries: self.max_retries,
             backoff: self.backoff,
+            max_backoff: self.max_backoff,
             policy: self.policy.clone(),
             max_replay_body_bytes: self.max_replay_body_bytes,
             budget_ratio: self.budget_ratio,
@@ -154,6 +156,7 @@ impl Retry {
             statuses: vec![status.try_into().expect("invalid status code")],
             max_retries: 3,
             backoff: Duration::from_secs(1),
+            max_backoff: DEFAULT_MAX_BACKOFF,
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
             budget_ratio: None,
@@ -176,6 +179,7 @@ impl Retry {
                 .collect(),
             max_retries: 3,
             backoff: Duration::from_secs(1),
+            max_backoff: DEFAULT_MAX_BACKOFF,
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
             budget_ratio: None,
@@ -192,9 +196,16 @@ impl Retry {
     }
 
     /// Base delay for exponential backoff. Actual delay is `base * 2^attempt`,
-    /// capped at 30 seconds. Only used with status-code-based retries.
+    /// capped at [`max_backoff`](Self::max_backoff). Only used with
+    /// status-code-based retries.
     pub fn backoff(mut self, base: Duration) -> Self {
         self.backoff = base;
+        self
+    }
+
+    /// Maximum delay for exponential backoff (default: 30s).
+    pub fn max_backoff(mut self, max: Duration) -> Self {
+        self.max_backoff = max;
         self
     }
 
@@ -353,6 +364,7 @@ impl Default for Retry {
             ],
             max_retries: 3,
             backoff: Duration::from_secs(1),
+            max_backoff: DEFAULT_MAX_BACKOFF,
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
             budget_ratio: None,
@@ -372,6 +384,7 @@ impl tower::Layer<HttpService> for Retry {
             statuses: self.statuses.clone(),
             max_retries: self.max_retries,
             backoff: self.backoff,
+            max_backoff: self.max_backoff,
             policy: self.policy.clone(),
             max_replay_body_bytes: self.max_replay_body_bytes,
             budget: self.budget_state.clone(),
@@ -384,6 +397,7 @@ pub struct RetryService {
     statuses: Vec<StatusCode>,
     max_retries: u32,
     backoff: Duration,
+    max_backoff: Duration,
     policy: Option<PolicyKind>,
     max_replay_body_bytes: usize,
     budget: Option<Arc<Mutex<BudgetState>>>,
@@ -403,6 +417,7 @@ impl Service<Request<Body>> for RetryService {
         let statuses = self.statuses.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.backoff;
+        let max_backoff = self.max_backoff;
         let policy = self.policy.clone();
         let max_replay_body_bytes = self.max_replay_body_bytes;
         let budget = self.budget.clone();
@@ -539,8 +554,9 @@ impl Service<Request<Body>> for RetryService {
                             b.record_retry();
                         }
 
-                        let delay = retry_after_delay(&resp)
-                            .unwrap_or_else(|| exponential_delay(base_backoff, attempt));
+                        let delay = retry_after_delay(&resp).unwrap_or_else(|| {
+                            exponential_delay(base_backoff, max_backoff, attempt)
+                        });
 
                         tracing::debug!(
                             status = %resp.status(),
@@ -560,8 +576,8 @@ impl Service<Request<Body>> for RetryService {
     }
 }
 
-fn exponential_delay(base: Duration, attempt: u32) -> Duration {
-    let max_delay = base.saturating_mul(1 << attempt).min(MAX_BACKOFF);
+fn exponential_delay(base: Duration, max_backoff: Duration, attempt: u32) -> Duration {
+    let max_delay = base.saturating_mul(1 << attempt).min(max_backoff);
     let jitter_nanos = rand::random_range(0..=max_delay.as_nanos() as u64);
     Duration::from_nanos(jitter_nanos)
 }

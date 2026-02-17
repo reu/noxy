@@ -200,6 +200,7 @@ Options:
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --retry-max-body <BYTES>         Max request body bytes captured for retry replay (default: 1048576)
+      --retry-max-backoff <DURATION>   Max backoff delay for retry exponential backoff (default: 30s)
       --retry-budget <RATIO>           Max fraction of requests that can be retries (e.g., 0.2)
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
       --rewrite-path <SPEC>                Rewrite request path (e.g., "/old/{*rest}=/new/{rest}"). Repeatable.
@@ -508,7 +509,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
 | `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
-| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses`, `max_replay_body_bytes`, `budget`, `budget_window`, `budget_min_retries` |
+| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses`, `max_replay_body_bytes`, `max_backoff`, `budget`, `budget_window`, `budget_min_retries` |
 | `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes` and `per_host` |
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |

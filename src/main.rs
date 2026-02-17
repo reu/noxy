@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long = "retry-max-body")]
     retry_max_body: Option<usize>,
 
+    /// Max backoff delay for retry exponential backoff (e.g., "30s")
+    #[arg(long = "retry-max-backoff")]
+    retry_max_backoff: Option<String>,
+
     /// Retry budget: max fraction of requests that can be retries (e.g., 0.2)
     #[arg(long = "retry-budget")]
     retry_budget: Option<f64>,
@@ -282,10 +286,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(max_retries) = cli.retry {
+        let max_backoff = cli
+            .retry_max_backoff
+            .as_deref()
+            .map(|s| {
+                noxy::config::parse_duration(s)
+                    .map(noxy::config::DurationValue)
+                    .map_err(|e| anyhow::anyhow!("invalid retry-max-backoff: {e}"))
+            })
+            .transpose()?;
         cli_rules.push(RuleConfig {
             retry: Some(noxy::config::RetryConfig {
                 max_retries: Some(max_retries),
                 backoff: None,
+                max_backoff,
                 statuses: None,
                 max_replay_body_bytes: cli.retry_max_body,
                 budget: cli.retry_budget,
