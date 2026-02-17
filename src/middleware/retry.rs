@@ -2,7 +2,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
@@ -14,6 +14,59 @@ use tower::Service;
 use crate::http::{Body, BoxError, HttpService, full_body};
 
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const DEFAULT_BUDGET_WINDOW: Duration = Duration::from_secs(10);
+const DEFAULT_BUDGET_MIN_RETRIES: u32 = 30;
+
+struct BudgetState {
+    ratio: f64,
+    min_retries: u32,
+    window: Duration,
+    requests: u64,
+    retries: u64,
+    window_start: Instant,
+}
+
+impl BudgetState {
+    fn new(ratio: f64, min_retries: u32, window: Duration) -> Self {
+        Self {
+            ratio,
+            min_retries,
+            window,
+            requests: 0,
+            retries: 0,
+            window_start: Instant::now(),
+        }
+    }
+
+    fn maybe_reset_window(&mut self) {
+        if self.window_start.elapsed() >= self.window {
+            self.requests = 0;
+            self.retries = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    fn record_request(&mut self) {
+        self.maybe_reset_window();
+        self.requests += 1;
+    }
+
+    fn allows_retry(&mut self) -> bool {
+        self.maybe_reset_window();
+        if self.retries < self.min_retries as u64 {
+            return true;
+        }
+        let total = self.requests + self.retries;
+        if total == 0 {
+            return true;
+        }
+        (self.retries as f64 / total as f64) < self.ratio
+    }
+
+    fn record_retry(&mut self) {
+        self.retries += 1;
+    }
+}
 
 type HeadersPolicy = Arc<dyn Fn(&http::response::Parts, u32) -> Option<Duration> + Send + Sync>;
 type BodyPolicy = Arc<dyn Fn(&Response<Bytes>, u32) -> Option<Duration> + Send + Sync>;
@@ -69,6 +122,10 @@ pub struct Retry {
     backoff: Duration,
     policy: Option<PolicyKind>,
     max_replay_body_bytes: usize,
+    budget_ratio: Option<f64>,
+    budget_window: Duration,
+    budget_min_retries: u32,
+    budget_state: Option<Arc<Mutex<BudgetState>>>,
 }
 
 impl Clone for Retry {
@@ -79,6 +136,10 @@ impl Clone for Retry {
             backoff: self.backoff,
             policy: self.policy.clone(),
             max_replay_body_bytes: self.max_replay_body_bytes,
+            budget_ratio: self.budget_ratio,
+            budget_window: self.budget_window,
+            budget_min_retries: self.budget_min_retries,
+            budget_state: self.budget_state.clone(),
         }
     }
 }
@@ -95,6 +156,10 @@ impl Retry {
             backoff: Duration::from_secs(1),
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
+            budget_ratio: None,
+            budget_window: DEFAULT_BUDGET_WINDOW,
+            budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
+            budget_state: None,
         }
     }
 
@@ -113,6 +178,10 @@ impl Retry {
             backoff: Duration::from_secs(1),
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
+            budget_ratio: None,
+            budget_window: DEFAULT_BUDGET_WINDOW,
+            budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
+            budget_state: None,
         }
     }
 
@@ -217,6 +286,60 @@ impl Retry {
         self.policy = Some(PolicyKind::Body(Arc::new(f)));
         self
     }
+
+    /// Enable retry budget: at most `ratio` of total requests can be retries.
+    ///
+    /// When upstream is failing, unlimited retries across many connections
+    /// amplify load (retry storm). A retry budget caps the fraction of total
+    /// requests that can be retries, preventing this amplification.
+    ///
+    /// `ratio` must be between 0.0 and 1.0 (e.g., 0.2 = at most 20% retries).
+    /// A minimum floor of retries per budget window is always allowed
+    /// regardless of the ratio (default: 30, configurable via
+    /// [`budget_min_retries`](Self::budget_min_retries)).
+    pub fn budget(mut self, ratio: f64) -> Self {
+        self.budget_ratio = Some(ratio);
+        self.budget_state = Some(Arc::new(Mutex::new(BudgetState::new(
+            ratio,
+            self.budget_min_retries,
+            self.budget_window,
+        ))));
+        self
+    }
+
+    /// Override budget time window (default: 10s).
+    ///
+    /// Counters reset at the end of each window. Must call after
+    /// [`budget`](Self::budget) to take effect, or call `budget` after this.
+    pub fn budget_window(mut self, window: Duration) -> Self {
+        self.budget_window = window;
+        if let Some(ratio) = self.budget_ratio {
+            self.budget_state = Some(Arc::new(Mutex::new(BudgetState::new(
+                ratio,
+                self.budget_min_retries,
+                window,
+            ))));
+        }
+        self
+    }
+
+    /// Minimum retries always allowed per budget window (default: 30).
+    ///
+    /// This many retries are always allowed per window regardless of the
+    /// budget ratio, ensuring a minimum level of retry capability. Must call
+    /// after [`budget`](Self::budget) to take effect, or call `budget` after
+    /// this.
+    pub fn budget_min_retries(mut self, n: u32) -> Self {
+        self.budget_min_retries = n;
+        if let Some(ratio) = self.budget_ratio {
+            self.budget_state = Some(Arc::new(Mutex::new(BudgetState::new(
+                ratio,
+                n,
+                self.budget_window,
+            ))));
+        }
+        self
+    }
 }
 
 impl Default for Retry {
@@ -232,6 +355,10 @@ impl Default for Retry {
             backoff: Duration::from_secs(1),
             policy: None,
             max_replay_body_bytes: 1024 * 1024,
+            budget_ratio: None,
+            budget_window: DEFAULT_BUDGET_WINDOW,
+            budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
+            budget_state: None,
         }
     }
 }
@@ -247,6 +374,7 @@ impl tower::Layer<HttpService> for Retry {
             backoff: self.backoff,
             policy: self.policy.clone(),
             max_replay_body_bytes: self.max_replay_body_bytes,
+            budget: self.budget_state.clone(),
         }
     }
 }
@@ -258,6 +386,7 @@ pub struct RetryService {
     backoff: Duration,
     policy: Option<PolicyKind>,
     max_replay_body_bytes: usize,
+    budget: Option<Arc<Mutex<BudgetState>>>,
 }
 
 impl Service<Request<Body>> for RetryService {
@@ -276,6 +405,7 @@ impl Service<Request<Body>> for RetryService {
         let base_backoff = self.backoff;
         let policy = self.policy.clone();
         let max_replay_body_bytes = self.max_replay_body_bytes;
+        let budget = self.budget.clone();
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -291,6 +421,10 @@ impl Service<Request<Body>> for RetryService {
             } else {
                 None
             };
+
+            if let Some(ref budget) = budget {
+                budget.lock().unwrap().record_request();
+            }
 
             for attempt in 0..=max_retries {
                 let mut builder = Request::builder()
@@ -329,6 +463,14 @@ impl Service<Request<Body>> for RetryService {
                                 let (parts, bytes) = buffered.into_parts();
                                 return Ok(Response::from_parts(parts, full_body(bytes)));
                             }
+                            if let Some(ref budget) = budget {
+                                let mut b = budget.lock().unwrap();
+                                if !b.allows_retry() {
+                                    let (parts, bytes) = buffered.into_parts();
+                                    return Ok(Response::from_parts(parts, full_body(bytes)));
+                                }
+                                b.record_retry();
+                            }
 
                             tracing::debug!(
                                 status = %buffered.status(),
@@ -357,6 +499,13 @@ impl Service<Request<Body>> for RetryService {
                             if replay_bytes.is_none() {
                                 return Ok(Response::from_parts(parts, body));
                             }
+                            if let Some(ref budget) = budget {
+                                let mut b = budget.lock().unwrap();
+                                if !b.allows_retry() {
+                                    return Ok(Response::from_parts(parts, body));
+                                }
+                                b.record_retry();
+                            }
 
                             tracing::debug!(
                                 status = %parts.status,
@@ -381,6 +530,13 @@ impl Service<Request<Body>> for RetryService {
                         }
                         if replay_bytes.is_none() {
                             return Ok(resp);
+                        }
+                        if let Some(ref budget) = budget {
+                            let mut b = budget.lock().unwrap();
+                            if !b.allows_retry() {
+                                return Ok(resp);
+                            }
+                            b.record_retry();
                         }
 
                         let delay = retry_after_delay(&resp)
@@ -525,5 +681,55 @@ mod tests {
         assert_eq!(err.to_string(), "stream failed");
 
         assert!(ReplayCapture::snapshot(&capture).is_none());
+    }
+
+    #[test]
+    fn budget_allows_when_under_ratio() {
+        let mut budget = BudgetState::new(0.5, 0, Duration::from_secs(60));
+        budget.requests = 10;
+        budget.retries = 3;
+        assert!(budget.allows_retry());
+    }
+
+    #[test]
+    fn budget_blocks_when_over_ratio() {
+        let mut budget = BudgetState::new(0.2, 0, Duration::from_secs(60));
+        budget.requests = 10;
+        budget.retries = 3;
+        // 3 / (10 + 3) ≈ 0.23 > 0.2
+        assert!(!budget.allows_retry());
+    }
+
+    #[test]
+    fn budget_floor_allows_retries() {
+        let mut budget = BudgetState::new(0.0, 10, Duration::from_secs(60));
+        budget.requests = 100;
+        budget.retries = 0;
+        // min_retries=10, retries(0) < 10 → allowed despite ratio=0
+        assert!(budget.allows_retry());
+    }
+
+    #[test]
+    fn budget_window_reset() {
+        let mut budget = BudgetState::new(0.2, 0, Duration::from_millis(1));
+        budget.requests = 10;
+        budget.retries = 10;
+        // Over budget
+        assert!(!budget.allows_retry());
+        // Wait for window to expire
+        std::thread::sleep(Duration::from_millis(2));
+        // After reset, counters are 0; total=0 => allows
+        assert!(budget.allows_retry());
+    }
+
+    #[test]
+    fn budget_record_request_and_retry() {
+        let mut budget = BudgetState::new(0.5, 0, Duration::from_secs(60));
+        budget.record_request();
+        budget.record_request();
+        assert_eq!(budget.requests, 2);
+        assert_eq!(budget.retries, 0);
+        budget.record_retry();
+        assert_eq!(budget.retries, 1);
     }
 }

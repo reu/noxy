@@ -10,7 +10,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
 - **Multi-upstream routing** -- route requests to different backends by path prefix, host, or custom predicates. Load balance across multiple backends with round-robin or random strategies.
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
-- **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, fixed responses, and TypeScript scripting
+- **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff and retry budget, circuit breaker, fixed responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
@@ -200,6 +200,7 @@ Options:
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --retry-max-body <BYTES>         Max request body bytes captured for retry replay (default: 1048576)
+      --retry-budget <RATIO>           Max fraction of requests that can be retries (e.g., 0.2)
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
       --rewrite-path <SPEC>                Rewrite request path (e.g., "/old/{*rest}=/new/{rest}"). Repeatable.
       --rewrite-path-regex <SPEC>        Rewrite request path via regex (e.g., "/api/v\d+/(.*)=/latest/$1"). Repeatable.
@@ -421,6 +422,10 @@ retry = { max_retries = 3, backoff = "1s", max_replay_body_bytes = 1048576 }
 match = { path_prefix = "/api" }
 retry = { max_retries = 5, backoff = "500ms", statuses = [503] }
 
+# Retry with budget: at most 20% of requests can be retries (prevents retry storms)
+[[rules]]
+retry = { max_retries = 3, budget = 0.2, budget_window = "10s", budget_min_retries = 30 }
+
 # Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
 [[rules]]
 circuit_breaker = { threshold = 5, recovery = "30s" }
@@ -503,7 +508,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
 | `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
-| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses` and `max_replay_body_bytes` |
+| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses`, `max_replay_body_bytes`, `budget`, `budget_window`, `budget_min_retries` |
 | `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes` and `per_host` |
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |

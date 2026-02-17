@@ -80,6 +80,10 @@ struct Cli {
     #[arg(long = "retry-max-body")]
     retry_max_body: Option<usize>,
 
+    /// Retry budget: max fraction of requests that can be retries (e.g., 0.2)
+    #[arg(long = "retry-budget")]
+    retry_budget: Option<f64>,
+
     /// Circuit breaker: trip after N failures, recover after duration (e.g., "5/30s")
     #[arg(long = "circuit-breaker")]
     circuit_breaker: Option<String>,
@@ -284,6 +288,9 @@ async fn main() -> anyhow::Result<()> {
                 backoff: None,
                 statuses: None,
                 max_replay_body_bytes: cli.retry_max_body,
+                budget: cli.retry_budget,
+                budget_window: None,
+                budget_min_retries: None,
             }),
             ..Default::default()
         });

@@ -216,6 +216,9 @@ pub struct RetryConfig {
     pub backoff: Option<DurationValue>,
     pub statuses: Option<Vec<u16>>,
     pub max_replay_body_bytes: Option<usize>,
+    pub budget: Option<f64>,
+    pub budget_window: Option<DurationValue>,
+    pub budget_min_retries: Option<u32>,
 }
 
 /// Header modification operations: `set`, `append`, and `remove`.
@@ -682,6 +685,15 @@ fn build_retry(config: RetryConfig) -> Retry {
     }
     if let Some(max_bytes) = config.max_replay_body_bytes {
         retry = retry.max_replay_body_bytes(max_bytes);
+    }
+    if let Some(min) = config.budget_min_retries {
+        retry = retry.budget_min_retries(min);
+    }
+    if let Some(window) = config.budget_window {
+        retry = retry.budget_window(window.0);
+    }
+    if let Some(ratio) = config.budget {
+        retry = retry.budget(ratio);
     }
     retry
 }
@@ -1222,5 +1234,33 @@ mod tests {
         assert_eq!(s2.file, "api.ts");
         assert_eq!(s2.max_body_bytes, None);
         assert!(config.rules[2].match_config.is_some());
+    }
+
+    #[test]
+    fn deserialize_retry_budget_config() {
+        let toml = r#"
+            [[rules]]
+            retry = { budget = 0.2 }
+
+            [[rules]]
+            retry = { max_retries = 5, budget = 0.1, budget_window = "30s", budget_min_retries = 5 }
+        "#;
+
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.rules.len(), 2);
+
+        let r0 = config.rules[0].retry.as_ref().unwrap();
+        assert!((r0.budget.unwrap() - 0.2).abs() < f64::EPSILON);
+        assert!(r0.budget_window.is_none());
+        assert!(r0.budget_min_retries.is_none());
+
+        let r1 = config.rules[1].retry.as_ref().unwrap();
+        assert_eq!(r1.max_retries, Some(5));
+        assert!((r1.budget.unwrap() - 0.1).abs() < f64::EPSILON);
+        assert_eq!(
+            r1.budget_window.as_ref().unwrap().0,
+            Duration::from_secs(30)
+        );
+        assert_eq!(r1.budget_min_retries, Some(5));
     }
 }
