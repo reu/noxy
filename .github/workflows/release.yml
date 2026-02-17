@@ -13,10 +13,23 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }}${{ matrix.variant.suffix }}
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
+        variant:
+          - suffix: ""
+            features: cli
+          - suffix: "-scripting"
+            features: cli,scripting
+        exclude:
+          - target: aarch64-unknown-linux-gnu
+            variant:
+              suffix: "-scripting"
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
@@ -34,7 +47,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}${{ matrix.variant.suffix }}
 
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -44,18 +57,18 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} --features cli
+        run: cargo build --release --target ${{ matrix.target }} --features ${{ matrix.variant.features }}
 
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../noxy-${{ matrix.target }}.tar.gz noxy
+          tar czf ../../../noxy${{ matrix.variant.suffix }}-${{ matrix.target }}.tar.gz noxy
           cd ../../..
 
       - uses: actions/upload-artifact@v4
         with:
-          name: noxy-${{ matrix.target }}
-          path: noxy-${{ matrix.target }}.tar.gz
+          name: noxy${{ matrix.variant.suffix }}-${{ matrix.target }}
+          path: noxy${{ matrix.variant.suffix }}-${{ matrix.target }}.tar.gz
 
   release:
     name: Release
