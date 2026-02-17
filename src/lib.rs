@@ -33,6 +33,7 @@ use http::{
 };
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
+type RoutePredicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
 
 /// A `ServerCertVerifier` that accepts any certificate. Used when
 /// `danger_accept_invalid_upstream_certs` is enabled on the builder.
@@ -175,6 +176,7 @@ pub struct ProxyBuilder {
     pool_idle_timeout: Duration,
     upstream_target: Option<(::http::uri::Authority, UpstreamScheme)>,
     tls_identity: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+    routes: Vec<(RoutePredicate, middleware::Upstream)>,
 }
 
 impl ProxyBuilder {
@@ -437,6 +439,46 @@ impl ProxyBuilder {
         Ok(self)
     }
 
+    /// Add a route: requests matching `predicate` are forwarded to `upstream`.
+    ///
+    /// Routes are evaluated in order; the first match wins. If no route
+    /// matches, the default upstream (from `reverse_proxy()`) is used.
+    /// In reverse proxy mode, the default upstream acts as the fallback.
+    pub fn route(
+        mut self,
+        predicate: impl Fn(&Request<Body>) -> bool + Send + Sync + 'static,
+        upstream: middleware::Upstream,
+    ) -> Self {
+        self.routes.push((Arc::new(predicate), upstream));
+        self
+    }
+
+    /// Route requests whose path starts with `prefix` to the given upstream
+    /// URL.
+    pub fn route_prefix(self, prefix: impl Into<String>, url: &str) -> anyhow::Result<Self> {
+        let upstream = middleware::Upstream::new([url])?;
+        let prefix = prefix.into();
+        Ok(self.route(
+            move |req: &Request<Body>| req.uri().path().starts_with(&prefix),
+            upstream,
+        ))
+    }
+
+    /// Route requests whose path starts with `prefix` to a load-balanced
+    /// set of upstream URLs (round-robin by default).
+    pub fn route_prefix_balanced(
+        self,
+        prefix: impl Into<String>,
+        urls: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> anyhow::Result<Self> {
+        let upstream = middleware::Upstream::balanced(urls)?;
+        let prefix = prefix.into();
+        Ok(self.route(
+            move |req: &Request<Body>| req.uri().path().starts_with(&prefix),
+            upstream,
+        ))
+    }
+
     /// Build the proxy. In forward mode, a CA must be set. In reverse proxy
     /// mode (when `reverse_proxy()` has been called), no CA is needed.
     pub fn build(self) -> anyhow::Result<Proxy> {
@@ -497,9 +539,22 @@ impl ProxyBuilder {
             }
         };
 
+        let mut http_layers = self.http_layers;
+        if !self.routes.is_empty() {
+            let mut router = middleware::Router::new();
+            for (predicate, upstream) in self.routes {
+                let pred = predicate;
+                router = router.route(move |req: &Request<Body>| pred(req), upstream);
+            }
+            let router_layer: LayerFn = Box::new(move |svc| {
+                tower::util::BoxService::new(tower::Layer::layer(&router, svc))
+            });
+            http_layers.insert(0, router_layer);
+        }
+
         Ok(Proxy {
             mode,
-            http_layers: Arc::new(self.http_layers),
+            http_layers: Arc::new(http_layers),
             upstream_client,
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
@@ -610,6 +665,7 @@ impl Proxy {
             pool_idle_timeout: Duration::from_secs(90),
             upstream_target: None,
             tls_identity: None,
+            routes: Vec::new(),
         }
     }
 

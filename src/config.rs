@@ -9,7 +9,8 @@ use serde::Deserialize;
 use crate::http::Body;
 use crate::middleware::{
     BandwidthThrottle, BlockList, CircuitBreaker, Conditional, FaultInjector, LatencyInjector,
-    ModifyHeaders, RateLimiter, Retry, SetResponse, SlidingWindow, TrafficLogger, UrlRewrite,
+    LoadBalanceStrategy, ModifyHeaders, RateLimiter, Retry, SetResponse, SlidingWindow,
+    TrafficLogger, Upstream, UrlRewrite,
 };
 
 /// Top-level proxy configuration. Format-agnostic (TOML, JSON, YAML via serde).
@@ -82,6 +83,9 @@ pub struct RuleConfig {
     #[serde(rename = "match")]
     pub match_config: Option<MatchConfig>,
 
+    pub upstream: Option<UpstreamConfigValue>,
+    pub balance: Option<String>,
+
     pub log: Option<LogConfig>,
     pub latency: Option<DurationOrRange>,
     pub bandwidth: Option<u64>,
@@ -95,6 +99,14 @@ pub struct RuleConfig {
     pub url_rewrite: Option<UrlRewriteConfig>,
     pub request_headers: Option<HeaderOpsConfig>,
     pub response_headers: Option<HeaderOpsConfig>,
+}
+
+/// Upstream URL(s) for routing: either a single string or a list of strings.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum UpstreamConfigValue {
+    Single(String),
+    Multiple(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -377,6 +389,22 @@ fn apply_rule(
 ) -> anyhow::Result<crate::ProxyBuilder> {
     let predicate = rule.match_config.map(|m| m.into_predicate()).transpose()?;
 
+    if let Some(upstream_config) = rule.upstream {
+        let mut upstream = match upstream_config {
+            UpstreamConfigValue::Single(url) => Upstream::new([url])?,
+            UpstreamConfigValue::Multiple(urls) => Upstream::balanced(urls)?,
+        };
+        if let Some(ref balance) = rule.balance {
+            upstream = upstream.strategy(parse_balance_strategy(balance)?);
+        }
+        if let Some(pred) = &predicate {
+            let pred = pred.clone();
+            builder = builder.route(move |req| pred(req), upstream);
+        } else {
+            builder = builder.route(|_| true, upstream);
+        }
+    }
+
     if let Some(log_config) = rule.log {
         let logger = build_traffic_logger(log_config);
         builder = apply_layer(builder, &predicate, logger);
@@ -598,6 +626,16 @@ fn build_url_rewrite(config: UrlRewriteConfig) -> anyhow::Result<UrlRewrite> {
         )),
         (None, None) => Err(anyhow::anyhow!(
             "url_rewrite: must specify either 'pattern' or 'regex'"
+        )),
+    }
+}
+
+fn parse_balance_strategy(s: &str) -> anyhow::Result<LoadBalanceStrategy> {
+    match s {
+        "round-robin" => Ok(LoadBalanceStrategy::RoundRobin),
+        "random" => Ok(LoadBalanceStrategy::Random),
+        other => Err(anyhow::anyhow!(
+            "unknown balance strategy '{other}', expected 'round-robin' or 'random'"
         )),
     }
 }
@@ -1039,5 +1077,76 @@ mod tests {
 
         let builder = config.into_builder();
         assert!(builder.is_ok());
+    }
+
+    #[test]
+    fn deserialize_single_upstream_rule() {
+        let toml = r#"
+            [[rules]]
+            match = { path_prefix = "/api" }
+            upstream = "http://api:8080"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert!(matches!(
+            &config.rules[0].upstream,
+            Some(UpstreamConfigValue::Single(url)) if url == "http://api:8080"
+        ));
+    }
+
+    #[test]
+    fn deserialize_multiple_upstream_rule() {
+        let toml = r#"
+            [[rules]]
+            match = { path_prefix = "/static" }
+            upstream = ["http://cdn1:9000", "http://cdn2:9000"]
+            balance = "round-robin"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.rules.len(), 1);
+        assert!(matches!(
+            &config.rules[0].upstream,
+            Some(UpstreamConfigValue::Multiple(urls)) if urls.len() == 2
+        ));
+        assert_eq!(config.rules[0].balance.as_deref(), Some("round-robin"));
+    }
+
+    #[test]
+    fn deserialize_routing_with_middleware() {
+        let toml = r#"
+            upstream = "http://default:3000"
+
+            [[rules]]
+            match = { path_prefix = "/api" }
+            upstream = "http://api:8080"
+            rate_limit = { count = 100, window = "1s" }
+
+            [[rules]]
+            match = { path_prefix = "/static" }
+            upstream = ["http://cdn1:9000", "http://cdn2:9000"]
+            balance = "random"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.upstream.as_deref(), Some("http://default:3000"));
+        assert_eq!(config.rules.len(), 2);
+
+        assert!(config.rules[0].upstream.is_some());
+        assert!(config.rules[0].rate_limit.is_some());
+
+        assert!(config.rules[1].upstream.is_some());
+        assert_eq!(config.rules[1].balance.as_deref(), Some("random"));
+    }
+
+    #[test]
+    fn parse_balance_strategy_values() {
+        assert!(matches!(
+            parse_balance_strategy("round-robin").unwrap(),
+            LoadBalanceStrategy::RoundRobin
+        ));
+        assert!(matches!(
+            parse_balance_strategy("random").unwrap(),
+            LoadBalanceStrategy::Random
+        ));
+        assert!(parse_balance_strategy("unknown").is_err());
     }
 }

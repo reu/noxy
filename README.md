@@ -8,6 +8,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 
 - **Forward proxy** -- CONNECT tunnel with TLS MITM, per-host certificate generation signed by a user-provided CA
 - **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
+- **Multi-upstream routing** -- route requests to different backends by path prefix, host, or custom predicates. Load balance across multiple backends with round-robin or random strategies.
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
 - **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff, circuit breaker, fixed responses, and TypeScript scripting
 - **Conditional rules** -- apply middleware only to requests matching a host or path (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
@@ -73,6 +74,28 @@ use noxy::Proxy;
 let proxy = Proxy::builder()
     .reverse_proxy("http://localhost:3000")?
     .http_layer(my_tower_layer)
+    .build()?;
+
+proxy.listen("127.0.0.1:8080").await?;
+```
+
+### Multi-upstream routing
+
+```rust,ignore
+use noxy::Proxy;
+use noxy::middleware::Upstream;
+
+let proxy = Proxy::builder()
+    .reverse_proxy("http://default:3000")?
+    // Route /api to a dedicated backend
+    .route_prefix("/api", "http://api:8080")?
+    // Load balance /static across two CDN nodes
+    .route_prefix_balanced("/static", ["http://cdn1:9000", "http://cdn2:9000"])?
+    // Custom predicate with full-flexibility API
+    .route(
+        |req| req.headers().contains_key("x-canary"),
+        Upstream::new(["http://canary:8080"])?,
+    )
     .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
@@ -296,6 +319,31 @@ log = true
 rate_limit = { count = 100, window = "1s" }
 ```
 
+### Multi-upstream routing config
+
+```toml
+listen = "127.0.0.1:8080"
+upstream = "http://default:3000"
+
+# Route /api to a dedicated backend with rate limiting
+[[rules]]
+match = { path_prefix = "/api" }
+upstream = "http://api:8080"
+rate_limit = { count = 100, window = "1s" }
+
+# Load balance /static across two CDN nodes
+[[rules]]
+match = { path_prefix = "/static" }
+upstream = ["http://cdn1:9000", "http://cdn2:9000"]
+balance = "round-robin"
+
+# Random selection for /images
+[[rules]]
+match = { path_prefix = "/images" }
+upstream = ["http://img1:9000", "http://img2:9000"]
+balance = "random"
+```
+
 ### Forward proxy config
 
 ```toml
@@ -426,6 +474,8 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
 | `match`     | `{ host = "*.example.com", path = "/api/*/users" }` or `{ path_prefix = "/prefix" }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`) |
+| `upstream`  | `"http://api:8080"` or `["http://a:8080", "http://b:8080"]` -- route matched requests to a different upstream |
+| `balance`   | `"round-robin"` or `"random"` -- load balancing strategy for multi-upstream rules (default: round-robin) |
 | `url_rewrite` | `{ pattern = "/old/{*rest}", replace = "/new/{rest}" }` or `{ regex = "/v\\d+/(.*)", replace = "/latest/$1" }` -- rewrite request paths |
 | `block`     | `{ hosts = ["*.tracking.com"], paths = ["/admin/*"] }` -- optional `status` and `body` fields (default: 403 empty) |
 | `log`       | `true` or `{ bodies = true }`                            |
@@ -616,7 +666,7 @@ noxy --upstream http://localhost:3000 \
      --log
 ```
 
-**API gateway** -- terminate TLS and apply middleware before routing to a backend:
+**API gateway** -- terminate TLS, route to multiple backends, and apply middleware:
 
 ```bash
 noxy --upstream http://localhost:8080 \
@@ -624,6 +674,26 @@ noxy --upstream http://localhost:8080 \
      --set-request-header "x-forwarded-proto: https" \
      --remove-response-header server \
      --rate-limit 1000/60s
+```
+
+```toml
+# Multi-backend gateway via config file
+listen = "0.0.0.0:443"
+upstream = "http://web:3000"
+
+[tls]
+cert = "server.pem"
+key = "server-key.pem"
+
+[[rules]]
+match = { path_prefix = "/api" }
+upstream = "http://api:8080"
+rate_limit = { count = 1000, window = "60s" }
+
+[[rules]]
+match = { path_prefix = "/static" }
+upstream = ["http://cdn1:9000", "http://cdn2:9000"]
+balance = "round-robin"
 ```
 
 **Testing and development** -- inject faults, latency, or fixed responses in front of a real API to test client resilience:

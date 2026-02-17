@@ -22,6 +22,15 @@ pub type HttpService = tower::util::BoxService<Request<Body>, Response<Body>, Bo
 pub(crate) type UpstreamClient = hyper_util::client::legacy::Client<UpstreamConnector, Body>;
 pub(crate) type UpstreamScheme = ::http::uri::Scheme;
 
+/// Request extension that overrides the default upstream for a single request.
+/// Set by the [`Router`](crate::middleware::Router) middleware; read by
+/// [`ForwardService`] before forwarding.
+#[derive(Clone, Debug)]
+pub struct UpstreamTarget {
+    pub authority: ::http::uri::Authority,
+    pub scheme: ::http::uri::Scheme,
+}
+
 pub fn full_body(data: impl Into<Bytes>) -> Body {
     http_body_util::Full::new(data.into())
         .map_err(|e| match e {})
@@ -163,9 +172,15 @@ impl Service<Request<Body>> for ForwardService {
     }
 
     fn call(&mut self, mut req: Request<Body>) -> Self::Future {
+        let (authority, scheme) = req
+            .extensions()
+            .get::<UpstreamTarget>()
+            .map(|t| (t.authority.clone(), t.scheme.clone()))
+            .unwrap_or_else(|| (self.authority.clone(), self.scheme.clone()));
+
         let mut parts = req.uri().clone().into_parts();
-        parts.scheme = Some(self.scheme.clone());
-        parts.authority = Some(self.authority.clone());
+        parts.scheme = Some(scheme);
+        parts.authority = Some(authority);
         if let Ok(uri) = ::http::Uri::from_parts(parts) {
             *req.uri_mut() = uri;
         }
