@@ -4,6 +4,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::routing::get;
 use axum_server::tls_rustls::RustlsConfig;
+use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use noxy::Proxy;
 use noxy::http::HttpService;
@@ -29,7 +30,13 @@ async fn start_upstream(body: &'static str) -> SocketAddr {
         .await
         .unwrap();
 
-    let app = Router::new().route("/", get(move || async move { body }));
+    let app = Router::new().route(
+        "/",
+        get(move || async move { body }).post(move |payload: axum::body::Bytes| async move {
+            let _ = payload.len();
+            body
+        }),
+    );
 
     let handle = axum_server::Handle::new();
     let listener_handle = handle.clone();
@@ -112,6 +119,39 @@ fn bench_get(
     });
 }
 
+fn bench_post_body(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    rt: &Runtime,
+    bench_name: &str,
+    proxy_addr: SocketAddr,
+    url: String,
+    payload: Bytes,
+) {
+    let client = http_client(proxy_addr);
+    group.bench_function(bench_name, |b| {
+        b.to_async(rt).iter(|| {
+            let client = client.clone();
+            let url = url.clone();
+            let payload = payload.clone();
+            async move { post_text_with_retries(&client, &url, payload).await }
+        });
+    });
+}
+
+async fn post_text_with_retries(client: &reqwest::Client, url: &str, payload: Bytes) -> String {
+    let mut last_err: Option<reqwest::Error> = None;
+    for _ in 0..3 {
+        match client.post(url).body(payload.clone()).send().await {
+            Ok(resp) => return resp.text().await.unwrap(),
+            Err(err) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+    panic!("post benchmark request failed after retries: {last_err:?}");
+}
+
 fn middleware_benchmarks(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
 
@@ -191,10 +231,65 @@ fn middleware_benchmarks(c: &mut Criterion) {
             .shared();
             tower::util::BoxService::new(layer.layer(inner))
         })]));
-        bench_get(&mut group, &rt, "script_no_body", script_proxy, url);
+        bench_get(&mut group, &rt, "script_no_body", script_proxy, url.clone());
     }
 
     group.finish();
+
+    let mut body_group = c.benchmark_group("middleware_body_sizes");
+    body_group.measurement_time(Duration::from_secs(10));
+
+    let baseline_body_proxy = rt.block_on(start_proxy(vec![]));
+    let retry_body_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let retry = Retry::default().max_retries(3);
+        tower::util::BoxService::new(retry.layer(inner))
+    })]));
+    #[cfg(feature = "scripting")]
+    let script_body_proxy = rt.block_on(start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = noxy::middleware::ScriptLayer::from_source(
+            "export default async (req, respond) => respond(req)",
+        )
+        .unwrap()
+        .shared();
+        tower::util::BoxService::new(layer.layer(inner))
+    })]));
+
+    for (label, size) in [
+        ("0b", 0usize),
+        ("1kb", 1024),
+        ("64kb", 64 * 1024),
+        ("1mb", 1024 * 1024),
+    ] {
+        let payload = Bytes::from(vec![b'x'; size]);
+        bench_post_body(
+            &mut body_group,
+            &rt,
+            &format!("baseline_{label}"),
+            baseline_body_proxy,
+            url.clone(),
+            payload.clone(),
+        );
+        bench_post_body(
+            &mut body_group,
+            &rt,
+            &format!("retry_no_retry_{label}"),
+            retry_body_proxy,
+            url.clone(),
+            payload.clone(),
+        );
+
+        #[cfg(feature = "scripting")]
+        bench_post_body(
+            &mut body_group,
+            &rt,
+            &format!("script_no_body_{label}"),
+            script_body_proxy,
+            url.clone(),
+            payload,
+        );
+    }
+
+    body_group.finish();
 }
 
 criterion_group!(benches, middleware_benchmarks);

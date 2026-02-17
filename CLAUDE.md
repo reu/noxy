@@ -44,7 +44,6 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 
 ### Benchmarking
 - Expanded workload matrix:
-  - body sizes: `0B`, `1KB`, `64KB`, `1MB`
   - concurrency levels: `1`, `32`, `256`
   - key distributions: hot-key and high-cardinality
 - Capture req/s, ns/op, p50/p95; optionally allocation metrics in a separate profile
