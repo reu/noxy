@@ -54,6 +54,9 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 
 ## Project Guidelines
 
+### No `mod.rs` files
+Use `src/foo.rs` + `src/foo/bar.rs` layout instead of `src/foo/mod.rs`. This applies everywhere, including `tests/` — use `tests/common.rs` not `tests/common/mod.rs`.
+
 ### Middleware checklist
 Every middleware should support all five surfaces:
 1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `http_layer()`
