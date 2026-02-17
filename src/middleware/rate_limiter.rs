@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use http::{Request, Response};
 use tower::Service;
 
+use super::store::RateLimitStore;
 use crate::http::{Body, BoxError, HttpService};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
@@ -15,15 +16,6 @@ const DEFAULT_MAX_KEYS: usize = 10_000;
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Token bucket algorithm: tokens refill continuously at `rate` tokens/sec,
-/// capped at `burst`. Each request consumes one token. If tokens go negative,
-/// the request sleeps for the deficit (reservation model — concurrent callers
-/// get correctly increasing delays).
-///
-/// This produces a steady rate, not a windowed counter. For example,
-/// `global(10, 60s)` with burst=10: the first 10 requests are instant (burst),
-/// then each subsequent request waits ~6s (1/rate). There's no "minute
-/// boundary" that resets — tokens trickle back at 0.167/s continuously.
 struct TokenBucket {
     tokens: f64,
     last_refill: Instant,
@@ -37,8 +29,6 @@ impl TokenBucket {
         }
     }
 
-    /// Refill tokens based on elapsed time, then consume one. Returns the
-    /// duration to sleep if tokens went negative (reservation model).
     fn take(&mut self, rate: f64, burst: f64) -> Option<Duration> {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
@@ -128,6 +118,49 @@ impl SharedState {
     }
 }
 
+/// In-memory token-bucket store backed by a `HashMap`.
+///
+/// This is the default store used by [`RateLimiter`] when no external backend
+/// is configured. All state lives in-process.
+#[derive(Clone)]
+pub struct InMemoryRateLimitStore {
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl InMemoryRateLimitStore {
+    fn new(rate: f64, burst: f64) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SharedState {
+                buckets: HashMap::new(),
+                rate,
+                burst,
+                max_keys: DEFAULT_MAX_KEYS,
+                idle_ttl: DEFAULT_IDLE_TTL,
+                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+            })),
+        }
+    }
+
+    fn set_burst(&self, burst: f64) {
+        self.state.lock().unwrap().burst = burst;
+    }
+
+    fn set_max_keys(&self, max: usize) {
+        self.state.lock().unwrap().max_keys = max.max(1);
+    }
+
+    fn set_idle_ttl(&self, ttl: Duration) {
+        self.state.lock().unwrap().idle_ttl = ttl;
+    }
+}
+
+impl RateLimitStore for InMemoryRateLimitStore {
+    fn take(&self, key: &str) -> impl Future<Output = Option<Duration>> + Send {
+        let result = self.state.lock().unwrap().take(key);
+        std::future::ready(result)
+    }
+}
+
 /// Tower layer that rate-limits requests using a token bucket algorithm.
 ///
 /// Requests that exceed the configured rate are delayed (not rejected),
@@ -162,16 +195,29 @@ impl SharedState {
 /// # Ok(())
 /// # }
 /// ```
-pub struct RateLimiter {
-    state: Arc<Mutex<SharedState>>,
+pub struct RateLimiter<S: RateLimitStore = InMemoryRateLimitStore> {
+    store: S,
     key_fn: KeyFn,
 }
 
-impl Clone for RateLimiter {
+impl<S: RateLimitStore> Clone for RateLimiter<S> {
     fn clone(&self) -> Self {
         Self {
-            state: self.state.clone(),
+            store: self.store.clone(),
             key_fn: self.key_fn.clone(),
+        }
+    }
+}
+
+impl<S: RateLimitStore> RateLimiter<S> {
+    /// Create a rate limiter with a custom backend store and key function.
+    pub fn with_store(
+        store: S,
+        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            store,
+            key_fn: Arc::new(key_fn),
         }
     }
 }
@@ -186,14 +232,7 @@ impl RateLimiter {
     ) -> Self {
         let rate = count as f64 / window.as_secs_f64();
         Self {
-            state: Arc::new(Mutex::new(SharedState {
-                buckets: HashMap::new(),
-                rate,
-                burst: count as f64,
-                max_keys: DEFAULT_MAX_KEYS,
-                idle_ttl: DEFAULT_IDLE_TTL,
-                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
-            })),
+            store: InMemoryRateLimitStore::new(rate, count as f64),
             key_fn: Arc::new(key_fn),
         }
     }
@@ -213,7 +252,7 @@ impl RateLimiter {
     /// Set the maximum burst size (max accumulated tokens). Defaults to
     /// `count`.
     pub fn burst(self, burst: u64) -> Self {
-        self.state.lock().unwrap().burst = burst as f64;
+        self.store.set_burst(burst as f64);
         self
     }
 
@@ -221,13 +260,13 @@ impl RateLimiter {
     /// Idle keys are evicted first; if all keys are active, the map may
     /// temporarily exceed this value to preserve rate-limit correctness.
     pub fn max_keys(self, max: usize) -> Self {
-        self.state.lock().unwrap().max_keys = max.max(1);
+        self.store.set_max_keys(max);
         self
     }
 
     /// Drop key state that has been idle longer than this duration.
     pub fn idle_ttl(self, ttl: Duration) -> Self {
-        self.state.lock().unwrap().idle_ttl = ttl;
+        self.store.set_idle_ttl(ttl);
         self
     }
 }
@@ -241,25 +280,25 @@ fn extract_host(req: &Request<Body>) -> String {
         .to_string()
 }
 
-impl tower::Layer<HttpService> for RateLimiter {
-    type Service = RateLimiterService;
+impl<S: RateLimitStore> tower::Layer<HttpService> for RateLimiter<S> {
+    type Service = RateLimiterService<S>;
 
     fn layer(&self, inner: HttpService) -> Self::Service {
         RateLimiterService {
             inner,
-            state: self.state.clone(),
+            store: self.store.clone(),
             key_fn: self.key_fn.clone(),
         }
     }
 }
 
-pub struct RateLimiterService {
+pub struct RateLimiterService<S: RateLimitStore = InMemoryRateLimitStore> {
     inner: HttpService,
-    state: Arc<Mutex<SharedState>>,
+    store: S,
     key_fn: KeyFn,
 }
 
-impl Service<Request<Body>> for RateLimiterService {
+impl<S: RateLimitStore> Service<Request<Body>> for RateLimiterService<S> {
     type Response = Response<Body>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
@@ -270,16 +309,15 @@ impl Service<Request<Body>> for RateLimiterService {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let key = (self.key_fn)(&req);
-        let delay = self.state.lock().unwrap().take(&key);
+        let store = self.store.clone();
         let fut = self.inner.call(req);
 
-        match delay {
-            None => fut,
-            Some(delay) => Box::pin(async move {
+        Box::pin(async move {
+            if let Some(delay) = store.take(&key).await {
                 tokio::time::sleep(delay).await;
-                fut.await
-            }),
-        }
+            }
+            fut.await
+        })
     }
 }
 

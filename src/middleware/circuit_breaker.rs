@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use http::{Request, Response, StatusCode};
 use tower::Service;
 
+use super::store::{CircuitAction, CircuitBreakerStore};
 use crate::http::{Body, BoxError, HttpService, full_body};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
@@ -20,11 +21,6 @@ enum State {
     Closed { consecutive_failures: u32 },
     Open { until: Instant },
     HalfOpen { in_flight: u32 },
-}
-
-enum Action {
-    Allow,
-    Reject,
 }
 
 struct SharedState {
@@ -84,7 +80,7 @@ impl SharedState {
         }
     }
 
-    fn check(&mut self, key: &str) -> Action {
+    fn check(&mut self, key: &str) -> CircuitAction {
         let now = Instant::now();
         self.maybe_cleanup(now);
         self.evict_if_needed(key, now);
@@ -101,21 +97,21 @@ impl SharedState {
         let state = &mut entry.state;
 
         match state {
-            State::Closed { .. } => Action::Allow,
+            State::Closed { .. } => CircuitAction::Allow,
             State::Open { until } => {
                 if Instant::now() >= *until {
                     *state = State::HalfOpen { in_flight: 1 };
-                    Action::Allow
+                    CircuitAction::Allow
                 } else {
-                    Action::Reject
+                    CircuitAction::Reject
                 }
             }
             State::HalfOpen { in_flight } => {
                 if *in_flight < self.half_open_probes {
                     *in_flight += 1;
-                    Action::Allow
+                    CircuitAction::Allow
                 } else {
-                    Action::Reject
+                    CircuitAction::Reject
                 }
             }
         }
@@ -170,6 +166,55 @@ impl SharedState {
     }
 }
 
+/// In-memory circuit breaker store backed by a `HashMap`.
+///
+/// This is the default store used by [`CircuitBreaker`] when no external
+/// backend is configured. All state lives in-process.
+#[derive(Clone)]
+pub struct InMemoryCircuitBreakerStore {
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl InMemoryCircuitBreakerStore {
+    fn new(threshold: u32, recovery: Duration) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SharedState {
+                circuits: HashMap::new(),
+                threshold,
+                recovery,
+                half_open_probes: 1,
+                max_keys: DEFAULT_MAX_KEYS,
+                idle_ttl: DEFAULT_IDLE_TTL,
+                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
+            })),
+        }
+    }
+
+    fn set_half_open_probes(&self, n: u32) {
+        self.state.lock().unwrap().half_open_probes = n;
+    }
+
+    fn set_max_keys(&self, max: usize) {
+        self.state.lock().unwrap().max_keys = max.max(1);
+    }
+
+    fn set_idle_ttl(&self, ttl: Duration) {
+        self.state.lock().unwrap().idle_ttl = ttl;
+    }
+}
+
+impl CircuitBreakerStore for InMemoryCircuitBreakerStore {
+    fn check(&self, key: &str) -> impl Future<Output = CircuitAction> + Send {
+        let result = self.state.lock().unwrap().check(key);
+        std::future::ready(result)
+    }
+
+    fn record(&self, key: &str, success: bool) -> impl Future<Output = ()> + Send {
+        self.state.lock().unwrap().record(key, success);
+        std::future::ready(())
+    }
+}
+
 /// Tower layer that implements the circuit breaker pattern.
 ///
 /// Tracks consecutive failures to an upstream and "trips" when a threshold is
@@ -196,23 +241,66 @@ impl SharedState {
 /// # Ok(())
 /// # }
 /// ```
-pub struct CircuitBreaker {
-    state: Arc<Mutex<SharedState>>,
+pub struct CircuitBreaker<S: CircuitBreakerStore = InMemoryCircuitBreakerStore> {
+    store: S,
     key_fn: KeyFn,
     failure_policy: FailurePolicy,
     reject_status: StatusCode,
     reject_body: String,
 }
 
-impl Clone for CircuitBreaker {
+impl<S: CircuitBreakerStore> Clone for CircuitBreaker<S> {
     fn clone(&self) -> Self {
         Self {
-            state: self.state.clone(),
+            store: self.store.clone(),
             key_fn: self.key_fn.clone(),
             failure_policy: self.failure_policy.clone(),
             reject_status: self.reject_status,
             reject_body: self.reject_body.clone(),
         }
+    }
+}
+
+impl<S: CircuitBreakerStore> CircuitBreaker<S> {
+    /// Create a circuit breaker with a custom backend store and key function.
+    pub fn with_store(
+        store: S,
+        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            store,
+            key_fn: Arc::new(key_fn),
+            failure_policy: Arc::new(|resp| resp.status().is_server_error()),
+            reject_status: StatusCode::SERVICE_UNAVAILABLE,
+            reject_body: "circuit breaker open".to_string(),
+        }
+    }
+
+    /// Custom failure detection policy. The default considers any 5xx status
+    /// a failure. Return `true` to count the response as a failure.
+    pub fn failure_policy(
+        mut self,
+        f: impl Fn(&Response<Body>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.failure_policy = Arc::new(f);
+        self
+    }
+
+    /// HTTP status code returned when the circuit is open. Defaults to 503.
+    pub fn reject_status<T>(mut self, status: T) -> Self
+    where
+        T: TryInto<StatusCode>,
+        T::Error: std::fmt::Debug,
+    {
+        self.reject_status = status.try_into().expect("invalid status code");
+        self
+    }
+
+    /// Response body returned when the circuit is open.
+    /// Defaults to "circuit breaker open".
+    pub fn reject_body(mut self, body: impl Into<String>) -> Self {
+        self.reject_body = body.into();
+        self
     }
 }
 
@@ -226,15 +314,7 @@ impl CircuitBreaker {
         key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
     ) -> Self {
         Self {
-            state: Arc::new(Mutex::new(SharedState {
-                circuits: HashMap::new(),
-                threshold,
-                recovery,
-                half_open_probes: 1,
-                max_keys: DEFAULT_MAX_KEYS,
-                idle_ttl: DEFAULT_IDLE_TTL,
-                next_cleanup: Instant::now() + CLEANUP_INTERVAL,
-            })),
+            store: InMemoryCircuitBreakerStore::new(threshold, recovery),
             key_fn: Arc::new(key_fn),
             failure_policy: Arc::new(|resp| resp.status().is_server_error()),
             reject_status: StatusCode::SERVICE_UNAVAILABLE,
@@ -257,34 +337,7 @@ impl CircuitBreaker {
     /// Number of probe requests allowed through in the half-open state.
     /// Defaults to 1.
     pub fn half_open_probes(self, n: u32) -> Self {
-        self.state.lock().unwrap().half_open_probes = n;
-        self
-    }
-
-    /// Custom failure detection policy. The default considers any 5xx status
-    /// a failure. Return `true` to count the response as a failure.
-    pub fn failure_policy(
-        mut self,
-        f: impl Fn(&Response<Body>) -> bool + Send + Sync + 'static,
-    ) -> Self {
-        self.failure_policy = Arc::new(f);
-        self
-    }
-
-    /// HTTP status code returned when the circuit is open. Defaults to 503.
-    pub fn reject_status<S>(mut self, status: S) -> Self
-    where
-        S: TryInto<StatusCode>,
-        S::Error: std::fmt::Debug,
-    {
-        self.reject_status = status.try_into().expect("invalid status code");
-        self
-    }
-
-    /// Response body returned when the circuit is open.
-    /// Defaults to "circuit breaker open".
-    pub fn reject_body(mut self, body: impl Into<String>) -> Self {
-        self.reject_body = body.into();
+        self.store.set_half_open_probes(n);
         self
     }
 
@@ -293,13 +346,13 @@ impl CircuitBreaker {
     /// (including open circuits before recovery), the map may temporarily
     /// exceed this value to preserve breaker correctness.
     pub fn max_keys(self, max: usize) -> Self {
-        self.state.lock().unwrap().max_keys = max.max(1);
+        self.store.set_max_keys(max);
         self
     }
 
     /// Drop key state that has been idle longer than this duration.
     pub fn idle_ttl(self, ttl: Duration) -> Self {
-        self.state.lock().unwrap().idle_ttl = ttl;
+        self.store.set_idle_ttl(ttl);
         self
     }
 }
@@ -313,13 +366,13 @@ fn extract_host(req: &Request<Body>) -> String {
         .to_string()
 }
 
-impl tower::Layer<HttpService> for CircuitBreaker {
-    type Service = CircuitBreakerService;
+impl<S: CircuitBreakerStore> tower::Layer<HttpService> for CircuitBreaker<S> {
+    type Service = CircuitBreakerService<S>;
 
     fn layer(&self, inner: HttpService) -> Self::Service {
         CircuitBreakerService {
             inner,
-            state: self.state.clone(),
+            store: self.store.clone(),
             key_fn: self.key_fn.clone(),
             failure_policy: self.failure_policy.clone(),
             reject_status: self.reject_status,
@@ -328,16 +381,16 @@ impl tower::Layer<HttpService> for CircuitBreaker {
     }
 }
 
-pub struct CircuitBreakerService {
+pub struct CircuitBreakerService<S: CircuitBreakerStore = InMemoryCircuitBreakerStore> {
     inner: HttpService,
-    state: Arc<Mutex<SharedState>>,
+    store: S,
     key_fn: KeyFn,
     failure_policy: FailurePolicy,
     reject_status: StatusCode,
     reject_body: String,
 }
 
-impl Service<Request<Body>> for CircuitBreakerService {
+impl<S: CircuitBreakerStore> Service<Request<Body>> for CircuitBreakerService<S> {
     type Response = Response<Body>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
@@ -348,33 +401,29 @@ impl Service<Request<Body>> for CircuitBreakerService {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let key = (self.key_fn)(&req);
+        let store = self.store.clone();
+        let failure_policy = self.failure_policy.clone();
+        let reject_status = self.reject_status;
+        let reject_body = self.reject_body.clone();
+        let fut = self.inner.call(req);
 
-        let action = self.state.lock().unwrap().check(&key);
-
-        match action {
-            Action::Reject => {
-                let status = self.reject_status;
-                let body = self.reject_body.clone();
-                Box::pin(async move {
+        Box::pin(async move {
+            match store.check(&key).await {
+                CircuitAction::Reject => {
+                    drop(fut);
                     Ok(Response::builder()
-                        .status(status)
-                        .body(full_body(body))
+                        .status(reject_status)
+                        .body(full_body(reject_body))
                         .unwrap())
-                })
-            }
-            Action::Allow => {
-                let fut = self.inner.call(req);
-                let state = self.state.clone();
-                let failure_policy = self.failure_policy.clone();
-
-                Box::pin(async move {
+                }
+                CircuitAction::Allow => {
                     let resp = fut.await?;
                     let failed = failure_policy(&resp);
-                    state.lock().unwrap().record(&key, !failed);
+                    store.record(&key, !failed).await;
                     Ok(resp)
-                })
+                }
             }
-        }
+        })
     }
 }
 

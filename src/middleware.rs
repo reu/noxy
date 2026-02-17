@@ -11,22 +11,24 @@ mod retry;
 mod router;
 mod set_response;
 mod sliding_window;
+pub mod store;
 mod traffic_logger;
 mod url_rewrite;
 
 pub use bandwidth_throttle::BandwidthThrottle;
 pub use block_list::BlockList;
-pub use circuit_breaker::CircuitBreaker;
+pub use circuit_breaker::{CircuitBreaker, InMemoryCircuitBreakerStore};
 pub use conditional::{Conditional, ConditionalLayer};
 pub use content_decoder::ContentDecoder;
 pub use fault_injector::FaultInjector;
 pub use latency_injector::LatencyInjector;
 pub use modify_headers::ModifyHeaders;
-pub use rate_limiter::RateLimiter;
+pub use rate_limiter::{InMemoryRateLimitStore, RateLimiter};
 pub use retry::Retry;
 pub use router::{LoadBalanceStrategy, Router, Upstream};
 pub use set_response::SetResponse;
-pub use sliding_window::SlidingWindow;
+pub use sliding_window::{InMemorySlidingWindowStore, SlidingWindow};
+pub use store::{CircuitAction, CircuitBreakerStore, RateLimitStore, SlidingWindowStore};
 pub use traffic_logger::TrafficLogger;
 pub use url_rewrite::UrlRewrite;
 

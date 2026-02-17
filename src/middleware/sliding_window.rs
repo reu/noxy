@@ -8,63 +8,13 @@ use std::time::{Duration, Instant};
 use http::{Request, Response};
 use tower::Service;
 
+use super::store::SlidingWindowStore;
 use crate::http::{Body, BoxError, HttpService};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
 const DEFAULT_MAX_KEYS: usize = 10_000;
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
-
-/// Sliding window log algorithm: stores a `VecDeque<Instant>` of request
-/// timestamps per key. On each request, entries older than `window` are
-/// drained. If the window has capacity (`len < count`), the request proceeds
-/// immediately. Otherwise, the request sleeps until the oldest entry expires
-/// and a slot opens.
-///
-/// Unlike the token bucket [`RateLimiter`](super::RateLimiter), this enforces
-/// a hard cap of `count` requests per `window` — there is no burst parameter
-/// and no steady-rate smoothing. This is useful when upstreams have strict
-/// "N requests per M seconds" API limits.
-///
-/// The rate limit key is derived from each request by a user-provided
-/// function. Use [`global`](Self::global) or [`per_host`](Self::per_host)
-/// for common strategies, or [`keyed`](Self::keyed) for custom keying
-/// (e.g., per API key).
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// use std::time::Duration;
-/// use noxy::{Proxy, middleware::SlidingWindow};
-///
-/// # fn main() -> anyhow::Result<()> {
-/// let proxy = Proxy::builder()
-///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(SlidingWindow::global(30, Duration::from_secs(1)))
-///     .http_layer(SlidingWindow::keyed(100, Duration::from_secs(1), |req| {
-///         req.headers()
-///             .get("x-api-key")
-///             .and_then(|v| v.to_str().ok())
-///             .unwrap_or("anonymous")
-///             .to_string()
-///     }))
-///     .build()?;
-/// # Ok(())
-/// # }
-/// ```
-pub struct SlidingWindow {
-    state: Arc<Mutex<SharedState>>,
-    key_fn: KeyFn,
-}
-
-impl Clone for SlidingWindow {
-    fn clone(&self) -> Self {
-        Self {
-            state: self.state.clone(),
-            key_fn: self.key_fn.clone(),
-        }
-    }
-}
 
 struct SharedState {
     windows: HashMap<String, WindowState>,
@@ -145,14 +95,17 @@ impl SharedState {
     }
 }
 
-impl SlidingWindow {
-    /// Rate-limit with a custom key function. Each distinct key gets its own
-    /// sliding window. `count` requests are allowed per `window` duration.
-    pub fn keyed(
-        count: u64,
-        window: Duration,
-        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
-    ) -> Self {
+/// In-memory sliding-window store backed by a `HashMap`.
+///
+/// This is the default store used by [`SlidingWindow`] when no external
+/// backend is configured. All state lives in-process.
+#[derive(Clone)]
+pub struct InMemorySlidingWindowStore {
+    state: Arc<Mutex<SharedState>>,
+}
+
+impl InMemorySlidingWindowStore {
+    fn new(count: u64, window: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
                 windows: HashMap::new(),
@@ -162,6 +115,99 @@ impl SlidingWindow {
                 idle_ttl: DEFAULT_IDLE_TTL,
                 next_cleanup: Instant::now() + CLEANUP_INTERVAL,
             })),
+        }
+    }
+
+    fn set_max_keys(&self, max: usize) {
+        self.state.lock().unwrap().max_keys = max.max(1);
+    }
+
+    fn set_idle_ttl(&self, ttl: Duration) {
+        self.state.lock().unwrap().idle_ttl = ttl;
+    }
+}
+
+impl SlidingWindowStore for InMemorySlidingWindowStore {
+    fn take(&self, key: &str) -> impl Future<Output = Option<Duration>> + Send {
+        let result = self.state.lock().unwrap().take(key);
+        std::future::ready(result)
+    }
+}
+
+/// Sliding window log algorithm: stores a `VecDeque<Instant>` of request
+/// timestamps per key. On each request, entries older than `window` are
+/// drained. If the window has capacity (`len < count`), the request proceeds
+/// immediately. Otherwise, the request sleeps until the oldest entry expires
+/// and a slot opens.
+///
+/// Unlike the token bucket [`RateLimiter`](super::RateLimiter), this enforces
+/// a hard cap of `count` requests per `window` — there is no burst parameter
+/// and no steady-rate smoothing. This is useful when upstreams have strict
+/// "N requests per M seconds" API limits.
+///
+/// The rate limit key is derived from each request by a user-provided
+/// function. Use [`global`](Self::global) or [`per_host`](Self::per_host)
+/// for common strategies, or [`keyed`](Self::keyed) for custom keying
+/// (e.g., per API key).
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use std::time::Duration;
+/// use noxy::{Proxy, middleware::SlidingWindow};
+///
+/// # fn main() -> anyhow::Result<()> {
+/// let proxy = Proxy::builder()
+///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+///     .http_layer(SlidingWindow::global(30, Duration::from_secs(1)))
+///     .http_layer(SlidingWindow::keyed(100, Duration::from_secs(1), |req| {
+///         req.headers()
+///             .get("x-api-key")
+///             .and_then(|v| v.to_str().ok())
+///             .unwrap_or("anonymous")
+///             .to_string()
+///     }))
+///     .build()?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct SlidingWindow<S: SlidingWindowStore = InMemorySlidingWindowStore> {
+    store: S,
+    key_fn: KeyFn,
+}
+
+impl<S: SlidingWindowStore> Clone for SlidingWindow<S> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            key_fn: self.key_fn.clone(),
+        }
+    }
+}
+
+impl<S: SlidingWindowStore> SlidingWindow<S> {
+    /// Create a sliding window limiter with a custom backend store and key function.
+    pub fn with_store(
+        store: S,
+        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            store,
+            key_fn: Arc::new(key_fn),
+        }
+    }
+}
+
+impl SlidingWindow {
+    /// Rate-limit with a custom key function. Each distinct key gets its own
+    /// sliding window. `count` requests are allowed per `window` duration.
+    pub fn keyed(
+        count: u64,
+        window: Duration,
+        key_fn: impl Fn(&Request<Body>) -> String + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            store: InMemorySlidingWindowStore::new(count, window),
             key_fn: Arc::new(key_fn),
         }
     }
@@ -182,13 +228,13 @@ impl SlidingWindow {
     /// Idle keys are evicted first; if all keys are active, the map may
     /// temporarily exceed this value to preserve window correctness.
     pub fn max_keys(self, max: usize) -> Self {
-        self.state.lock().unwrap().max_keys = max.max(1);
+        self.store.set_max_keys(max);
         self
     }
 
     /// Drop key state that has been idle longer than this duration.
     pub fn idle_ttl(self, ttl: Duration) -> Self {
-        self.state.lock().unwrap().idle_ttl = ttl;
+        self.store.set_idle_ttl(ttl);
         self
     }
 }
@@ -202,25 +248,25 @@ fn extract_host(req: &Request<Body>) -> String {
         .to_string()
 }
 
-impl tower::Layer<HttpService> for SlidingWindow {
-    type Service = SlidingWindowService;
+impl<S: SlidingWindowStore> tower::Layer<HttpService> for SlidingWindow<S> {
+    type Service = SlidingWindowService<S>;
 
     fn layer(&self, inner: HttpService) -> Self::Service {
         SlidingWindowService {
             inner,
-            state: self.state.clone(),
+            store: self.store.clone(),
             key_fn: self.key_fn.clone(),
         }
     }
 }
 
-pub struct SlidingWindowService {
+pub struct SlidingWindowService<S: SlidingWindowStore = InMemorySlidingWindowStore> {
     inner: HttpService,
-    state: Arc<Mutex<SharedState>>,
+    store: S,
     key_fn: KeyFn,
 }
 
-impl Service<Request<Body>> for SlidingWindowService {
+impl<S: SlidingWindowStore> Service<Request<Body>> for SlidingWindowService<S> {
     type Response = Response<Body>;
     type Error = BoxError;
     type Future = Pin<Box<dyn Future<Output = Result<Response<Body>, BoxError>> + Send>>;
@@ -231,16 +277,15 @@ impl Service<Request<Body>> for SlidingWindowService {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let key = (self.key_fn)(&req);
-        let delay = self.state.lock().unwrap().take(&key);
+        let store = self.store.clone();
         let fut = self.inner.call(req);
 
-        match delay {
-            None => fut,
-            Some(delay) => Box::pin(async move {
+        Box::pin(async move {
+            if let Some(delay) = store.take(&key).await {
                 tokio::time::sleep(delay).await;
-                fut.await
-            }),
-        }
+            }
+            fut.await
+        })
     }
 }
 
