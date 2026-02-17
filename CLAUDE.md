@@ -40,7 +40,6 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ## TODO
 
 ### Performance
-- Eliminate request serialization caused by holding `Arc<tokio::sync::Mutex<HttpService>>` locks across `.await` in hot paths (`HyperServiceAdapter`, `Retry`, and `ScriptService`), which currently blocks HTTP/2 multiplexing and increases tail latency
 - Refactor per-host certificate cache lookup so certificate generation does not happen while the cache mutex is held (avoid lock convoy during spikes in new hostnames)
 - Add stale-key eviction/TTL bounds to keyed state maps in `RateLimiter`, `SlidingWindow`, and `CircuitBreaker` to prevent unbounded memory growth under high-cardinality traffic
 - Fix config behavior for `log = false` so traffic logging middleware is not installed (currently still pays formatting/locking overhead)

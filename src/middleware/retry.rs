@@ -16,6 +16,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 type HeadersPolicy = Arc<dyn Fn(&http::response::Parts, u32) -> Option<Duration> + Send + Sync>;
 type BodyPolicy = Arc<dyn Fn(&Response<Bytes>, u32) -> Option<Duration> + Send + Sync>;
+type BufferedHttpService =
+    tower::buffer::Buffer<Request<Body>, <HttpService as Service<Request<Body>>>::Future>;
 
 enum PolicyKind {
     Headers(HeadersPolicy),
@@ -238,7 +240,7 @@ impl tower::Layer<HttpService> for Retry {
 
     fn layer(&self, inner: HttpService) -> Self::Service {
         RetryService {
-            inner: Arc::new(tokio::sync::Mutex::new(inner)),
+            inner: tower::buffer::Buffer::new(inner, 1024),
             statuses: self.statuses.clone(),
             max_retries: self.max_retries,
             backoff: self.backoff,
@@ -249,7 +251,7 @@ impl tower::Layer<HttpService> for Retry {
 }
 
 pub struct RetryService {
-    inner: Arc<tokio::sync::Mutex<HttpService>>,
+    inner: BufferedHttpService,
     statuses: Vec<StatusCode>,
     max_retries: u32,
     backoff: Duration,
@@ -267,7 +269,7 @@ impl Service<Request<Body>> for RetryService {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let inner = self.inner.clone();
+        let mut inner = self.inner.clone();
         let statuses = self.statuses.clone();
         let max_retries = self.max_retries;
         let base_backoff = self.backoff;
@@ -298,11 +300,8 @@ impl Service<Request<Body>> for RetryService {
                 };
                 let req = builder.body(req_body).unwrap();
 
-                let resp = {
-                    let mut svc = inner.lock().await;
-                    std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
-                    svc.call(req).await?
-                };
+                std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                let resp = inner.call(req).await?;
 
                 match &policy {
                     Some(PolicyKind::Body(f)) => {

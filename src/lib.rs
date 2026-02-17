@@ -34,6 +34,8 @@ use http::{
 
 type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 type RoutePredicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
+type BufferedHttpService =
+    tower::buffer::Buffer<Request<Body>, <HttpService as Service<Request<Body>>>::Future>;
 
 /// A `ServerCertVerifier` that accepts any certificate. Used when
 /// `danger_accept_invalid_upstream_certs` is enabled on the builder.
@@ -566,9 +568,9 @@ impl ProxyBuilder {
 }
 
 /// Adapter that bridges a tower `Service` (which uses `&mut self`) to hyper's
-/// `Service` trait (which uses `&self`). Uses a `Mutex` for interior mutability.
+/// `Service` trait (which uses `&self`) via a bounded tower buffer.
 struct HyperServiceAdapter {
-    inner: Arc<tokio::sync::Mutex<HttpService>>,
+    inner: BufferedHttpService,
 }
 
 impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
@@ -579,7 +581,7 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
     >;
 
     fn call(&self, mut req: Request<Incoming>) -> Self::Future {
-        let inner = self.inner.clone();
+        let mut inner = self.inner.clone();
         let span = tracing::debug_span!("request", method = %req.method(), uri = %req.uri());
 
         let is_upgrade = req
@@ -601,9 +603,8 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
         Box::pin(
             async move {
                 let req = req.map(incoming_to_body);
-                let mut svc = inner.lock().await;
-                std::future::poll_fn(|cx| svc.poll_ready(cx)).await?;
-                let mut resp = svc.call(req).await?;
+                std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                let mut resp = inner.call(req).await?;
 
                 if resp.status() == ::http::StatusCode::SWITCHING_PROTOCOLS
                     && let Some(client_upgrade) = client_upgrade
@@ -943,7 +944,7 @@ impl Proxy {
     ) -> anyhow::Result<()> {
         let service = self.build_service_chain(upstream_authority, upstream_scheme);
         let hyper_service = HyperServiceAdapter {
-            inner: Arc::new(tokio::sync::Mutex::new(service)),
+            inner: tower::buffer::Buffer::new(service, 1024),
         };
 
         if let Some(acceptor) = tls_acceptor {
@@ -1070,7 +1071,7 @@ impl Proxy {
         let authority: ::http::uri::Authority = format!("{host}:{port}").parse()?;
         let service = self.build_service_chain(authority, ::http::uri::Scheme::HTTPS);
         let hyper_service = HyperServiceAdapter {
-            inner: Arc::new(tokio::sync::Mutex::new(service)),
+            inner: tower::buffer::Buffer::new(service, 1024),
         };
 
         Ok((hyper_service, client_tls))

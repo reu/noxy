@@ -49,6 +49,8 @@ struct RequestEnvelope {
 }
 
 type RespondReply = Result<(ResponseMeta, Arc<Mutex<Option<Body>>>), BoxError>;
+type BufferedHttpService =
+    tower::buffer::Buffer<Request<Body>, <HttpService as Service<Request<Body>>>::Future>;
 
 struct RespondCommand {
     meta: RequestMeta,
@@ -463,7 +465,7 @@ impl tower::Layer<HttpService> for ScriptLayer {
     fn layer(&self, inner: HttpService) -> Self::Service {
         if let Some(tx) = &self.shared_tx {
             return ScriptService {
-                inner: Arc::new(tokio::sync::Mutex::new(inner)),
+                inner: tower::buffer::Buffer::new(inner, 1024),
                 tx: tx.clone(),
                 _thread: None,
             };
@@ -472,7 +474,7 @@ impl tower::Layer<HttpService> for ScriptLayer {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
         let thread = spawn_v8_thread((*self.source).clone(), rx);
         ScriptService {
-            inner: Arc::new(tokio::sync::Mutex::new(inner)),
+            inner: tower::buffer::Buffer::new(inner, 1024),
             tx,
             _thread: Some(Arc::new(thread)),
         }
@@ -480,7 +482,7 @@ impl tower::Layer<HttpService> for ScriptLayer {
 }
 
 pub struct ScriptService {
-    inner: Arc<tokio::sync::Mutex<HttpService>>,
+    inner: BufferedHttpService,
     tx: tokio::sync::mpsc::Sender<RequestEnvelope>,
     _thread: Option<Arc<std::thread::JoinHandle<()>>>,
 }
@@ -496,7 +498,7 @@ impl Service<Request<Body>> for ScriptService {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let tx = self.tx.clone();
-        let inner = self.inner.clone();
+        let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -539,8 +541,8 @@ impl Service<Request<Body>> for ScriptService {
 
                             match req {
                                 Ok(req) => {
-                                    let mut svc = inner.lock().await;
-                                    let result = svc.call(req).await;
+                                    std::future::poll_fn(|cx| inner.poll_ready(cx)).await?;
+                                    let result = inner.call(req).await;
                                     match result {
                                         Ok(resp) => {
                                             let (parts, body) = resp.into_parts();
