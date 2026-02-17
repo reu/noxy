@@ -46,7 +46,6 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ### Security
 - Redact sensitive headers by default in traffic logs (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, etc.)
 - Use constant-time credential comparison for proxy auth checks
-- Add configurable body size limits in scripting middleware to prevent memory DoS from unbounded buffering
 - Harden CONNECT authority parsing (avoid naive string split on `:`; use authority-aware parsing including IPv6)
 
 ### Scripting

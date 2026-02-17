@@ -80,3 +80,75 @@ async fn script_layer_short_circuits_response() {
         .unwrap();
     assert_eq!(resp.text().await.unwrap(), "real response");
 }
+
+#[tokio::test]
+async fn script_layer_enforces_request_body_limit() {
+    let upstream_addr = start_upstream("real response").await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = noxy::middleware::ScriptLayer::from_source(
+            r#"
+            export default async function(req, respond) {
+                try {
+                    await req.body();
+                } catch (_err) {
+                    return new Response("request too large", { status: 413 });
+                }
+                return await respond(req);
+            }
+            "#,
+        )
+        .unwrap()
+        .max_body_bytes(16);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .post(format!("https://localhost:{}/", upstream_addr.port()))
+        .body("this body is definitely longer than sixteen bytes")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(resp.text().await.unwrap(), "request too large");
+}
+
+#[tokio::test]
+async fn script_layer_enforces_response_body_limit() {
+    let large_body = "x".repeat(128);
+    let leaked: &'static str = Box::leak(large_body.into_boxed_str());
+    let upstream_addr = start_upstream(leaked).await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = noxy::middleware::ScriptLayer::from_source(
+            r#"
+            export default async function(req, respond) {
+                const res = await respond(req);
+                try {
+                    await res.body();
+                } catch (_err) {
+                    return new Response("response too large", { status: 502 });
+                }
+                return res;
+            }
+            "#,
+        )
+        .unwrap()
+        .max_body_bytes(16);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_GATEWAY);
+    assert_eq!(resp.text().await.unwrap(), "response too large");
+}

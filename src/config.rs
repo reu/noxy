@@ -249,6 +249,7 @@ pub struct ScriptConfig {
     pub file: String,
     #[serde(default)]
     pub shared: bool,
+    pub max_body_bytes: Option<usize>,
 }
 
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
@@ -481,6 +482,9 @@ fn apply_rule(
     #[cfg(feature = "scripting")]
     if let Some(script_config) = rule.script {
         let mut layer = crate::middleware::ScriptLayer::from_file(&script_config.file)?;
+        if let Some(max) = script_config.max_body_bytes {
+            layer = layer.max_body_bytes(max);
+        }
         if script_config.shared {
             layer = layer.shared();
         }
@@ -1188,7 +1192,7 @@ mod tests {
             script = { file = "middleware.ts" }
 
             [[rules]]
-            script = { file = "middleware.ts", shared = true }
+            script = { file = "middleware.ts", shared = true, max_body_bytes = 2048 }
 
             [[rules]]
             match = { host = "api.example.com" }
@@ -1205,9 +1209,11 @@ mod tests {
         let s1 = config.rules[1].script.as_ref().unwrap();
         assert_eq!(s1.file, "middleware.ts");
         assert!(s1.shared);
+        assert_eq!(s1.max_body_bytes, Some(2048));
 
         let s2 = config.rules[2].script.as_ref().unwrap();
         assert_eq!(s2.file, "api.ts");
+        assert_eq!(s2.max_body_bytes, None);
         assert!(config.rules[2].match_config.is_some());
     }
 }

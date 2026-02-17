@@ -17,6 +17,8 @@ use tower::Service;
 
 use crate::http::{Body, BoxError, HttpService, full_body};
 
+const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
+
 struct RequestMeta {
     method: String,
     url: String,
@@ -64,6 +66,7 @@ struct RequestState {
     respond_tx: tokio::sync::mpsc::Sender<RespondCommand>,
     response_body: Option<Arc<Mutex<Option<Body>>>>,
     result: Option<ScriptResult>,
+    max_body_bytes: usize,
 }
 
 #[derive(deno_core::serde::Deserialize)]
@@ -77,21 +80,17 @@ struct ScriptResult {
 #[deno_core::op2(async(lazy), nofast)]
 #[buffer]
 async fn op_noxy_req_body(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErrorBox> {
-    let body = {
+    let (body, max_body_bytes) = {
         let mut state = state.borrow_mut();
         let req_state = state.borrow_mut::<RequestState>();
-        req_state.body.lock().unwrap().take()
+        (
+            req_state.body.lock().unwrap().take(),
+            req_state.max_body_bytes,
+        )
     };
 
     match body {
-        Some(body) => {
-            use http_body_util::BodyExt;
-            let collected = body
-                .collect()
-                .await
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-            Ok(collected.to_bytes().to_vec())
-        }
+        Some(body) => collect_limited(body, max_body_bytes).await,
         None => Ok(Vec::new()),
     }
 }
@@ -148,24 +147,20 @@ async fn op_noxy_respond(
 #[deno_core::op2(async(lazy), nofast)]
 #[buffer]
 async fn op_noxy_res_body(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErrorBox> {
-    let body = {
+    let (body, max_body_bytes) = {
         let mut state = state.borrow_mut();
         let req_state = state.borrow_mut::<RequestState>();
-        req_state
-            .response_body
-            .as_ref()
-            .and_then(|b| b.lock().unwrap().take())
+        (
+            req_state
+                .response_body
+                .as_ref()
+                .and_then(|b| b.lock().unwrap().take()),
+            req_state.max_body_bytes,
+        )
     };
 
     match body {
-        Some(body) => {
-            use http_body_util::BodyExt;
-            let collected = body
-                .collect()
-                .await
-                .map_err(|e| JsErrorBox::generic(e.to_string()))?;
-            Ok(collected.to_bytes().to_vec())
-        }
+        Some(body) => collect_limited(body, max_body_bytes).await,
         None => Ok(Vec::new()),
     }
 }
@@ -185,6 +180,25 @@ fn op_noxy_finish(
         body: body.map(|b| b.to_vec()),
         passthrough,
     });
+}
+
+async fn collect_limited(mut body: Body, max_bytes: usize) -> Result<Vec<u8>, JsErrorBox> {
+    use http_body_util::BodyExt;
+
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| JsErrorBox::generic(e.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            let new_len = out.len().saturating_add(data.len());
+            if new_len > max_bytes {
+                return Err(JsErrorBox::generic(format!(
+                    "Body exceeds script max_body_bytes limit ({max_bytes} bytes)"
+                )));
+            }
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok(out)
 }
 
 const RUNTIME_JS: &str = include_str!("script_runtime.js");
@@ -257,6 +271,7 @@ fn transpile_source(source: &str, filename: &str) -> anyhow::Result<String> {
 
 fn spawn_v8_thread(
     transpiled_source: String,
+    max_body_bytes: usize,
     mut rx: tokio::sync::mpsc::Receiver<RequestEnvelope>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -317,6 +332,7 @@ fn spawn_v8_thread(
                     envelope.meta,
                     envelope.body.clone(),
                     envelope.respond_tx,
+                    max_body_bytes,
                 )
                 .await;
 
@@ -338,6 +354,7 @@ async fn handle_request(
     meta: RequestMeta,
     body: Arc<Mutex<Option<Body>>>,
     respond_tx: tokio::sync::mpsc::Sender<RespondCommand>,
+    max_body_bytes: usize,
 ) -> Result<Response<Body>, BoxError> {
     {
         let op_state = runtime.op_state();
@@ -347,6 +364,7 @@ async fn handle_request(
             respond_tx,
             response_body: None,
             result: None,
+            max_body_bytes,
         });
     }
 
@@ -419,6 +437,7 @@ async fn handle_request(
 /// ```
 pub struct ScriptLayer {
     source: Arc<String>,
+    max_body_bytes: usize,
     shared_tx: Option<tokio::sync::mpsc::Sender<RequestEnvelope>>,
     _shared_thread: Option<Arc<std::thread::JoinHandle<()>>>,
 }
@@ -442,9 +461,25 @@ impl ScriptLayer {
     fn from_transpiled(transpiled: String) -> Self {
         Self {
             source: Arc::new(transpiled),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             shared_tx: None,
             _shared_thread: None,
         }
+    }
+
+    /// Maximum number of bytes scripts may buffer when calling `req.body()`
+    /// or `res.body()`. If exceeded, the JS promise rejects with an error.
+    ///
+    /// Default: 1 MiB.
+    pub fn max_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_body_bytes = bytes.max(1);
+        if self.shared_tx.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            let thread = spawn_v8_thread((*self.source).clone(), self.max_body_bytes, rx);
+            self.shared_tx = Some(tx);
+            self._shared_thread = Some(Arc::new(thread));
+        }
+        self
     }
 
     /// Share a single V8 isolate across all connections instead of spawning
@@ -452,7 +487,7 @@ impl ScriptLayer {
     /// requests regardless of which connection they belong to.
     pub fn shared(mut self) -> Self {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let thread = spawn_v8_thread((*self.source).clone(), rx);
+        let thread = spawn_v8_thread((*self.source).clone(), self.max_body_bytes, rx);
         self.shared_tx = Some(tx);
         self._shared_thread = Some(Arc::new(thread));
         self
@@ -472,7 +507,7 @@ impl tower::Layer<HttpService> for ScriptLayer {
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let thread = spawn_v8_thread((*self.source).clone(), rx);
+        let thread = spawn_v8_thread((*self.source).clone(), self.max_body_bytes, rx);
         ScriptService {
             inner: tower::buffer::Buffer::new(inner, 1024),
             tx,

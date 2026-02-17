@@ -210,6 +210,7 @@ Options:
       --set-response-header <HEADER>   Set a response header (e.g., "x-served-by: noxy"). Repeatable.
       --remove-response-header <NAME>  Remove a response header. Repeatable.
       --script <PATH>                  Path to a JS/TS middleware script (requires scripting feature)
+      --script-max-body <BYTES>        Max bytes scripts may buffer for req/res body reads
       --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
       --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
@@ -295,6 +296,9 @@ noxy --upstream http://localhost:3000 --tls-cert server.pem --tls-key server-key
 
 # Run a TypeScript middleware script (requires scripting feature)
 noxy --upstream http://localhost:3000 --script middleware.ts
+
+# Limit body bytes scripts may buffer when calling req.body()/res.body()
+noxy --upstream http://localhost:3000 --script middleware.ts --script-max-body 262144
 ```
 
 ## Config File
@@ -504,7 +508,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
-| `script`    | `{ file = "middleware.ts" }` -- optional `shared = true` for single V8 isolate (requires `scripting` feature) |
+| `script`    | `{ file = "middleware.ts" }` -- optional `shared = true` and `max_body_bytes = 1048576` (requires `scripting` feature) |
 
 ## Scripting Middleware
 
@@ -574,6 +578,13 @@ ScriptLayer::from_file("middleware.ts")?
 
 // Shared -- one isolate for all connections, global state is shared
 ScriptLayer::from_file("middleware.ts")?.shared()
+```
+
+Limit script body buffering (applies to both `req.body()` and `res.body()`):
+
+```rust,ignore
+ScriptLayer::from_file("middleware.ts")?
+    .max_body_bytes(256 * 1024)
 ```
 
 ## How It Works

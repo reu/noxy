@@ -129,6 +129,11 @@ struct Cli {
     #[arg(long)]
     script: Option<String>,
 
+    /// Max bytes scripts may buffer when reading req/res bodies
+    #[cfg(feature = "scripting")]
+    #[arg(long = "script-max-body")]
+    script_max_body: Option<usize>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -364,6 +369,7 @@ async fn main() -> anyhow::Result<()> {
             script: Some(noxy::config::ScriptConfig {
                 file: script_path,
                 shared: false,
+                max_body_bytes: cli.script_max_body,
             }),
             ..Default::default()
         });
