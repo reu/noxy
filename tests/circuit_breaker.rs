@@ -189,3 +189,176 @@ async fn circuit_breaker_per_host() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "ok");
 }
+
+#[tokio::test]
+async fn circuit_breaker_half_open_failure_reopens() {
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let app = Router::new().route(
+        "/",
+        get(|| async { (http::StatusCode::INTERNAL_SERVER_ERROR, "error").into_response() }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = CircuitBreaker::global(2, Duration::from_millis(200));
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    // Trip the circuit: 2 failures
+    for _ in 0..2 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 500);
+    }
+
+    // Circuit is open
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+
+    // Wait for recovery period
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Half-open: probe goes through but fails (upstream still returns 500)
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 500, "half-open probe should reach upstream");
+
+    // Circuit should reopen since the probe failed
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "circuit should reopen after failed probe"
+    );
+}
+
+#[tokio::test]
+async fn circuit_breaker_custom_reject_response() {
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let app = Router::new().route(
+        "/",
+        get(|| async { (http::StatusCode::INTERNAL_SERVER_ERROR, "error").into_response() }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = CircuitBreaker::global(2, Duration::from_secs(60))
+            .reject_status(429u16)
+            .reject_body("slow down");
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    // Trip the circuit
+    for _ in 0..2 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 500);
+    }
+
+    // Check custom rejection
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 429);
+    assert_eq!(resp.text().await.unwrap(), "slow down");
+}
+
+#[tokio::test]
+async fn circuit_breaker_custom_failure_policy() {
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let app = Router::new().route(
+        "/",
+        get(|| async { (http::StatusCode::BAD_REQUEST, "bad request").into_response() }),
+    );
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    let upstream_addr = listener_handle.listening().await.unwrap();
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = CircuitBreaker::global(2, Duration::from_secs(60))
+            .failure_policy(|resp| resp.status() == http::StatusCode::BAD_REQUEST);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    // 400 is now treated as a failure
+    for _ in 0..2 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 400);
+    }
+
+    // Circuit should be tripped
+    let resp = client.get(&url).send().await.unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.text().await.unwrap(), "circuit breaker open");
+}

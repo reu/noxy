@@ -114,6 +114,42 @@ impl tower::Layer<HttpService> for BoxedLayer {
     }
 }
 
+/// Start an HTTPS upstream that echoes request headers back as sorted lines of "name: value".
+pub async fn start_echo_upstream() -> SocketAddr {
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let app = Router::new().fallback(|headers: http::HeaderMap| async move {
+        let mut lines: Vec<String> = headers
+            .iter()
+            .map(|(name, value)| format!("{}: {}", name, value.to_str().unwrap_or("")))
+            .collect();
+        lines.sort();
+        lines.join("\n")
+    });
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    listener_handle.listening().await.unwrap()
+}
+
 /// Start a plain HTTP upstream server (no TLS) that returns `body` on GET /.
 pub async fn start_http_upstream(body: &'static str) -> SocketAddr {
     let app = Router::new().route("/", get(move || async move { body }));

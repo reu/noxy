@@ -33,3 +33,31 @@ async fn latency_injector_adds_delay() {
         "request took {elapsed:?}, expected at least {delay:?}"
     );
 }
+
+#[tokio::test]
+async fn latency_injector_uniform_adds_delay_in_range() {
+    let upstream_addr = start_upstream("hello").await;
+
+    let min = Duration::from_millis(200);
+    let max = Duration::from_millis(400);
+    let proxy_addr = start_proxy(vec![Box::new(move |inner: HttpService| {
+        let layer = LatencyInjector::uniform(min..max);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let start = Instant::now();
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(resp.text().await.unwrap(), "hello");
+    assert!(
+        elapsed >= min,
+        "request took {elapsed:?}, expected at least {min:?}"
+    );
+}

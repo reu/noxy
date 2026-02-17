@@ -59,6 +59,7 @@ regex = "1"
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+brotli = "7"
 criterion = { version = "0.5", features = ["async_tokio"] }
 flate2 = "1"
 futures-util = "0.3"
@@ -67,6 +68,7 @@ rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
+zstd = "0.13"
 
 [[bench]]
 name = "proxy"
