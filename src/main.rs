@@ -21,7 +21,7 @@ struct Cli {
     port: u16,
 
     /// Bind address
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     bind: String,
 
     /// Generate a new CA cert+key pair and exit

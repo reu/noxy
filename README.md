@@ -185,7 +185,7 @@ Options:
       --cert <CERT>            Path to CA certificate PEM file [default: ca-cert.pem]
       --key <KEY>              Path to CA private key PEM file [default: ca-key.pem]
   -p, --port <PORT>            Port to listen on [default: 8080]
-      --bind <BIND>            Bind address [default: 0.0.0.0]
+      --bind <BIND>            Bind address [default: 127.0.0.1]
       --generate               Generate a new CA cert+key pair and exit
       --upstream <URL>         Reverse proxy mode: forward all traffic to this upstream URL
       --tls-cert <PATH>        TLS cert for client-facing HTTPS (reverse proxy mode)
@@ -695,7 +695,7 @@ noxy --upstream http://localhost:8080 \
 ```toml
 # Multi-backend gateway via config file
 port = 443
-bind = "0.0.0.0"
+bind = "127.0.0.1"
 upstream = "http://web:3000"
 
 [tls]
