@@ -2,11 +2,11 @@
 
 rustPlatform.buildRustPackage {
   pname = "noxy";
-  version = "0.0.4";
+  version = "0.0.5";
 
   src = ./.;
 
-  cargoHash = "sha256-4WK2BvEsSRtH28CZUSyb8Vp84LqpiBzJGI8XNgdqjOI=";
+  cargoHash = lib.fakeHash;
 
   buildFeatures = [ "cli" ];
 

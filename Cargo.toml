@@ -1,6 +1,6 @@
 [package]
 name = "noxy"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 authors = ["Rodrigo Navarro <rnavarro@rnavarro.com.br>"]
 description = "HTTP forward and reverse proxy with a pluggable tower middleware pipeline"
