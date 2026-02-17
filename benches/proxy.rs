@@ -13,7 +13,7 @@ use tokio::runtime::Runtime;
 use tower::Layer;
 
 fn install_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 async fn start_upstream(body: &'static str) -> SocketAddr {

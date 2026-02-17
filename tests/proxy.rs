@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 use tower::Layer;
 
 fn install_crypto_provider() {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
 /// Start an HTTPS server with a self-signed cert that returns `body` on GET /.

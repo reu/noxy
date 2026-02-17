@@ -71,7 +71,7 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::aws_lc_rs::default_provider()
+        rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }

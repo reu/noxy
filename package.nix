@@ -1,4 +1,4 @@
-{ lib, rustPlatform, cmake, pkg-config, openssl }:
+{ lib, rustPlatform }:
 
 rustPlatform.buildRustPackage {
   pname = "noxy";
@@ -9,9 +9,6 @@ rustPlatform.buildRustPackage {
   cargoHash = lib.fakeHash;
 
   buildFeatures = [ "cli" ];
-
-  nativeBuildInputs = [ cmake pkg-config ];
-  buildInputs = [ openssl ];
 
   doCheck = false;
 
