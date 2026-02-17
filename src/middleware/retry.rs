@@ -405,8 +405,9 @@ impl Service<Request<Body>> for RetryService {
 }
 
 fn exponential_delay(base: Duration, attempt: u32) -> Duration {
-    let delay = base.saturating_mul(1 << attempt);
-    delay.min(MAX_BACKOFF)
+    let max_delay = base.saturating_mul(1 << attempt).min(MAX_BACKOFF);
+    let jitter_nanos = rand::random_range(0..=max_delay.as_nanos() as u64);
+    Duration::from_nanos(jitter_nanos)
 }
 
 fn retry_after_delay(resp: &Response<Body>) -> Option<Duration> {
@@ -486,7 +487,7 @@ impl http_body::Body for RecordingBody {
                 Poll::Ready(Some(Ok(frame)))
             }
             Poll::Ready(Some(Err(e))) => {
-                self.capture.lock().unwrap().complete = true;
+                self.capture.lock().unwrap().overflowed = true;
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
@@ -498,5 +499,31 @@ impl http_body::Body for RecordingBody {
 
     fn size_hint(&self) -> http_body::SizeHint {
         self.inner.size_hint()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::BodyExt;
+
+    #[tokio::test]
+    async fn recording_body_marks_overflowed_on_stream_error() {
+        let error_body = http_body_util::StreamBody::new(futures_util::stream::iter(vec![
+            Ok(Frame::data(Bytes::from("partial"))),
+            Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "stream failed",
+            )),
+        ]));
+        let capture = Arc::new(Mutex::new(ReplayCapture::new(1024)));
+        let mut recording = RecordingBody::new(error_body.boxed(), capture.clone());
+
+        let frame = recording.frame().await.unwrap().unwrap();
+        assert_eq!(frame.into_data().unwrap(), "partial");
+
+        let err = recording.frame().await.unwrap().unwrap_err();
+        assert_eq!(err.to_string(), "stream failed");
+
+        assert!(ReplayCapture::snapshot(&capture).is_none());
     }
 }

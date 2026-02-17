@@ -94,6 +94,9 @@ Every middleware should support all five surfaces:
 - In source-level doc comments (`///`), never use `` ```rust,ignore `` — use `` ```rust,no_run `` with hidden boilerplate (`# fn main() -> anyhow::Result<()> {`) so examples are compile-checked and catch API drift
 - In `README.md`, use `` ```rust,ignore `` — hidden `# ` lines clutter the GitHub rendering, and the README is primarily read on GitHub
 
+### Bug fixes
+- Every bug fix must include a regression test that fails without the fix and passes with it
+
 ### After every Rust file change
 - Run `cargo fmt` to format the code
 - Run `cargo clippy` and fix all warnings before considering the task done
