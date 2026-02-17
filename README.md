@@ -199,6 +199,7 @@ Options:
       --sliding-window <RATE>          Sliding window rate limit (e.g., "30/1s"). Repeatable.
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
+      --retry-max-body <BYTES>         Max request body bytes captured for retry replay (default: 1048576)
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
       --rewrite-path <SPEC>                Rewrite request path (e.g., "/old/{*rest}=/new/{rest}"). Repeatable.
       --rewrite-path-regex <SPEC>        Rewrite request path via regex (e.g., "/api/v\d+/(.*)=/latest/$1"). Repeatable.
@@ -409,7 +410,7 @@ sliding_window = { count = 500, window = "60s", per_host = true }
 
 # Retry failed requests (429, 502, 503, 504) up to 3 times
 [[rules]]
-retry = { max_retries = 3, backoff = "1s" }
+retry = { max_retries = 3, backoff = "1s", max_replay_body_bytes = 1048576 }
 
 # Retry only 503s with custom statuses
 [[rules]]
@@ -498,7 +499,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
 | `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
-| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses` to override |
+| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses` and `max_replay_body_bytes` |
 | `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes` and `per_host` |
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |

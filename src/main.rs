@@ -76,6 +76,10 @@ struct Cli {
     #[arg(long)]
     retry: Option<u32>,
 
+    /// Max request body bytes captured for retry replay (default: 1048576)
+    #[arg(long = "retry-max-body")]
+    retry_max_body: Option<usize>,
+
     /// Circuit breaker: trip after N failures, recover after duration (e.g., "5/30s")
     #[arg(long = "circuit-breaker")]
     circuit_breaker: Option<String>,
@@ -274,6 +278,7 @@ async fn main() -> anyhow::Result<()> {
                 max_retries: Some(max_retries),
                 backoff: None,
                 statuses: None,
+                max_replay_body_bytes: cli.retry_max_body,
             }),
             ..Default::default()
         });

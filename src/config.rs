@@ -215,6 +215,7 @@ pub struct RetryConfig {
     pub max_retries: Option<u32>,
     pub backoff: Option<DurationValue>,
     pub statuses: Option<Vec<u16>>,
+    pub max_replay_body_bytes: Option<usize>,
 }
 
 /// Header modification operations: `set`, `append`, and `remove`.
@@ -674,6 +675,9 @@ fn build_retry(config: RetryConfig) -> Retry {
     if let Some(backoff) = config.backoff {
         retry = retry.backoff(backoff.0);
     }
+    if let Some(max_bytes) = config.max_replay_body_bytes {
+        retry = retry.max_replay_body_bytes(max_bytes);
+    }
     retry
 }
 
@@ -775,7 +779,7 @@ mod tests {
             retry = {}
 
             [[rules]]
-            retry = { max_retries = 5, backoff = "500ms", statuses = [503, 429] }
+            retry = { max_retries = 5, backoff = "500ms", statuses = [503, 429], max_replay_body_bytes = 4096 }
 
             [[rules]]
             circuit_breaker = { threshold = 5, recovery = "30s" }
@@ -906,6 +910,7 @@ mod tests {
             Duration::from_millis(500)
         );
         assert_eq!(retry.statuses.as_ref().unwrap(), &[503, 429]);
+        assert_eq!(retry.max_replay_body_bytes, Some(4096));
 
         // Rule 14: circuit_breaker global
         let cb = config.rules[14].circuit_breaker.as_ref().unwrap();

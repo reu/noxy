@@ -1,11 +1,12 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
+use http_body::Frame;
 use http_body_util::BodyExt;
 use tower::Service;
 
@@ -32,8 +33,11 @@ impl Clone for PolicyKind {
 
 /// Tower layer that retries requests when upstream returns specific status codes.
 ///
-/// Buffers the request body before the first attempt so it can be replayed on
-/// retries. Uses exponential backoff (`base * 2^attempt`), respecting
+/// Streams the first attempt upstream while capturing request body bytes for
+/// replay on retries. Capture is bounded by
+/// [`max_replay_body_bytes`](Self::max_replay_body_bytes) (default: 1 MiB). If
+/// the body exceeds this limit, retries are skipped and the first response is
+/// returned. Uses exponential backoff (`base * 2^attempt`), respecting
 /// `Retry-After` headers when present.
 ///
 /// For custom retry decisions, two policy variants are available:
@@ -61,6 +65,7 @@ pub struct Retry {
     max_retries: u32,
     backoff: Duration,
     policy: Option<PolicyKind>,
+    max_replay_body_bytes: usize,
 }
 
 impl Clone for Retry {
@@ -70,6 +75,7 @@ impl Clone for Retry {
             max_retries: self.max_retries,
             backoff: self.backoff,
             policy: self.policy.clone(),
+            max_replay_body_bytes: self.max_replay_body_bytes,
         }
     }
 }
@@ -85,6 +91,7 @@ impl Retry {
             max_retries: 3,
             backoff: Duration::from_secs(1),
             policy: None,
+            max_replay_body_bytes: 1024 * 1024,
         }
     }
 
@@ -102,6 +109,7 @@ impl Retry {
             max_retries: 3,
             backoff: Duration::from_secs(1),
             policy: None,
+            max_replay_body_bytes: 1024 * 1024,
         }
     }
 
@@ -115,6 +123,15 @@ impl Retry {
     /// capped at 30 seconds. Only used with status-code-based retries.
     pub fn backoff(mut self, base: Duration) -> Self {
         self.backoff = base;
+        self
+    }
+
+    /// Maximum number of request body bytes to capture for replay on retries.
+    ///
+    /// If the body exceeds this limit (or cannot be fully captured before a
+    /// retry decision), retries are skipped and the first response is returned.
+    pub fn max_replay_body_bytes(mut self, bytes: usize) -> Self {
+        self.max_replay_body_bytes = bytes;
         self
     }
 
@@ -211,6 +228,7 @@ impl Default for Retry {
             max_retries: 3,
             backoff: Duration::from_secs(1),
             policy: None,
+            max_replay_body_bytes: 1024 * 1024,
         }
     }
 }
@@ -225,6 +243,7 @@ impl tower::Layer<HttpService> for Retry {
             max_retries: self.max_retries,
             backoff: self.backoff,
             policy: self.policy.clone(),
+            max_replay_body_bytes: self.max_replay_body_bytes,
         }
     }
 }
@@ -235,6 +254,7 @@ pub struct RetryService {
     max_retries: u32,
     backoff: Duration,
     policy: Option<PolicyKind>,
+    max_replay_body_bytes: usize,
 }
 
 impl Service<Request<Body>> for RetryService {
@@ -252,15 +272,17 @@ impl Service<Request<Body>> for RetryService {
         let max_retries = self.max_retries;
         let base_backoff = self.backoff;
         let policy = self.policy.clone();
+        let max_replay_body_bytes = self.max_replay_body_bytes;
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
-            let bytes = body.collect().await?.to_bytes();
-
             let method = parts.method;
             let uri = parts.uri;
             let version = parts.version;
             let headers = parts.headers;
+            let capture = Arc::new(Mutex::new(ReplayCapture::new(max_replay_body_bytes)));
+            let mut first_body = Some(body);
+            let mut replay_bytes: Option<Bytes> = None;
 
             for attempt in 0..=max_retries {
                 let mut builder = Request::builder()
@@ -268,7 +290,13 @@ impl Service<Request<Body>> for RetryService {
                     .uri(uri.clone())
                     .version(version);
                 *builder.headers_mut().unwrap() = headers.clone();
-                let req = builder.body(full_body(bytes.clone())).unwrap();
+                let req_body = if attempt == 0 {
+                    let body = first_body.take().unwrap_or_else(crate::http::empty_body);
+                    RecordingBody::new(body, capture.clone()).boxed()
+                } else {
+                    full_body(replay_bytes.clone().unwrap_or_default())
+                };
+                let req = builder.body(req_body).unwrap();
 
                 let resp = {
                     let mut svc = inner.lock().await;
@@ -285,6 +313,14 @@ impl Service<Request<Body>> for RetryService {
                         if let Some(delay) = f(&buffered, attempt)
                             && attempt < max_retries
                         {
+                            if replay_bytes.is_none() {
+                                replay_bytes = ReplayCapture::snapshot(&capture);
+                            }
+                            if replay_bytes.is_none() {
+                                let (parts, bytes) = buffered.into_parts();
+                                return Ok(Response::from_parts(parts, full_body(bytes)));
+                            }
+
                             tracing::debug!(
                                 status = %buffered.status(),
                                 attempt = attempt + 1,
@@ -306,6 +342,13 @@ impl Service<Request<Body>> for RetryService {
                         if let Some(delay) = f(&parts, attempt)
                             && attempt < max_retries
                         {
+                            if replay_bytes.is_none() {
+                                replay_bytes = ReplayCapture::snapshot(&capture);
+                            }
+                            if replay_bytes.is_none() {
+                                return Ok(Response::from_parts(parts, body));
+                            }
+
                             tracing::debug!(
                                 status = %parts.status,
                                 attempt = attempt + 1,
@@ -322,6 +365,12 @@ impl Service<Request<Body>> for RetryService {
 
                     None => {
                         if attempt == max_retries || !statuses.contains(&resp.status()) {
+                            return Ok(resp);
+                        }
+                        if replay_bytes.is_none() {
+                            replay_bytes = ReplayCapture::snapshot(&capture);
+                        }
+                        if replay_bytes.is_none() {
                             return Ok(resp);
                         }
 
@@ -356,4 +405,89 @@ fn retry_after_delay(resp: &Response<Body>) -> Option<Duration> {
     let value = header.to_str().ok()?;
     let seconds: u64 = value.parse().ok()?;
     Some(Duration::from_secs(seconds))
+}
+
+struct ReplayCapture {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    overflowed: bool,
+    complete: bool,
+}
+
+impl ReplayCapture {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            max_bytes,
+            overflowed: false,
+            complete: false,
+        }
+    }
+
+    fn record_chunk(&mut self, chunk: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+
+        let new_len = self.bytes.len().saturating_add(chunk.len());
+        if new_len > self.max_bytes {
+            self.bytes.clear();
+            self.overflowed = true;
+            return;
+        }
+
+        self.bytes.extend_from_slice(chunk);
+    }
+
+    fn snapshot(capture: &Arc<Mutex<Self>>) -> Option<Bytes> {
+        let state = capture.lock().unwrap();
+        if state.complete && !state.overflowed {
+            Some(Bytes::copy_from_slice(&state.bytes))
+        } else {
+            None
+        }
+    }
+}
+
+struct RecordingBody {
+    inner: Body,
+    capture: Arc<Mutex<ReplayCapture>>,
+}
+
+impl RecordingBody {
+    fn new(inner: Body, capture: Arc<Mutex<ReplayCapture>>) -> Self {
+        Self { inner, capture }
+    }
+}
+
+impl http_body::Body for RecordingBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    self.capture.lock().unwrap().record_chunk(data.as_ref());
+                }
+                Poll::Ready(Some(Ok(frame)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                self.capture.lock().unwrap().complete = true;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(None) => {
+                self.capture.lock().unwrap().complete = true;
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
 }
