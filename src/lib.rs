@@ -204,9 +204,10 @@ impl ProxyBuilder {
 
     /// Add a tower HTTP layer.
     ///
-    /// Layers wrap the inner service in an onion model. The innermost service
-    /// forwards requests to the upstream server. Each layer can inspect/modify
-    /// the request before forwarding and the response after.
+    /// Layers wrap the inner service in an onion model. The first layer added
+    /// is the outermost and sees requests first — matching the convention
+    /// used by tower's `ServiceBuilder`. The innermost service forwards
+    /// requests to the upstream server.
     pub fn http_layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<HttpService> + Send + Sync + 'static,
@@ -549,7 +550,7 @@ impl ProxyBuilder {
             let router_layer: LayerFn = Box::new(move |svc| {
                 tower::util::BoxService::new(tower::Layer::layer(&router, svc))
             });
-            http_layers.insert(0, router_layer);
+            http_layers.push(router_layer);
         }
 
         Ok(Proxy {
@@ -860,7 +861,7 @@ impl Proxy {
     ) -> HttpService {
         let forward = ForwardService::new(self.upstream_client.clone(), authority, scheme);
         let mut service: HttpService = tower::util::BoxService::new(forward);
-        for layer_fn in self.http_layers.iter() {
+        for layer_fn in self.http_layers.iter().rev() {
             service = layer_fn(service);
         }
         service
