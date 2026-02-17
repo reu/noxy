@@ -2083,3 +2083,88 @@ async fn reverse_proxy_with_tls_identity() {
     std::fs::remove_file(&cert_path).ok();
     std::fs::remove_file(&key_path).ok();
 }
+
+#[tokio::test]
+async fn layers_execute_in_addition_order() {
+    install_crypto_provider();
+    let app = Router::new().route(
+        "/",
+        get(|req: axum::extract::Request| async move {
+            let order = req
+                .headers()
+                .get("x-order")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            (
+                [(
+                    http::header::HeaderName::from_static("x-request-order"),
+                    order,
+                )],
+                "ok",
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let proxy_addr = start_reverse_proxy(
+        &format!("http://127.0.0.1:{}", upstream_addr.port()),
+        vec![
+            // Layer A (added first = outermost, processes request first)
+            Box::new(|inner: HttpService| {
+                tower::util::BoxService::new(AppendOrderHeader { inner, tag: "A" })
+            }),
+            // Layer B (added second = inner, processes request second)
+            Box::new(|inner: HttpService| {
+                tower::util::BoxService::new(AppendOrderHeader { inner, tag: "B" })
+            }),
+        ],
+    )
+    .await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/"))
+        .send()
+        .await
+        .unwrap();
+
+    // Upstream echoes the x-order header it received. Since A is outermost,
+    // it appends first, then B appends second: "A,B".
+    assert_eq!(resp.headers().get("x-request-order").unwrap(), "A,B");
+}
+
+struct AppendOrderHeader {
+    inner: HttpService,
+    tag: &'static str,
+}
+
+impl tower::Service<http::Request<Body>> for AppendOrderHeader {
+    type Response = http::Response<Body>;
+    type Error = BoxError;
+    type Future = Pin<Box<dyn Future<Output = Result<http::Response<Body>, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: http::Request<Body>) -> Self::Future {
+        let existing = req
+            .headers()
+            .get("x-order")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let new_value = if existing.is_empty() {
+            self.tag.to_string()
+        } else {
+            format!("{existing},{}", self.tag)
+        };
+        req.headers_mut().insert(
+            http::HeaderName::from_static("x-order"),
+            http::HeaderValue::from_str(&new_value).unwrap(),
+        );
+        self.inner.call(req)
+    }
+}
