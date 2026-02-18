@@ -11,6 +11,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Multi-upstream routing** -- route requests to different backends by path prefix, host, or custom predicates. Load balance across multiple backends with round-robin or random strategies.
 - **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
 - **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff and retry budget, circuit breaker, fixed responses, and TypeScript scripting
+- **Redis backend** -- optional Redis-backed state for rate limiting, sliding window, and circuit breaker middleware. Enables shared state across multiple proxy instances for horizontal scaling. Falls back to in-memory on Redis errors. (`redis` feature)
 - **Conditional rules** -- apply middleware only to requests matching a host, path, or HTTP method (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
 - **TOML config file** -- configure the proxy and middleware rules declaratively
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
@@ -213,6 +214,7 @@ Options:
       --remove-response-header <NAME>  Remove a response header. Repeatable.
       --script <PATH>                  Path to a JS/TS middleware script (requires scripting feature)
       --script-max-body <BYTES>        Max bytes scripts may buffer for req/res body reads
+      --redis-url <URL>                Redis URL for distributed middleware state (requires redis feature)
       --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
       --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
@@ -301,6 +303,9 @@ noxy --upstream http://localhost:3000 --script middleware.ts
 
 # Limit body bytes scripts may buffer when calling req.body()/res.body()
 noxy --upstream http://localhost:3000 --script middleware.ts --script-max-body 262144
+
+# Use Redis for distributed rate limiting across multiple proxy instances (requires redis feature)
+noxy --upstream http://localhost:3000 --redis-url redis://localhost:6379 --rate-limit 100/1s
 ```
 
 ## Config File
@@ -323,6 +328,11 @@ upstream = "http://localhost:3000"
 # [tls]
 # cert = "server.pem"
 # key = "server-key.pem"
+
+# Optional: use Redis for distributed middleware state (requires redis feature)
+# [redis]
+# url = "redis://localhost:6379"
+# prefix = "noxy:"
 
 [[rules]]
 log = true
@@ -435,6 +445,10 @@ circuit_breaker = { threshold = 5, recovery = "30s" }
 [[rules]]
 circuit_breaker = { threshold = 3, recovery = "10s", half_open_probes = 2, per_host = true }
 
+# Circuit breaker with local cache to reduce Redis round-trips (Redis only)
+[[rules]]
+circuit_breaker = { threshold = 5, recovery = "30s", cache_ttl = "100ms" }
+
 # Add a request header and strip a response header
 [[rules]]
 request_headers = { set = { "x-proxy" = "noxy" } }
@@ -503,6 +517,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 
 | Field       | Description                                              |
 |-------------|----------------------------------------------------------|
+| `name`      | Stable identifier for Redis key scoping (e.g. `"api-limiter"`). When set, used instead of the rule's positional index so Redis state survives rule reordering. Must be unique and non-empty. Only relevant when `[redis]` is configured. |
 | `match`     | `{ host = "*.example.com", path = "/api/*/users" }`, `{ path_prefix = "/prefix" }`, or `{ methods = ["GET", "POST"] }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`); `methods` filters by HTTP method (case-insensitive) |
 | `upstream`  | `"http://api:8080"` or `["http://a:8080", "http://b:8080"]` -- route matched requests to a different upstream |
 | `balance`   | `"round-robin"` or `"random"` -- load balancing strategy for multi-upstream rules (default: round-robin) |
@@ -515,7 +530,7 @@ Each rule has an optional `match` condition and one or more middleware configs. 
 | `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
 | `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
 | `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses`, `max_replay_body_bytes`, `max_backoff`, `budget`, `budget_window`, `budget_min_retries` |
-| `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes` and `per_host` |
+| `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes`, `per_host`, and `cache_ttl` (Redis only, caches Closed/Open state locally) |
 | `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
 | `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |
 | `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
@@ -597,6 +612,55 @@ Limit script body buffering (applies to both `req.body()` and `res.body()`):
 ScriptLayer::from_file("middleware.ts")?
     .max_body_bytes(256 * 1024)
 ```
+
+## Redis Backend
+
+Stateful middleware (rate limiting, sliding window, circuit breaker) keeps state in-memory by default. For horizontal scaling across multiple proxy instances, enable the `redis` feature to share state via Redis.
+
+```bash
+cargo install noxy --features cli,redis
+```
+
+### TOML config
+
+```toml
+[redis]
+url = "redis://localhost:6379"
+# prefix = "noxy:"    # optional key prefix (default: "noxy:")
+
+[[rules]]
+rate_limit = { count = 100, window = "1s" }
+
+[[rules]]
+circuit_breaker = { threshold = 5, recovery = "30s" }
+```
+
+When `[redis]` is configured, all `rate_limit`, `sliding_window`, and `circuit_breaker` rules automatically use Redis. If Redis becomes unreachable, each store transparently falls back to an in-memory store and logs a warning.
+
+### CLI
+
+```bash
+noxy --upstream http://localhost:3000 --redis-url redis://localhost:6379 --rate-limit 100/1s
+```
+
+### Library API
+
+```rust,ignore
+use std::time::Duration;
+use noxy::Proxy;
+use noxy::middleware::{RedisConnection, RedisRateLimitStore, RateLimiter};
+
+let conn = RedisConnection::open("redis://localhost:6379")?;
+let store = RedisRateLimitStore::new(conn, 100.0, 100.0);  // rate=100/s, burst=100
+let limiter = RateLimiter::with_store(store, |_| String::new());  // global key
+
+let proxy = Proxy::builder()
+    .reverse_proxy("http://localhost:3000")?
+    .http_layer(limiter)
+    .build()?;
+```
+
+All three stores follow the same pattern: `RedisRateLimitStore`, `RedisSlidingWindowStore`, and `RedisCircuitBreakerStore` each take a `RedisConnection` and embed an in-memory fallback internally.
 
 ## How It Works
 

@@ -128,7 +128,7 @@ pub struct InMemoryRateLimitStore {
 }
 
 impl InMemoryRateLimitStore {
-    fn new(rate: f64, burst: f64) -> Self {
+    pub(crate) fn new(rate: f64, burst: f64) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
                 buckets: HashMap::new(),
@@ -141,15 +141,15 @@ impl InMemoryRateLimitStore {
         }
     }
 
-    fn set_burst(&self, burst: f64) {
+    pub(crate) fn set_burst(&self, burst: f64) {
         self.state.lock().unwrap().burst = burst;
     }
 
-    fn set_max_keys(&self, max: usize) {
+    pub(crate) fn set_max_keys(&self, max: usize) {
         self.state.lock().unwrap().max_keys = max.max(1);
     }
 
-    fn set_idle_ttl(&self, ttl: Duration) {
+    pub(crate) fn set_idle_ttl(&self, ttl: Duration) {
         self.state.lock().unwrap().idle_ttl = ttl;
     }
 }
@@ -320,6 +320,122 @@ impl<S: RateLimitStore> Service<Request<Body>> for RateLimiterService<S> {
         })
     }
 }
+
+#[cfg(feature = "redis")]
+mod redis_impl {
+    use std::time::Duration;
+
+    use super::super::store::RateLimitStore;
+    use super::InMemoryRateLimitStore;
+    use crate::redis::RedisConnection;
+
+    const RATE_LIMIT_LUA: &str = r#"
+local key = KEYS[1]
+local rate = tonumber(ARGV[1])
+local burst = tonumber(ARGV[2])
+local ttl_ms = tonumber(ARGV[3])
+
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+local data = redis.call('HMGET', key, 'tokens', 'last_refill_ms')
+local tokens = tonumber(data[1])
+local last_ms = tonumber(data[2])
+
+if tokens == nil then
+    tokens = burst
+    last_ms = now_ms
+end
+
+local elapsed_s = (now_ms - last_ms) / 1000.0
+local refilled = math.min(tokens + elapsed_s * rate, burst)
+refilled = refilled - 1.0
+
+redis.call('HSET', key, 'tokens', tostring(refilled), 'last_refill_ms', tostring(now_ms))
+redis.call('PEXPIRE', key, ttl_ms)
+
+if refilled < 0 then
+    return math.ceil((-refilled / rate) * 1000)
+else
+    return 0
+end
+"#;
+
+    /// Redis-backed token-bucket rate limiter.
+    ///
+    /// On Redis errors, transparently falls back to an embedded in-memory store.
+    #[derive(Clone)]
+    pub struct RedisRateLimitStore {
+        conn: RedisConnection,
+        fallback: InMemoryRateLimitStore,
+        rate: f64,
+        burst: f64,
+        namespace: String,
+    }
+
+    impl RedisRateLimitStore {
+        pub fn new(conn: RedisConnection, rate: f64, burst: f64) -> Self {
+            Self {
+                conn,
+                fallback: InMemoryRateLimitStore::new(rate, burst),
+                rate,
+                burst,
+                namespace: "rate_limit".to_string(),
+            }
+        }
+
+        /// Set a scope to isolate this store's keys from other instances of
+        /// the same middleware type in Redis. Two stores with different scopes
+        /// will never share state, even for the same request key.
+        pub fn scope(mut self, id: &str) -> Self {
+            self.namespace = format!("rate_limit:{id}");
+            self
+        }
+    }
+
+    impl RateLimitStore for RedisRateLimitStore {
+        fn take(&self, key: &str) -> impl std::future::Future<Output = Option<Duration>> + Send {
+            let redis_key = self.conn.prefixed_key(&self.namespace, key);
+            let conn = self.conn.clone();
+            let rate = self.rate;
+            let burst = self.burst;
+            let fallback = self.fallback.clone();
+            let key = key.to_string();
+
+            async move {
+                let mgr = match conn.get_connection().await {
+                    Ok(mgr) => mgr,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis rate limit connect failed, using in-memory fallback");
+                        return fallback.take(&key).await;
+                    }
+                };
+
+                let ttl_ms = ((burst / rate) * 1000.0) as u64 + 60_000;
+
+                let result: Result<i64, _> = ::redis::Script::new(RATE_LIMIT_LUA)
+                    .key(&redis_key)
+                    .arg(rate)
+                    .arg(burst)
+                    .arg(ttl_ms)
+                    .invoke_async(&mut mgr.clone())
+                    .await;
+
+                match result {
+                    Ok(delay_ms) if delay_ms > 0 => Some(Duration::from_millis(delay_ms as u64)),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis rate limit failed, using in-memory fallback");
+                        fallback.take(&key).await
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+pub use redis_impl::RedisRateLimitStore;
 
 #[cfg(test)]
 mod tests {

@@ -32,6 +32,15 @@ pub use store::{CircuitAction, CircuitBreakerStore, RateLimitStore, SlidingWindo
 pub use traffic_logger::TrafficLogger;
 pub use url_rewrite::UrlRewrite;
 
+#[cfg(feature = "redis")]
+pub use crate::redis::RedisConnection;
+#[cfg(feature = "redis")]
+pub use circuit_breaker::RedisCircuitBreakerStore;
+#[cfg(feature = "redis")]
+pub use rate_limiter::RedisRateLimitStore;
+#[cfg(feature = "redis")]
+pub use sliding_window::RedisSlidingWindowStore;
+
 #[cfg(feature = "scripting")]
 mod script;
 #[cfg(feature = "scripting")]

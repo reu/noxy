@@ -105,7 +105,7 @@ pub struct InMemorySlidingWindowStore {
 }
 
 impl InMemorySlidingWindowStore {
-    fn new(count: u64, window: Duration) -> Self {
+    pub(crate) fn new(count: u64, window: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
                 windows: HashMap::new(),
@@ -118,11 +118,11 @@ impl InMemorySlidingWindowStore {
         }
     }
 
-    fn set_max_keys(&self, max: usize) {
+    pub(crate) fn set_max_keys(&self, max: usize) {
         self.state.lock().unwrap().max_keys = max.max(1);
     }
 
-    fn set_idle_ttl(&self, ttl: Duration) {
+    pub(crate) fn set_idle_ttl(&self, ttl: Duration) {
         self.state.lock().unwrap().idle_ttl = ttl;
     }
 }
@@ -288,6 +288,122 @@ impl<S: SlidingWindowStore> Service<Request<Body>> for SlidingWindowService<S> {
         })
     }
 }
+
+#[cfg(feature = "redis")]
+mod redis_impl {
+    use std::time::Duration;
+
+    use super::super::store::SlidingWindowStore;
+    use super::InMemorySlidingWindowStore;
+    use crate::redis::RedisConnection;
+
+    const SLIDING_WINDOW_LUA: &str = r#"
+local key = KEYS[1]
+local count = tonumber(ARGV[1])
+local window_ms = tonumber(ARGV[2])
+local member = ARGV[3]
+
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local cutoff = now_ms - window_ms
+
+redis.call('ZREMRANGEBYSCORE', key, '-inf', cutoff)
+
+local current = redis.call('ZCARD', key)
+
+if current < count then
+    redis.call('ZADD', key, now_ms, member)
+    redis.call('PEXPIRE', key, window_ms + 1000)
+    return 0
+else
+    local oldest = redis.call('ZRANGEBYSCORE', key, '-inf', '+inf', 'WITHSCORES', 'LIMIT', 0, 1)
+    if #oldest >= 2 then
+        local oldest_ms = tonumber(oldest[2])
+        local delay_ms = window_ms - (now_ms - oldest_ms)
+        if delay_ms < 0 then delay_ms = 0 end
+        local reserved_ms = now_ms + delay_ms
+        redis.call('ZADD', key, reserved_ms, member)
+        redis.call('PEXPIRE', key, window_ms + delay_ms + 1000)
+        return delay_ms
+    end
+    return 0
+end
+"#;
+
+    /// Redis-backed sliding-window rate limiter.
+    ///
+    /// On Redis errors, transparently falls back to an embedded in-memory store.
+    #[derive(Clone)]
+    pub struct RedisSlidingWindowStore {
+        conn: RedisConnection,
+        fallback: InMemorySlidingWindowStore,
+        count: u64,
+        window: Duration,
+        namespace: String,
+    }
+
+    impl RedisSlidingWindowStore {
+        pub fn new(conn: RedisConnection, count: u64, window: Duration) -> Self {
+            Self {
+                conn,
+                fallback: InMemorySlidingWindowStore::new(count, window),
+                count,
+                window,
+                namespace: "sliding_window".to_string(),
+            }
+        }
+
+        /// Set a scope to isolate this store's keys from other instances of
+        /// the same middleware type in Redis.
+        pub fn scope(mut self, id: &str) -> Self {
+            self.namespace = format!("sliding_window:{id}");
+            self
+        }
+    }
+
+    impl SlidingWindowStore for RedisSlidingWindowStore {
+        fn take(&self, key: &str) -> impl std::future::Future<Output = Option<Duration>> + Send {
+            let redis_key = self.conn.prefixed_key(&self.namespace, key);
+            let conn = self.conn.clone();
+            let count = self.count;
+            let window_ms = self.window.as_millis() as u64;
+            let fallback = self.fallback.clone();
+            let key = key.to_string();
+
+            async move {
+                let mgr = match conn.get_connection().await {
+                    Ok(mgr) => mgr,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis sliding window connect failed, using in-memory fallback");
+                        return fallback.take(&key).await;
+                    }
+                };
+
+                let member = format!("{:x}:{:x}", rand::random::<u64>(), rand::random::<u64>());
+
+                let result: Result<i64, _> = ::redis::Script::new(SLIDING_WINDOW_LUA)
+                    .key(&redis_key)
+                    .arg(count)
+                    .arg(window_ms)
+                    .arg(&member)
+                    .invoke_async(&mut mgr.clone())
+                    .await;
+
+                match result {
+                    Ok(delay_ms) if delay_ms > 0 => Some(Duration::from_millis(delay_ms as u64)),
+                    Ok(_) => None,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis sliding window failed, using in-memory fallback");
+                        fallback.take(&key).await
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+pub use redis_impl::RedisSlidingWindowStore;
 
 #[cfg(test)]
 mod tests {

@@ -142,6 +142,11 @@ struct Cli {
     #[arg(long = "script-max-body")]
     script_max_body: Option<usize>,
 
+    /// Redis URL for distributed middleware state (e.g., "redis://localhost:6379")
+    #[cfg(feature = "redis")]
+    #[arg(long = "redis-url")]
+    redis_url: Option<String>,
+
     /// Accept invalid upstream TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
@@ -234,6 +239,14 @@ async fn main() -> anyhow::Result<()> {
         config.credentials.push(noxy::config::CredentialConfig {
             username: user.to_string(),
             password: pass.to_string(),
+        });
+    }
+
+    #[cfg(feature = "redis")]
+    if let Some(redis_url) = cli.redis_url {
+        config.redis = Some(noxy::config::RedisConfig {
+            url: redis_url,
+            prefix: None,
         });
     }
 
@@ -452,6 +465,7 @@ fn parse_circuit_breaker_rule(s: &str) -> anyhow::Result<RuleConfig> {
             recovery: noxy::config::DurationValue(recovery),
             half_open_probes: None,
             per_host: false,
+            cache_ttl: None,
         }),
         ..Default::default()
     })

@@ -22,6 +22,7 @@ required-features = ["cli"]
 config = ["serde", "toml"]
 cli = ["clap", "config", "tracing-subscriber"]
 scripting = ["deno_core", "deno_ast", "deno_error", "serde"]
+redis = ["dep:redis"]
 
 [dependencies]
 anyhow = "1"
@@ -54,6 +55,7 @@ base64 = "0.22"
 webpki-roots = "0.26"
 lru = "0.16.3"
 matchit = "0.8"
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 regex = "1"
 
 [dev-dependencies]
@@ -66,6 +68,8 @@ futures-util = "0.3"
 reqwest = { version = "0.12", features = ["rustls-tls", "stream"] }
 rcgen = { version = "0.13", features = ["x509-parser"] }
 rustls = { version = "0.23", features = ["ring"] }
+testcontainers = "0.26"
+testcontainers-modules = { version = "0.14", features = ["redis"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
 zstd = "0.13"

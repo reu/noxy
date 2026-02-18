@@ -176,7 +176,7 @@ pub struct InMemoryCircuitBreakerStore {
 }
 
 impl InMemoryCircuitBreakerStore {
-    fn new(threshold: u32, recovery: Duration) -> Self {
+    pub(crate) fn new(threshold: u32, recovery: Duration) -> Self {
         Self {
             state: Arc::new(Mutex::new(SharedState {
                 circuits: HashMap::new(),
@@ -190,15 +190,15 @@ impl InMemoryCircuitBreakerStore {
         }
     }
 
-    fn set_half_open_probes(&self, n: u32) {
+    pub(crate) fn set_half_open_probes(&self, n: u32) {
         self.state.lock().unwrap().half_open_probes = n;
     }
 
-    fn set_max_keys(&self, max: usize) {
+    pub(crate) fn set_max_keys(&self, max: usize) {
         self.state.lock().unwrap().max_keys = max.max(1);
     }
 
-    fn set_idle_ttl(&self, ttl: Duration) {
+    pub(crate) fn set_idle_ttl(&self, ttl: Duration) {
         self.state.lock().unwrap().idle_ttl = ttl;
     }
 }
@@ -426,6 +426,314 @@ impl<S: CircuitBreakerStore> Service<Request<Body>> for CircuitBreakerService<S>
         })
     }
 }
+
+#[cfg(feature = "redis")]
+mod redis_impl {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::super::store::{CircuitAction, CircuitBreakerStore};
+    use super::InMemoryCircuitBreakerStore;
+    use crate::redis::RedisConnection;
+
+    struct CachedEntry {
+        action: CircuitAction,
+        expires_at: Instant,
+    }
+
+    struct LocalCache {
+        entries: HashMap<String, CachedEntry>,
+        next_cleanup: Instant,
+    }
+
+    impl LocalCache {
+        fn new() -> Self {
+            Self {
+                entries: HashMap::new(),
+                next_cleanup: Instant::now() + super::CLEANUP_INTERVAL,
+            }
+        }
+
+        fn maybe_cleanup(&mut self, now: Instant) {
+            if now < self.next_cleanup {
+                return;
+            }
+            self.entries.retain(|_, entry| now < entry.expires_at);
+            self.next_cleanup = now + super::CLEANUP_INTERVAL;
+        }
+    }
+
+    const CB_CHECK_LUA: &str = r#"
+local key = KEYS[1]
+local half_open_probes = tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
+
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+local data = redis.call('HMGET', key, 'state', 'until_ms', 'in_flight')
+local state = tonumber(data[1]) or 0
+local until_ms = tonumber(data[2]) or 0
+local in_flight = tonumber(data[3]) or 0
+
+redis.call('PEXPIRE', key, ttl_ms)
+
+-- Return codes:
+--  0         = Closed, allow  (cacheable)
+--  positive  = Open, reject   (cacheable, value = remaining ms until recovery)
+-- -1         = HalfOpen probe, allow  (not cacheable)
+-- -2         = HalfOpen full, reject  (not cacheable)
+if state == 0 then
+    return 0
+elseif state == 1 then
+    if now_ms >= until_ms then
+        redis.call('HSET', key, 'state', 2, 'in_flight', 1)
+        return -1
+    else
+        return until_ms - now_ms
+    end
+elseif state == 2 then
+    if in_flight < half_open_probes then
+        redis.call('HINCRBY', key, 'in_flight', 1)
+        return -1
+    else
+        return -2
+    end
+end
+return 0
+"#;
+
+    const CB_RECORD_LUA: &str = r#"
+local key = KEYS[1]
+local success = tonumber(ARGV[1])
+local threshold = tonumber(ARGV[2])
+local recovery_ms = tonumber(ARGV[3])
+local ttl_ms = tonumber(ARGV[4])
+
+local t = redis.call('TIME')
+local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+local data = redis.call('HMGET', key, 'state', 'consecutive_failures')
+local state = tonumber(data[1]) or 0
+local failures = tonumber(data[2]) or 0
+
+redis.call('PEXPIRE', key, ttl_ms)
+
+if state == 0 then
+    if success == 1 then
+        redis.call('HSET', key, 'consecutive_failures', 0)
+    else
+        failures = failures + 1
+        if failures >= threshold then
+            local until_ms = now_ms + recovery_ms
+            redis.call('HSET', key, 'state', 1, 'consecutive_failures', failures, 'until_ms', until_ms, 'in_flight', 0)
+        else
+            redis.call('HSET', key, 'consecutive_failures', failures)
+        end
+    end
+elseif state == 2 then
+    if success == 1 then
+        redis.call('HSET', key, 'state', 0, 'consecutive_failures', 0, 'in_flight', 0)
+    else
+        local until_ms = now_ms + recovery_ms
+        redis.call('HSET', key, 'state', 1, 'consecutive_failures', 0, 'until_ms', until_ms, 'in_flight', 0)
+    end
+end
+
+return 0
+"#;
+
+    /// Redis-backed circuit breaker.
+    ///
+    /// On Redis errors, transparently falls back to an embedded in-memory store.
+    ///
+    /// When [`cache_ttl`](Self::cache_ttl) is set, `check()` caches Closed and
+    /// Open states locally to avoid a Redis round-trip on every request.
+    /// HalfOpen states are never cached (probe coordination requires atomicity).
+    /// `record()` always goes to Redis and invalidates the local cache entry so
+    /// the same instance sees state changes immediately.
+    #[derive(Clone)]
+    pub struct RedisCircuitBreakerStore {
+        conn: RedisConnection,
+        fallback: InMemoryCircuitBreakerStore,
+        threshold: u32,
+        recovery: Duration,
+        half_open_probes: u32,
+        cache: Arc<Mutex<LocalCache>>,
+        cache_ttl: Option<Duration>,
+        namespace: String,
+    }
+
+    impl RedisCircuitBreakerStore {
+        pub fn new(conn: RedisConnection, threshold: u32, recovery: Duration) -> Self {
+            Self {
+                conn,
+                fallback: InMemoryCircuitBreakerStore::new(threshold, recovery),
+                threshold,
+                recovery,
+                half_open_probes: 1,
+                cache: Arc::new(Mutex::new(LocalCache::new())),
+                cache_ttl: None,
+                namespace: "circuit_breaker".to_string(),
+            }
+        }
+
+        pub fn half_open_probes(mut self, n: u32) -> Self {
+            self.half_open_probes = n;
+            self.fallback.set_half_open_probes(n);
+            self
+        }
+
+        /// Cache Closed/Open check results locally for this duration to reduce
+        /// Redis round-trips. `None` (the default) disables caching — every
+        /// `check()` hits Redis.
+        ///
+        /// Open results are cached for `min(ttl, remaining recovery time)` so
+        /// the cache never delays the Open→HalfOpen transition. HalfOpen
+        /// states are never cached. `record()` always hits Redis and
+        /// invalidates the cache so the same instance sees failure-triggered
+        /// transitions immediately. Cross-instance staleness is bounded by the
+        /// TTL for the Closed→Open direction.
+        pub fn cache_ttl(mut self, ttl: Duration) -> Self {
+            self.cache_ttl = Some(ttl);
+            self
+        }
+
+        /// Set a scope to isolate this store's keys from other instances of
+        /// the same middleware type in Redis.
+        pub fn scope(mut self, id: &str) -> Self {
+            self.namespace = format!("circuit_breaker:{id}");
+            self
+        }
+    }
+
+    impl CircuitBreakerStore for RedisCircuitBreakerStore {
+        fn check(&self, key: &str) -> impl std::future::Future<Output = CircuitAction> + Send {
+            let redis_key = self.conn.prefixed_key(&self.namespace, key);
+            let conn = self.conn.clone();
+            let half_open_probes = self.half_open_probes;
+            let recovery = self.recovery;
+            let fallback = self.fallback.clone();
+            let cache = self.cache.clone();
+            let cache_ttl = self.cache_ttl;
+            let key = key.to_string();
+
+            async move {
+                if cache_ttl.is_some() {
+                    let now = Instant::now();
+                    let mut local = cache.lock().unwrap();
+                    local.maybe_cleanup(now);
+                    if let Some(entry) = local.entries.get(&key)
+                        && now < entry.expires_at
+                    {
+                        return entry.action;
+                    }
+                }
+
+                let mgr = match conn.get_connection().await {
+                    Ok(mgr) => mgr,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis circuit breaker connect failed, using in-memory fallback");
+                        return fallback.check(&key).await;
+                    }
+                };
+
+                let ttl_ms = recovery.as_millis() as u64 + 60_000;
+
+                let result: Result<i64, _> = ::redis::Script::new(CB_CHECK_LUA)
+                    .key(&redis_key)
+                    .arg(half_open_probes)
+                    .arg(ttl_ms)
+                    .invoke_async(&mut mgr.clone())
+                    .await;
+
+                match result {
+                    Ok(code) => {
+                        let action = if code > 0 || code == -2 {
+                            CircuitAction::Reject
+                        } else {
+                            CircuitAction::Allow
+                        };
+                        if let Some(ttl) = cache_ttl {
+                            if code == 0 {
+                                // Closed: cache for full TTL
+                                cache.lock().unwrap().entries.insert(
+                                    key,
+                                    CachedEntry {
+                                        action,
+                                        expires_at: Instant::now() + ttl,
+                                    },
+                                );
+                            } else if code > 0 {
+                                // Open: cache for min(ttl, remaining recovery time)
+                                let remaining = Duration::from_millis(code as u64);
+                                cache.lock().unwrap().entries.insert(
+                                    key,
+                                    CachedEntry {
+                                        action,
+                                        expires_at: Instant::now() + ttl.min(remaining),
+                                    },
+                                );
+                            }
+                            // HalfOpen (-1, -2): never cache
+                        }
+                        action
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis circuit breaker check failed, using in-memory fallback");
+                        fallback.check(&key).await
+                    }
+                }
+            }
+        }
+
+        fn record(&self, key: &str, success: bool) -> impl std::future::Future<Output = ()> + Send {
+            let redis_key = self.conn.prefixed_key(&self.namespace, key);
+            let conn = self.conn.clone();
+            let threshold = self.threshold;
+            let recovery = self.recovery;
+            let fallback = self.fallback.clone();
+            let cache = self.cache.clone();
+            let cache_ttl = self.cache_ttl;
+            let key = key.to_string();
+
+            async move {
+                let mgr = match conn.get_connection().await {
+                    Ok(mgr) => mgr,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Redis circuit breaker connect failed, using in-memory fallback");
+                        fallback.record(&key, success).await;
+                        return;
+                    }
+                };
+
+                let ttl_ms = recovery.as_millis() as u64 + 60_000;
+
+                let result: Result<i64, _> = ::redis::Script::new(CB_RECORD_LUA)
+                    .key(&redis_key)
+                    .arg(i64::from(u8::from(success)))
+                    .arg(threshold)
+                    .arg(recovery.as_millis() as u64)
+                    .arg(ttl_ms)
+                    .invoke_async(&mut mgr.clone())
+                    .await;
+
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "Redis circuit breaker record failed, using in-memory fallback");
+                    fallback.record(&key, success).await;
+                }
+
+                if cache_ttl.is_some() {
+                    cache.lock().unwrap().entries.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "redis")]
+pub use redis_impl::RedisCircuitBreakerStore;
 
 #[cfg(test)]
 mod tests {

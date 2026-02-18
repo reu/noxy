@@ -57,6 +57,10 @@ pub struct ProxyConfig {
     /// Idle timeout for pooled upstream connections, e.g. "90s". Default: 90s.
     pub pool_idle_timeout: Option<DurationValue>,
 
+    /// Redis configuration for distributed middleware state.
+    #[cfg(feature = "redis")]
+    pub redis: Option<RedisConfig>,
+
     /// Ordered list of middleware rules.
     #[serde(default)]
     pub rules: Vec<RuleConfig>,
@@ -80,9 +84,27 @@ pub struct CredentialConfig {
     pub password: String,
 }
 
+/// Redis connection for distributed middleware state (rate limiting, circuit
+/// breakers). When configured, all stateful middleware automatically uses
+/// Redis. On errors, stores fall back to in-memory.
+#[cfg(feature = "redis")]
+#[derive(Debug, Deserialize)]
+pub struct RedisConfig {
+    /// Redis URL, e.g. `"redis://localhost:6379"`.
+    pub url: String,
+    /// Key prefix for all Redis keys. Defaults to `"noxy:"`.
+    pub prefix: Option<String>,
+}
+
 /// A single rule. Has an optional condition and one or more middleware configs.
 #[derive(Debug, Default, Deserialize)]
 pub struct RuleConfig {
+    /// Stable identifier for this rule's Redis key scope. When set, the name
+    /// is used instead of the rule's positional index, making Redis state
+    /// resilient to rule reordering, insertion, or removal. Only matters when
+    /// Redis is configured; ignored otherwise.
+    pub name: Option<String>,
+
     #[serde(rename = "match")]
     pub match_config: Option<MatchConfig>,
 
@@ -248,6 +270,10 @@ pub struct CircuitBreakerConfig {
     pub half_open_probes: Option<u32>,
     #[serde(default)]
     pub per_host: bool,
+    /// Local cache TTL for Redis-backed circuit breakers. Caches Closed/Open
+    /// check results to avoid a Redis round-trip on every request. HalfOpen is
+    /// never cached. Only effective when Redis is configured; ignored otherwise.
+    pub cache_ttl: Option<DurationValue>,
 }
 
 #[cfg(feature = "scripting")]
@@ -408,8 +434,39 @@ impl ProxyConfig {
             builder = builder.pool_idle_timeout(timeout.0);
         }
 
-        for rule in self.rules {
-            builder = apply_rule(builder, rule)?;
+        #[cfg(feature = "redis")]
+        {
+            let mut seen_names = std::collections::HashSet::new();
+            for (i, rule) in self.rules.iter().enumerate() {
+                if let Some(ref name) = rule.name {
+                    if name.is_empty() {
+                        anyhow::bail!("rule {i}: `name` must not be empty");
+                    }
+                    if !seen_names.insert(name.as_str()) {
+                        anyhow::bail!("rule {i}: duplicate rule name {name:?}");
+                    }
+                }
+            }
+        }
+
+        #[cfg(feature = "redis")]
+        let redis_conn = if let Some(ref redis) = self.redis {
+            let prefix = redis.prefix.as_deref().unwrap_or("noxy:");
+            Some(crate::middleware::RedisConnection::open_with_prefix(
+                &redis.url, prefix,
+            )?)
+        } else {
+            None
+        };
+
+        for (i, rule) in self.rules.into_iter().enumerate() {
+            builder = apply_rule(
+                builder,
+                rule,
+                i,
+                #[cfg(feature = "redis")]
+                redis_conn.as_ref(),
+            )?;
         }
 
         Ok(builder)
@@ -419,7 +476,16 @@ impl ProxyConfig {
 fn apply_rule(
     mut builder: crate::ProxyBuilder,
     rule: RuleConfig,
+    rule_index: usize,
+    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
 ) -> anyhow::Result<crate::ProxyBuilder> {
+    #[cfg(feature = "redis")]
+    let scope = rule
+        .name
+        .as_deref()
+        .map(String::from)
+        .unwrap_or_else(|| rule_index.to_string());
+
     let predicate = rule.match_config.map(|m| m.into_predicate()).transpose()?;
 
     if let Some(upstream_config) = rule.upstream {
@@ -459,13 +525,35 @@ fn apply_rule(
     }
 
     if let Some(rl_config) = rule.rate_limit {
-        let limiter = build_rate_limiter(rl_config);
-        builder = apply_layer(builder, &predicate, limiter);
+        #[cfg(feature = "redis")]
+        if let Some(conn) = redis {
+            let limiter = build_rate_limiter_redis(rl_config, conn, &scope);
+            builder = apply_layer(builder, &predicate, limiter);
+        } else {
+            let limiter = build_rate_limiter(rl_config);
+            builder = apply_layer(builder, &predicate, limiter);
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            let limiter = build_rate_limiter(rl_config);
+            builder = apply_layer(builder, &predicate, limiter);
+        }
     }
 
     if let Some(sw_config) = rule.sliding_window {
-        let limiter = build_sliding_window(sw_config);
-        builder = apply_layer(builder, &predicate, limiter);
+        #[cfg(feature = "redis")]
+        if let Some(conn) = redis {
+            let limiter = build_sliding_window_redis(sw_config, conn, &scope);
+            builder = apply_layer(builder, &predicate, limiter);
+        } else {
+            let limiter = build_sliding_window(sw_config);
+            builder = apply_layer(builder, &predicate, limiter);
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            let limiter = build_sliding_window(sw_config);
+            builder = apply_layer(builder, &predicate, limiter);
+        }
     }
 
     if let Some(retry_config) = rule.retry {
@@ -474,8 +562,19 @@ fn apply_rule(
     }
 
     if let Some(cb_config) = rule.circuit_breaker {
-        let cb = build_circuit_breaker(cb_config);
-        builder = apply_layer(builder, &predicate, cb);
+        #[cfg(feature = "redis")]
+        if let Some(conn) = redis {
+            let cb = build_circuit_breaker_redis(cb_config, conn, &scope);
+            builder = apply_layer(builder, &predicate, cb);
+        } else {
+            let cb = build_circuit_breaker(cb_config);
+            builder = apply_layer(builder, &predicate, cb);
+        }
+        #[cfg(not(feature = "redis"))]
+        {
+            let cb = build_circuit_breaker(cb_config);
+            builder = apply_layer(builder, &predicate, cb);
+        }
     }
 
     if let Some(rewrite_config) = rule.url_rewrite {
@@ -625,6 +724,79 @@ fn build_circuit_breaker(config: CircuitBreakerConfig) -> CircuitBreaker {
         cb.half_open_probes(probes)
     } else {
         cb
+    }
+}
+
+#[cfg(feature = "redis")]
+fn host_key(req: &Request<Body>) -> String {
+    req.uri()
+        .host()
+        .or_else(|| req.headers().get(http::header::HOST)?.to_str().ok())
+        .map(|h| h.split(':').next().unwrap_or(h))
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[cfg(feature = "redis")]
+fn build_rate_limiter_redis(
+    config: RateLimitConfig,
+    conn: &crate::middleware::RedisConnection,
+    scope: &str,
+) -> RateLimiter<crate::middleware::RedisRateLimitStore> {
+    let rate = config.count as f64 / config.window.0.as_secs_f64();
+    let burst = config
+        .burst
+        .map(|b| b as f64)
+        .unwrap_or(config.count as f64);
+    let store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst).scope(scope);
+    if config.per_host {
+        RateLimiter::with_store(store, host_key)
+    } else {
+        RateLimiter::with_store(store, |_| String::new())
+    }
+}
+
+#[cfg(feature = "redis")]
+fn build_sliding_window_redis(
+    config: SlidingWindowConfig,
+    conn: &crate::middleware::RedisConnection,
+    scope: &str,
+) -> SlidingWindow<crate::middleware::RedisSlidingWindowStore> {
+    let store = crate::middleware::RedisSlidingWindowStore::new(
+        conn.clone(),
+        config.count,
+        config.window.0,
+    )
+    .scope(scope);
+    if config.per_host {
+        SlidingWindow::with_store(store, host_key)
+    } else {
+        SlidingWindow::with_store(store, |_| String::new())
+    }
+}
+
+#[cfg(feature = "redis")]
+fn build_circuit_breaker_redis(
+    config: CircuitBreakerConfig,
+    conn: &crate::middleware::RedisConnection,
+    scope: &str,
+) -> CircuitBreaker<crate::middleware::RedisCircuitBreakerStore> {
+    let mut store = crate::middleware::RedisCircuitBreakerStore::new(
+        conn.clone(),
+        config.threshold,
+        config.recovery.0,
+    )
+    .scope(scope);
+    if let Some(probes) = config.half_open_probes {
+        store = store.half_open_probes(probes);
+    }
+    if let Some(ttl) = config.cache_ttl {
+        store = store.cache_ttl(ttl.0);
+    }
+    if config.per_host {
+        CircuitBreaker::with_store(store, host_key)
+    } else {
+        CircuitBreaker::with_store(store, |_| String::new())
     }
 }
 
@@ -823,6 +995,9 @@ mod tests {
             circuit_breaker = { threshold = 3, recovery = "10s", half_open_probes = 2, per_host = true }
 
             [[rules]]
+            circuit_breaker = { threshold = 5, recovery = "30s", cache_ttl = "100ms" }
+
+            [[rules]]
             request_headers = { set = { "x-proxy" = "noxy" }, remove = ["x-internal"] }
             response_headers = { set = { "x-served-by" = "noxy" }, append = { "via" = "noxy" }, remove = ["server"] }
 
@@ -852,7 +1027,7 @@ mod tests {
         assert_eq!(ca.cert, "cert.pem");
         assert_eq!(ca.key, "key.pem");
 
-        assert_eq!(config.rules.len(), 20);
+        assert_eq!(config.rules.len(), 21);
 
         // Rule 0: log = true
         assert!(matches!(
@@ -961,29 +1136,35 @@ mod tests {
         assert_eq!(cb.half_open_probes, Some(2));
         assert!(cb.per_host);
 
-        // Rule 16: request + response headers
-        let rh = config.rules[16].request_headers.as_ref().unwrap();
+        // Rule 16: circuit_breaker with cache_ttl
+        let cb = config.rules[16].circuit_breaker.as_ref().unwrap();
+        assert_eq!(cb.threshold, 5);
+        assert_eq!(cb.recovery.0, Duration::from_secs(30));
+        assert_eq!(cb.cache_ttl.as_ref().unwrap().0, Duration::from_millis(100));
+
+        // Rule 17: request + response headers
+        let rh = config.rules[17].request_headers.as_ref().unwrap();
         assert_eq!(rh.set.get("x-proxy").unwrap(), "noxy");
         assert_eq!(rh.remove, vec!["x-internal"]);
-        let rsh = config.rules[16].response_headers.as_ref().unwrap();
+        let rsh = config.rules[17].response_headers.as_ref().unwrap();
         assert_eq!(rsh.set.get("x-served-by").unwrap(), "noxy");
         assert_eq!(rsh.append.get("via").unwrap(), "noxy");
         assert_eq!(rsh.remove, vec!["server"]);
 
-        // Rule 17: conditional request headers
-        assert!(config.rules[17].match_config.is_some());
-        let rh = config.rules[17].request_headers.as_ref().unwrap();
+        // Rule 18: conditional request headers
+        assert!(config.rules[18].match_config.is_some());
+        let rh = config.rules[18].request_headers.as_ref().unwrap();
         assert_eq!(rh.set.get("x-api-version").unwrap(), "2");
 
-        // Rule 18: block with hosts and paths
-        let bl = config.rules[18].block.as_ref().unwrap();
+        // Rule 19: block with hosts and paths
+        let bl = config.rules[19].block.as_ref().unwrap();
         assert_eq!(bl.hosts, vec!["*.tracking.com", "ads.example.com"]);
         assert_eq!(bl.paths, vec!["/admin/*"]);
         assert_eq!(bl.status, None);
         assert_eq!(bl.body, None);
 
-        // Rule 19: block with custom status and body
-        let bl = config.rules[19].block.as_ref().unwrap();
+        // Rule 20: block with custom status and body
+        let bl = config.rules[20].block.as_ref().unwrap();
         assert_eq!(bl.hosts, vec!["internal.corp.com"]);
         assert!(bl.paths.is_empty());
         assert_eq!(bl.status, Some(404));
@@ -1385,6 +1566,73 @@ mod tests {
         assert_eq!(s2.file, "api.ts");
         assert_eq!(s2.max_body_bytes, None);
         assert!(config.rules[2].match_config.is_some());
+    }
+
+    #[test]
+    fn deserialize_rule_name() {
+        let toml = r#"
+            [[rules]]
+            name = "api-limiter"
+            rate_limit = { count = 10, window = "1s" }
+
+            [[rules]]
+            rate_limit = { count = 5, window = "1s" }
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.rules[0].name.as_deref(), Some("api-limiter"));
+        assert_eq!(config.rules[1].name, None);
+    }
+
+    #[test]
+    #[cfg(feature = "redis")]
+    fn duplicate_rule_names_rejected() {
+        let config = ProxyConfig {
+            rules: vec![
+                RuleConfig {
+                    name: Some("dup".into()),
+                    rate_limit: Some(RateLimitConfig {
+                        count: 10,
+                        window: DurationValue(Duration::from_secs(1)),
+                        burst: None,
+                        per_host: false,
+                    }),
+                    ..Default::default()
+                },
+                RuleConfig {
+                    name: Some("dup".into()),
+                    rate_limit: Some(RateLimitConfig {
+                        count: 5,
+                        window: DurationValue(Duration::from_secs(1)),
+                        burst: None,
+                        per_host: false,
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let err = config.into_builder().err().expect("should fail");
+        assert!(
+            err.to_string().contains("duplicate rule name"),
+            "expected duplicate name error, got: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "redis")]
+    fn empty_rule_name_rejected() {
+        let config = ProxyConfig {
+            rules: vec![RuleConfig {
+                name: Some(String::new()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let err = config.into_builder().err().expect("should fail");
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "expected empty name error, got: {err}"
+        );
     }
 
     #[test]

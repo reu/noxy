@@ -6,6 +6,9 @@ pub mod middleware;
 #[cfg(feature = "config")]
 pub mod config;
 
+#[cfg(feature = "redis")]
+mod redis;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
