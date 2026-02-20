@@ -1,0 +1,21 @@
+FROM rust:1-slim-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG FEATURES=
+
+WORKDIR /build
+COPY . .
+RUN cargo build --release --features "cli,redis${FEATURES:+,${FEATURES}}"
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/noxy /usr/local/bin/noxy
+
+ENTRYPOINT ["noxy"]
