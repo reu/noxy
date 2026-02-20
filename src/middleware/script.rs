@@ -166,6 +166,12 @@ async fn op_noxy_res_body(state: Rc<RefCell<OpState>>) -> Result<Vec<u8>, JsErro
 }
 
 #[deno_core::op2]
+#[string]
+fn op_noxy_env_get(#[string] key: String) -> Option<String> {
+    std::env::var(&key).ok()
+}
+
+#[deno_core::op2]
 fn op_noxy_finish(
     state: &mut OpState,
     status: u16,
@@ -285,6 +291,7 @@ fn spawn_v8_thread(
                 op_noxy_req_body(),
                 op_noxy_respond(),
                 op_noxy_res_body(),
+                op_noxy_env_get(),
                 op_noxy_finish(),
             ];
 

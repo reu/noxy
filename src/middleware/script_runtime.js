@@ -124,9 +124,17 @@ class Response {
   }
 }
 
+const env = {
+  get(key) {
+    return Deno.core.ops.op_noxy_env_get(key) ?? undefined;
+  },
+};
+
 globalThis.Headers = Headers;
 globalThis.Request = Request;
 globalThis.Response = Response;
+globalThis.env = env;
+globalThis.Deno.env = env;
 
 globalThis.__noxy_handle = async function (handler, method, url, headers) {
   const req = new Request(method, url, headers);
