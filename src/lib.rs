@@ -227,6 +227,44 @@ impl ProxyBuilder {
         self
     }
 
+    /// Add middleware from an async function.
+    ///
+    /// This is a convenience wrapper around [`http_layer`](Self::http_layer)
+    /// that avoids implementing [`Layer`](tower::Layer) and
+    /// [`Service`](tower::Service) manually. The function receives each
+    /// request and a [`Next`](middleware::Next) handle; call
+    /// [`Next::run`](middleware::Next::run) to forward the request
+    /// downstream.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use noxy::Proxy;
+    ///
+    /// # fn main() -> anyhow::Result<()> {
+    /// let proxy = Proxy::builder()
+    ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+    ///     .http_middleware(|mut req, next| async move {
+    ///         req.headers_mut()
+    ///             .insert("x-proxy", "noxy".parse().unwrap());
+    ///         let mut response = next.run(req).await?;
+    ///         response
+    ///             .headers_mut()
+    ///             .insert("x-powered-by", "noxy".parse().unwrap());
+    ///         Ok(response)
+    ///     })
+    ///     .build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn http_middleware<F, Fut>(self, f: F) -> Self
+    where
+        F: Fn(Request<Body>, middleware::Next) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<Response<Body>, BoxError>> + Send + 'static,
+    {
+        self.http_layer(middleware::from_fn(f))
+    }
+
     /// Add a traffic logger that logs request/response metadata to stderr.
     ///
     /// Use [`TrafficLogger`](middleware::TrafficLogger) directly with

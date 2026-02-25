@@ -9,7 +9,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Forward proxy** -- CONNECT tunnel with TLS MITM, per-host certificate generation signed by a user-provided CA
 - **Reverse proxy** -- point Noxy at a fixed upstream and forward all incoming HTTP traffic directly -- no CONNECT, no CA, no client-side proxy configuration required
 - **Multi-upstream routing** -- route requests to different backends by path prefix, host, or custom predicates. Load balance across multiple backends with round-robin or random strategies.
-- **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services.
+- **Tower middleware pipeline** -- plug in any tower `Layer` or `Service` to inspect and modify HTTP traffic. Works with tower-http layers (compression, tracing, CORS, etc.) and your own custom services. Use `from_fn` to create middleware from a simple async closure without boilerplate.
 - **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff and retry budget, circuit breaker, fixed responses, and TypeScript scripting
 - **Redis backend** -- optional Redis-backed state for rate limiting, sliding window, and circuit breaker middleware. Enables shared state across multiple proxy instances for horizontal scaling. Falls back to in-memory on Redis errors. (`redis` feature)
 - **Conditional rules** -- apply middleware only to requests matching a host, path, or HTTP method (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
@@ -103,6 +103,83 @@ proxy.listen("127.0.0.1:8080").await?;
 ```
 
 Any tower `Layer<HttpService>` works in both modes. The innermost service forwards requests to the upstream server; your layers wrap around it in an onion model and can inspect or modify requests before forwarding and responses after.
+
+### Custom middleware
+
+Use `http_middleware` to create middleware from an async closure instead of implementing `Layer` + `Service` manually. The closure receives each request and a `Next` handle for forwarding it downstream:
+
+```rust,ignore
+use noxy::Proxy;
+
+let proxy = Proxy::builder()
+    .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+    .http_middleware(|mut req, next| async move {
+        // Modify the request before forwarding
+        req.headers_mut().insert("x-proxy", "noxy".parse().unwrap());
+
+        // Forward to the next service (or upstream)
+        let mut response = next.run(req).await?;
+
+        // Modify the response before returning to the client
+        response.headers_mut().insert("x-powered-by", "noxy".parse().unwrap());
+        Ok(response)
+    })
+    .build()?;
+
+proxy.listen("127.0.0.1:8080").await?;
+```
+
+Short-circuit without forwarding upstream by returning a response directly:
+
+```rust,ignore
+use noxy::Proxy;
+use noxy::http::full_body;
+
+let proxy = Proxy::builder()
+    .reverse_proxy("http://localhost:3000")?
+    .http_middleware(|req, _next| async move {
+        if req.uri().path() == "/health" {
+            return Ok(http::Response::new(full_body("ok")));
+        }
+        _next.run(req).await
+    })
+    .build()?;
+```
+
+For shared state across requests, capture an `Arc` in the closure:
+
+```rust,ignore
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use noxy::Proxy;
+
+let counter = Arc::new(AtomicU64::new(0));
+let c = counter.clone();
+
+let proxy = Proxy::builder()
+    .reverse_proxy("http://localhost:3000")?
+    .http_middleware(move |req, next| {
+        let c = c.clone();
+        async move {
+            c.fetch_add(1, Ordering::Relaxed);
+            next.run(req).await
+        }
+    })
+    .build()?;
+```
+
+The equivalent `from_fn` function works with `http_layer` for composability with `Conditional` and other layers:
+
+```rust,ignore
+use noxy::Proxy;
+use noxy::middleware::from_fn;
+
+let proxy = Proxy::builder()
+    .ca_pem_files("ca-cert.pem", "ca-key.pem")?
+    .http_layer(from_fn(|req, next| async move {
+        next.run(req).await
+    }))
+    .build()?;
+```
 
 ## Installation
 
