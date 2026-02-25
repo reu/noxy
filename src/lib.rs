@@ -159,6 +159,7 @@ enum ProxyMode {
         ca: Arc<CertificateAuthority>,
         server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
         credentials: Option<Arc<Vec<(String, String)>>>,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
     },
     Reverse {
         upstream_authority: ::http::uri::Authority,
@@ -428,8 +429,11 @@ impl ProxyBuilder {
         Ok(self)
     }
 
-    /// Set a TLS identity (cert + key) for serving HTTPS to clients in
-    /// reverse proxy mode.
+    /// Set a TLS identity (cert + key) for serving HTTPS to clients.
+    ///
+    /// In reverse proxy mode, the proxy accepts TLS before forwarding to
+    /// the upstream. In forward proxy mode, the proxy accepts TLS before
+    /// the CONNECT handshake, allowing clients to use `HTTPS_PROXY=https://...`.
     pub fn tls_identity(
         mut self,
         cert_path: impl AsRef<std::path::Path>,
@@ -532,6 +536,15 @@ impl ProxyBuilder {
             let ca = self
                 .ca
                 .ok_or_else(|| anyhow::anyhow!("CertificateAuthority must be set"))?;
+            let tls_acceptor = if let Some((certs, key)) = self.tls_identity {
+                let mut config = ServerConfig::builder()
+                    .with_no_client_auth()
+                    .with_single_cert(certs, key)?;
+                config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                Some(Arc::new(TlsAcceptor::from(Arc::new(config))))
+            } else {
+                None
+            };
             ProxyMode::Forward {
                 ca: Arc::new(ca),
                 server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
@@ -542,6 +555,7 @@ impl ProxyBuilder {
                 } else {
                     Some(Arc::new(self.credentials))
                 },
+                tls_acceptor,
             }
         };
 
@@ -706,8 +720,12 @@ impl Proxy {
     ) -> anyhow::Result<()> {
         let local_addr = listener.local_addr()?;
         match &self.mode {
-            ProxyMode::Forward { .. } => {
-                tracing::info!(%local_addr, "listening (forward proxy)");
+            ProxyMode::Forward { tls_acceptor, .. } => {
+                if tls_acceptor.is_some() {
+                    tracing::info!(%local_addr, "listening (forward proxy, TLS)");
+                } else {
+                    tracing::info!(%local_addr, "listening (forward proxy)");
+                }
             }
             ProxyMode::Reverse {
                 upstream_authority,
@@ -842,6 +860,7 @@ impl Proxy {
                 ca,
                 server_config_cache,
                 credentials,
+                tls_acceptor,
             } => {
                 self.handle_forward_connection(
                     stream,
@@ -849,6 +868,7 @@ impl Proxy {
                     ca.clone(),
                     server_config_cache.clone(),
                     credentials.clone(),
+                    tls_acceptor.clone(),
                 )
                 .await
             }
@@ -932,20 +952,36 @@ impl Proxy {
         ca: Arc<CertificateAuthority>,
         server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
         credentials: Option<Arc<Vec<(String, String)>>>,
+        tls_acceptor: Option<Arc<TlsAcceptor>>,
     ) -> anyhow::Result<()> {
-        let (hyper_service, client_tls) = {
-            let handshake = self.handshake(stream, ca, server_config_cache, credentials);
-            if let Some(timeout) = self.handshake_timeout {
-                tokio::time::timeout(timeout, handshake)
-                    .await
-                    .map_err(|_| anyhow::anyhow!("handshake timed out"))??
-            } else {
-                handshake.await?
-            }
-        };
-
-        self.serve_client(client_tls, hyper_service, shutdown_rx)
-            .await
+        if let Some(acceptor) = tls_acceptor {
+            let tls_stream = acceptor.accept(stream).await?;
+            let (hyper_service, client_tls) = {
+                let handshake = self.handshake(tls_stream, ca, server_config_cache, credentials);
+                if let Some(timeout) = self.handshake_timeout {
+                    tokio::time::timeout(timeout, handshake)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("handshake timed out"))??
+                } else {
+                    handshake.await?
+                }
+            };
+            self.serve_client(client_tls, hyper_service, shutdown_rx)
+                .await
+        } else {
+            let (hyper_service, client_tls) = {
+                let handshake = self.handshake(stream, ca, server_config_cache, credentials);
+                if let Some(timeout) = self.handshake_timeout {
+                    tokio::time::timeout(timeout, handshake)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("handshake timed out"))??
+                } else {
+                    handshake.await?
+                }
+            };
+            self.serve_client(client_tls, hyper_service, shutdown_rx)
+                .await
+        }
     }
 
     async fn handle_reverse_connection(
@@ -973,9 +1009,9 @@ impl Proxy {
     /// Perform the full handshake sequence for forward proxy mode: CONNECT
     /// parsing via hyper, TLS on both sides. Returns the tower service and
     /// client TLS stream ready for `serve_connection`.
-    async fn handshake(
+    async fn handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
         &self,
-        stream: TcpStream,
+        stream: S,
         ca: Arc<CertificateAuthority>,
         server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
         credentials: Option<Arc<Vec<(String, String)>>>,

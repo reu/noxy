@@ -25,7 +25,7 @@ pub struct ProxyConfig {
     /// Fixed upstream URL for reverse proxy mode, e.g. "https://api.example.com".
     pub upstream: Option<String>,
 
-    /// TLS certificate and key for serving HTTPS to clients (reverse proxy mode).
+    /// TLS certificate and key for serving HTTPS to clients.
     pub tls: Option<TlsConfig>,
 
     /// CA certificate and key paths (forward proxy mode).

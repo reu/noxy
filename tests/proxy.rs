@@ -752,3 +752,61 @@ async fn proxy_relays_websocket() {
     // Clean close
     ws.close(None).await.unwrap();
 }
+
+#[tokio::test]
+async fn forward_proxy_with_tls_listener() {
+    install_crypto_provider();
+    let upstream_addr = start_upstream("hello tls forward").await;
+
+    // Generate a self-signed cert for the proxy listener
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+
+    let cert_pem = cert.pem();
+    let key_pem = key_pair.serialize_pem();
+
+    let cert_path = std::env::temp_dir().join("noxy-test-forward-tls-cert.pem");
+    let key_path = std::env::temp_dir().join("noxy-test-forward-tls-key.pem");
+    std::fs::write(&cert_path, &cert_pem).unwrap();
+    std::fs::write(&key_path, &key_pem).unwrap();
+
+    let proxy = Proxy::builder()
+        .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
+        .unwrap()
+        .danger_accept_invalid_upstream_certs()
+        .tls_identity(&cert_path, &key_path)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        proxy.listen_on(listener).await.unwrap();
+    });
+
+    // Client trusts the proxy's listener cert and connects via HTTPS proxy
+    let listener_ca = reqwest::tls::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+    let ca_pem = std::fs::read("tests/dummy-cert.pem").unwrap();
+    let mitm_ca = reqwest::tls::Certificate::from_pem(&ca_pem).unwrap();
+
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("https://localhost:{}", proxy_addr.port())).unwrap())
+        .add_root_certificate(listener_ca)
+        .add_root_certificate(mitm_ca)
+        .build()
+        .unwrap();
+
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().await.unwrap(), "hello tls forward");
+
+    std::fs::remove_file(&cert_path).ok();
+    std::fs::remove_file(&key_path).ok();
+}

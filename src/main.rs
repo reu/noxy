@@ -32,11 +32,11 @@ struct Cli {
     #[arg(long)]
     upstream: Option<String>,
 
-    /// TLS certificate for client-facing HTTPS (reverse proxy mode)
+    /// TLS certificate for client-facing HTTPS
     #[arg(long = "tls-cert")]
     tls_cert: Option<String>,
 
-    /// TLS private key for client-facing HTTPS (reverse proxy mode)
+    /// TLS private key for client-facing HTTPS
     #[arg(long = "tls-key")]
     tls_key: Option<String>,
 
