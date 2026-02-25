@@ -153,9 +153,18 @@ pub struct BlockListConfig {
     pub body: Option<String>,
 }
 
-/// Request matching condition. The `host` and `path` fields support glob patterns
-/// (`*`, `**`, `?`, `[abc]`, `[a-z]`, `[!a-z]`). Literal strings with no metacharacters
-/// match exactly, preserving backward compatibility.
+/// Header matching condition. The `value` field supports glob patterns.
+#[derive(Debug, Deserialize)]
+pub struct HeaderMatchConfig {
+    /// Header name (case-insensitive).
+    pub name: String,
+    /// Header value glob, e.g. `"application/json"` or `"text/*"`.
+    pub value: String,
+}
+
+/// Request matching condition. The `host`, `path`, and header `value` fields
+/// support glob patterns (`*`, `**`, `?`, `[abc]`, `[a-z]`, `[!a-z]`). Literal
+/// strings with no metacharacters match exactly, preserving backward compatibility.
 #[derive(Debug, Deserialize)]
 pub struct MatchConfig {
     /// Hostname glob (port stripped), e.g. `"*.example.com"`.
@@ -167,6 +176,8 @@ pub struct MatchConfig {
     /// HTTP methods to match, e.g. `["GET", "POST"]`. Case-insensitive.
     #[serde(default)]
     pub methods: Vec<String>,
+    /// Header to match, e.g. `{ name = "x-api-version", value = "v2" }`.
+    pub header: Option<HeaderMatchConfig>,
 }
 
 /// Log configuration: `true` for defaults, or `{ bodies = true }` for detail.
@@ -342,6 +353,16 @@ impl MatchConfig {
                     .map_err(|e| anyhow::anyhow!("invalid HTTP method '{m}': {e}"))
             })
             .collect::<Result<_, _>>()?;
+        let header_matcher = self
+            .header
+            .map(|h| {
+                let name = http::header::HeaderName::from_bytes(h.name.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("invalid header name '{}': {e}", h.name))?;
+                let value_glob = compile_glob(&h.value)
+                    .map_err(|e| anyhow::anyhow!("invalid header value glob '{}': {e}", h.value))?;
+                Ok::<_, anyhow::Error>((name, value_glob))
+            })
+            .transpose()?;
 
         Ok(Arc::new(move |req: &Request<Body>| {
             if !methods.is_empty() && !methods.contains(req.method()) {
@@ -355,6 +376,12 @@ impl MatchConfig {
                     .map(|h| h.split(':').next().unwrap_or(h));
                 match req_host {
                     Some(h) if m.is_match(h) => {}
+                    _ => return false,
+                }
+            }
+            if let Some((ref name, ref value_glob)) = header_matcher {
+                match req.headers().get(name).and_then(|v| v.to_str().ok()) {
+                    Some(v) if value_glob.is_match(v) => {}
                     _ => return false,
                 }
             }
@@ -1202,6 +1229,20 @@ mod tests {
         assert_eq!(config.credentials[1].password, "hunter2");
     }
 
+    fn make_request_with_header(
+        host: &str,
+        path: &str,
+        header_name: &str,
+        header_value: &str,
+    ) -> Request<Body> {
+        let uri = format!("https://{host}{path}");
+        Request::builder()
+            .uri(uri)
+            .header(header_name, header_value)
+            .body(crate::http::empty_body())
+            .unwrap()
+    }
+
     fn make_request(host: &str, path: &str) -> Request<Body> {
         let uri = format!("https://{host}{path}");
         Request::builder()
@@ -1226,6 +1267,7 @@ mod tests {
             path: Some("/health".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1241,6 +1283,7 @@ mod tests {
             path: Some("/api/*/users".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1256,6 +1299,7 @@ mod tests {
             path: Some("/api/**".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1271,6 +1315,7 @@ mod tests {
             path: Some("/api/v?".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1286,6 +1331,7 @@ mod tests {
             path: Some("/[abc].html".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1301,6 +1347,7 @@ mod tests {
             path: None,
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1316,6 +1363,7 @@ mod tests {
             path: Some("/api/*".into()),
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1330,6 +1378,7 @@ mod tests {
             path: None,
             path_prefix: None,
             methods: vec!["GET".into()],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1352,6 +1401,7 @@ mod tests {
             path: None,
             path_prefix: Some("/api".into()),
             methods: vec!["GET".into(), "POST".into()],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1384,6 +1434,7 @@ mod tests {
             path: None,
             path_prefix: None,
             methods: vec!["get".into()],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1401,6 +1452,7 @@ mod tests {
             path: None,
             path_prefix: None,
             methods: vec![],
+            header: None,
         }
         .into_predicate()
         .unwrap();
@@ -1423,9 +1475,149 @@ mod tests {
             path: None,
             path_prefix: None,
             methods: vec!["NOT\nVALID".into()],
+            header: None,
         }
         .into_predicate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn header_exact_match() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec![],
+            header: Some(HeaderMatchConfig {
+                name: "x-api-version".into(),
+                value: "v2".into(),
+            }),
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "x-api-version",
+            "v2"
+        )));
+        assert!(!pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "x-api-version",
+            "v1"
+        )));
+        assert!(!pred(&make_request("example.com", "/any")));
+    }
+
+    #[test]
+    fn header_glob_match() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec![],
+            header: Some(HeaderMatchConfig {
+                name: "content-type".into(),
+                value: "text/*".into(),
+            }),
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "content-type",
+            "text/html"
+        )));
+        assert!(pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "content-type",
+            "text/plain"
+        )));
+        assert!(!pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "content-type",
+            "application/json"
+        )));
+    }
+
+    #[test]
+    fn header_name_case_insensitive() {
+        let pred = MatchConfig {
+            host: None,
+            path: None,
+            path_prefix: None,
+            methods: vec![],
+            header: Some(HeaderMatchConfig {
+                name: "X-Custom".into(),
+                value: "yes".into(),
+            }),
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_header(
+            "example.com",
+            "/any",
+            "x-custom",
+            "yes"
+        )));
+    }
+
+    #[test]
+    fn header_combined_with_host_and_path() {
+        let pred = MatchConfig {
+            host: Some("api.example.com".into()),
+            path: None,
+            path_prefix: Some("/v2".into()),
+            methods: vec![],
+            header: Some(HeaderMatchConfig {
+                name: "x-api-version".into(),
+                value: "v2".into(),
+            }),
+        }
+        .into_predicate()
+        .unwrap();
+        assert!(pred(&make_request_with_header(
+            "api.example.com",
+            "/v2/users",
+            "x-api-version",
+            "v2"
+        )));
+        assert!(!pred(&make_request_with_header(
+            "other.com",
+            "/v2/users",
+            "x-api-version",
+            "v2"
+        )));
+        assert!(!pred(&make_request_with_header(
+            "api.example.com",
+            "/v1/users",
+            "x-api-version",
+            "v2"
+        )));
+        assert!(!pred(&make_request_with_header(
+            "api.example.com",
+            "/v2/users",
+            "x-api-version",
+            "v1"
+        )));
+    }
+
+    #[test]
+    fn deserialize_header_match() {
+        let toml = r#"
+            [[rules]]
+            match = { header = { name = "x-api-version", value = "v2" } }
+            upstream = "http://api-v2:8080"
+        "#;
+        let config: ProxyConfig = toml::from_str(toml).unwrap();
+        let m = config.rules[0].match_config.as_ref().unwrap();
+        let h = m.header.as_ref().unwrap();
+        assert_eq!(h.name, "x-api-version");
+        assert_eq!(h.value, "v2");
     }
 
     #[test]
