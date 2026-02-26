@@ -1,7 +1,7 @@
 FROM rust:1-slim-bookworm AS builder
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential curl \
     && rm -rf /var/lib/apt/lists/*
 
 ARG FEATURES=
