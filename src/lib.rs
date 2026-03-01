@@ -9,10 +9,11 @@ pub mod config;
 #[cfg(feature = "redis")]
 mod redis;
 
+pub use rustls_mitm::CertificateAuthority;
+
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,7 +21,6 @@ use ::http::{Request, Response};
 use base64::Engine;
 use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
-use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
@@ -82,82 +82,10 @@ impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
     }
 }
 
-/// Wraps a CA certificate and key pair used to sign per-host certificates.
-pub struct CertificateAuthority {
-    cert: rcgen::Certificate,
-    key: KeyPair,
-}
-
-impl CertificateAuthority {
-    /// Create from PEM-encoded strings.
-    pub fn from_pem(cert_pem: &str, key_pem: &str) -> anyhow::Result<Self> {
-        let key = KeyPair::from_pem(key_pem)?;
-        let params = CertificateParams::from_ca_cert_pem(cert_pem)?;
-        let cert = params.self_signed(&key)?;
-        Ok(Self { cert, key })
-    }
-
-    /// Create from PEM files on disk.
-    pub fn from_pem_files(
-        cert_path: impl AsRef<std::path::Path>,
-        key_path: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<Self> {
-        let cert_pem = std::fs::read_to_string(cert_path)?;
-        let key_pem = std::fs::read_to_string(key_path)?;
-        Self::from_pem(&cert_pem, &key_pem)
-    }
-
-    /// Generate a new self-signed CA certificate and key pair.
-    pub fn generate() -> anyhow::Result<Self> {
-        let mut params = CertificateParams::default();
-        params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Noxy CA");
-        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-
-        let key = KeyPair::generate()?;
-        let cert = params.self_signed(&key)?;
-        Ok(Self { cert, key })
-    }
-
-    /// Write the CA certificate and key as PEM files to disk.
-    pub fn to_pem_files(
-        &self,
-        cert_path: impl AsRef<std::path::Path>,
-        key_path: impl AsRef<std::path::Path>,
-    ) -> anyhow::Result<()> {
-        std::fs::write(cert_path, self.cert.pem())?;
-        std::fs::write(key_path, self.key.serialize_pem())?;
-        Ok(())
-    }
-
-    /// Generate a leaf certificate for the given hostname, signed by this CA.
-    pub fn generate_cert(
-        &self,
-        hostname: &str,
-    ) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
-        let mut params = CertificateParams::new(vec![hostname.to_string()])?;
-        params.is_ca = IsCa::NoCa;
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, hostname);
-
-        let key_pair = KeyPair::generate()?;
-        let key_der = PrivateKeyDer::Pkcs8(key_pair.serialized_der().to_vec().into());
-        let cert = params.signed_by(&key_pair, &self.cert, &self.key)?;
-        let cert_der = cert.der().clone();
-
-        Ok((cert_der, key_der))
-    }
-}
-
 #[derive(Clone)]
 enum ProxyMode {
     Forward {
-        ca: Arc<CertificateAuthority>,
-        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        mitm_acceptor: Arc<ServerConfig>,
         credentials: Option<Arc<Vec<(String, String)>>>,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
     },
@@ -584,10 +512,11 @@ impl ProxyBuilder {
                 None
             };
             ProxyMode::Forward {
-                ca: Arc::new(ca),
-                server_config_cache: Arc::new(Mutex::new(lru::LruCache::new(
-                    NonZeroUsize::new(1024).unwrap(),
-                ))),
+                mitm_acceptor: {
+                    let mut config = rustls_mitm::MitmCertResolver::new(ca).into_server_config();
+                    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                    Arc::new(config)
+                },
                 credentials: if self.credentials.is_empty() {
                     None
                 } else {
@@ -842,36 +771,6 @@ impl Proxy {
         Ok(())
     }
 
-    fn server_config_for(
-        ca: &CertificateAuthority,
-        cache: &Mutex<lru::LruCache<String, Arc<ServerConfig>>>,
-        hostname: &str,
-    ) -> anyhow::Result<Arc<ServerConfig>> {
-        // Fast path: hit cache under a short lock.
-        {
-            let mut cache = cache.lock().unwrap();
-            if let Some(config) = cache.get(hostname) {
-                return Ok(config.clone());
-            }
-        }
-
-        // Miss path: generate certificate/config outside the cache lock.
-        let (cert_der, key_der) = ca.generate_cert(hostname)?;
-        let mut config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert_der], key_der)?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let config = Arc::new(config);
-
-        // Re-check in case another task inserted while we were generating.
-        let mut cache = cache.lock().unwrap();
-        if let Some(existing) = cache.get(hostname) {
-            return Ok(existing.clone());
-        }
-        cache.put(hostname.to_string(), config.clone());
-        Ok(config)
-    }
-
     /// Handle a single CONNECT tunnel on an already-accepted stream.
     pub async fn handle_connection(
         &self,
@@ -895,16 +794,14 @@ impl Proxy {
     ) -> anyhow::Result<()> {
         match &self.mode {
             ProxyMode::Forward {
-                ca,
-                server_config_cache,
+                mitm_acceptor,
                 credentials,
                 tls_acceptor,
             } => {
                 self.handle_forward_connection(
                     stream,
                     shutdown_rx,
-                    ca.clone(),
-                    server_config_cache.clone(),
+                    mitm_acceptor.clone(),
                     credentials.clone(),
                     tls_acceptor.clone(),
                 )
@@ -987,15 +884,14 @@ impl Proxy {
         &self,
         stream: TcpStream,
         shutdown_rx: tokio::sync::watch::Receiver<bool>,
-        ca: Arc<CertificateAuthority>,
-        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        mitm_acceptor: Arc<ServerConfig>,
         credentials: Option<Arc<Vec<(String, String)>>>,
         tls_acceptor: Option<Arc<TlsAcceptor>>,
     ) -> anyhow::Result<()> {
         if let Some(acceptor) = tls_acceptor {
             let tls_stream = acceptor.accept(stream).await?;
             let (hyper_service, client_tls) = {
-                let handshake = self.handshake(tls_stream, ca, server_config_cache, credentials);
+                let handshake = self.handshake(tls_stream, mitm_acceptor, credentials);
                 if let Some(timeout) = self.handshake_timeout {
                     tokio::time::timeout(timeout, handshake)
                         .await
@@ -1008,7 +904,7 @@ impl Proxy {
                 .await
         } else {
             let (hyper_service, client_tls) = {
-                let handshake = self.handshake(stream, ca, server_config_cache, credentials);
+                let handshake = self.handshake(stream, mitm_acceptor, credentials);
                 if let Some(timeout) = self.handshake_timeout {
                     tokio::time::timeout(timeout, handshake)
                         .await
@@ -1050,8 +946,7 @@ impl Proxy {
     async fn handshake<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static>(
         &self,
         stream: S,
-        ca: Arc<CertificateAuthority>,
-        server_config_cache: Arc<Mutex<lru::LruCache<String, Arc<ServerConfig>>>>,
+        mitm_acceptor: Arc<ServerConfig>,
         credentials: Option<Arc<Vec<(String, String)>>>,
     ) -> anyhow::Result<(
         HyperServiceAdapter,
@@ -1152,8 +1047,7 @@ impl Proxy {
         );
         tracing::debug!("CONNECT");
 
-        let server_config = Self::server_config_for(&ca, &server_config_cache, host)?;
-        let acceptor = TlsAcceptor::from(server_config);
+        let acceptor = TlsAcceptor::from(mitm_acceptor);
         let client_tls = acceptor.accept(TokioIo::new(upgraded)).await?;
 
         let authority: ::http::uri::Authority = format!("{host}:{port}").parse()?;

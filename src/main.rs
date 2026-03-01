@@ -181,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cli.generate {
-        let ca = noxy::CertificateAuthority::generate()?;
+        let ca = noxy::CertificateAuthority::generate_with_cn("Noxy CA")?;
         ca.to_pem_files(&cli.cert, &cli.key)?;
         tracing::info!(path = %cli.cert, "generated CA certificate");
         tracing::info!(path = %cli.key, "generated CA private key");

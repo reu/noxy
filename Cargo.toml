@@ -26,6 +26,7 @@ redis = ["dep:redis"]
 
 [dependencies]
 anyhow = "1"
+rustls-mitm = "0.1"
 bytes = "1"
 clap = { version = "4", features = ["derive"], optional = true }
 deno_core = { version = "0.385", optional = true }
@@ -48,12 +49,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optio
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 rustls-pemfile = "2"
 rand = "0.9"
-rcgen = { version = "0.13", features = ["x509-parser"] }
 serde = { version = "1", features = ["derive"], optional = true }
 toml = { version = "0.8", optional = true }
 base64 = "0.22"
 webpki-roots = "0.26"
-lru = "0.16.3"
 matchit = "0.8"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 regex = "1"

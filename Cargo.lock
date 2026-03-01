@@ -2456,7 +2456,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "lru",
  "matchit",
  "rand 0.9.2",
  "rcgen",
@@ -2464,6 +2463,7 @@ dependencies = [
  "regex",
  "reqwest",
  "rustls",
+ "rustls-mitm",
  "rustls-pemfile",
  "serde",
  "testcontainers",
@@ -2927,7 +2927,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -3325,6 +3325,17 @@ dependencies = [
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-mitm"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b26bc3ba3f8b03d481917acd785a11279189a78f17b9215c5a25d7a82697437a"
+dependencies = [
+ "lru",
+ "rcgen",
+ "rustls",
 ]
 
 [[package]]
