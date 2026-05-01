@@ -7,7 +7,8 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ### Entry point (`src/main.rs`)
 - `main()` — CLI interface (behind `cli` feature), loads CA cert/key or upstream URL, builds proxy, runs accept loop
 - CA generation via `--generate` flag
-- `--upstream <URL>` enables reverse proxy mode; `--tls-cert`/`--tls-key` for client-facing TLS
+- `--upstream <URL>` enables reverse proxy mode (sets `config.reverse_proxy`); `--tls-cert`/`--tls-key` for client-facing TLS
+- `--config <path>` loads a KDL config file; CLI middleware flags append unconditional rule nodes onto `config.body` after the file is loaded
 
 ### HTTP types and forwarding (`src/http.rs`)
 - `Body` — `BoxBody<Bytes, BoxError>`, supports both buffered and streaming access
@@ -36,6 +37,31 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 - TypeScript transpiled at construction time via `deno_ast`
 - JS runtime shim (`script_runtime.js`) provides `Headers`, `Request`, `Response` classes and the `__noxy_handle` orchestrator
 - User script exports a default async function receiving `(req, respond)` — `respond` forwards upstream, returning without it short-circuits
+
+### Config (`src/config.rs`, behind `config` feature)
+KDL config (parsed via `knus` 3.x, KDL 1.x syntax — `true`/`false`, **not** `#true`/`#false`). Top-level holds globals (`port`, `bind`, `ca`, `tls`, `reverse-proxy`, timeouts, `credential` repeated, optional `redis`) plus a `body: Vec<RuleNode>` of rule nodes. The body is a recursive tree: rule nodes are either match scopes (`match`/`host`/`path`/`method`/`methods`) that AND-compose their predicates with enclosing matches, or middleware leaves.
+
+**Two-pass compilation in `into_builder`:**
+1. `walk_body` walks the rule tree, collecting each leaf into a `Decl` carrying its tree-path (indices through enclosing matches), scope predicate, and the leaf `RuleNode` value.
+2. `resolve_exclusions` finds same-kind decls where one's path is a strict prefix of another's; the inner ones contribute their scope predicates to the outer's `excluded_preds` set. Same-kind comparison uses `std::mem::discriminant(&decl.leaf)` — no parallel kind-tag enum.
+3. `emit_decl` is a thin dispatcher: for each `Decl`, compute `effective_predicate = scope_pred AND NOT (any exclusion)`, then dispatch into `Rule::emit` on the leaf config.
+
+**`Rule` trait** — every leaf config (`LogConfig`, `LatencyConfig`, `BlockConfig`, …) implements this:
+```rust
+trait Rule {
+    fn is_exclusive(&self) -> bool { false }
+    fn emit(self, builder: ProxyBuilder, ctx: &EmitCtx<'_>) -> anyhow::Result<ProxyBuilder>;
+}
+```
+`is_exclusive` controls shadowing (default: additive). `emit` constructs the actual tower layer (or route, for `UpstreamConfig`) and applies it via `apply_layer` using `ctx.pred`.
+
+**Exclusive vs additive (shadowing model):**
+- Exclusive (innermost-wins, outer carved out): `log`, `latency`, `bandwidth`, `fault`, `retry`, `circuit-breaker`, `respond`. Inner declaration replaces outer for matching requests.
+- Additive (all stack): `block`, all six `*-request-header` / `*-response-header` ops, `rewrite-path`, `rewrite-path-regex`, `rate-limit`, `sliding-window`, `upstream`, `script`. (`rate-limit` and `sliding-window` are technically additive because most-restrictive-wins is already correct semantics; `upstream` routes via the Router's first-match-wins.)
+
+**Path matching:** `path "/v1"` is exact match. `path "/v1/"` (trailing slash) means "subtree-including-self" — matches `/v1`, `/v1/foo`, `/v1/foo/bar`. `path "/v1/**"` matches `/v1/foo` and below but not `/v1` itself. There is no `path-prefix` field anymore; trailing-slash is the convention.
+
+**Config alias nodes:** `host "X" { ... }`, `path "Y" { ... }`, `method "GET" { ... }`, and variadic `methods "GET" "POST" { ... }` desugar to the corresponding `match` block. Per-op header types (`SetRequestHeader`, `AppendRequestHeader`, `RemoveRequestHeader`, `SetResponseHeader`, `AppendResponseHeader`, `RemoveResponseHeader`) and rewrite types (`RewritePath`, `RewritePathRegex`) are all dedicated structs — no shared `HeaderEntry` / `RewriteSpec`, since each variant needs its own `impl Rule`.
 
 ## TODO
 
@@ -72,12 +98,20 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 Use `src/foo.rs` + `src/foo/bar.rs` layout instead of `src/foo/mod.rs`. This applies everywhere, including `tests/` — use `tests/common.rs` not `tests/common/mod.rs`.
 
 ### Middleware checklist
-Every middleware should support all five surfaces:
-1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `http_layer()`
-2. **ProxyBuilder helper** — convenience method like `.rate_limit(30, Duration::from_secs(1))`
-3. **TOML config** — `rate_limit = { count = 30, window = "1s" }` in `[[rules]]` (`src/config.rs`)
+Every middleware should support all five surfaces. Adding one touches:
+
+1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `http_layer()` (in `src/middleware/<name>.rs`)
+2. **ProxyBuilder helper** — convenience method like `.rate_limit(30, Duration::from_secs(1))` (in `src/lib.rs`)
+3. **KDL config** (`src/config.rs`):
+   - Define a `<Name>Config` struct with `#[derive(knus::Decode)]`
+   - Add a `RuleNode::<Name>(<Name>Config)` variant
+   - Add the dispatch arm in `emit_decl` (one line: `RuleNode::<Name>(c) => c.emit(builder, &ctx)`)
+   - Add the dispatch arm in `rule_is_exclusive` (one line: `RuleNode::<Name>(c) => c.is_exclusive()`)
+   - Write `impl Rule for <Name>Config { ... }` — all per-middleware logic (exclusivity, layer construction) lives here
 4. **CLI flag** — e.g. `--rate-limit 30/1s` (`src/main.rs`)
-5. **README** — update the features list, CLI options, example config, and rules table
+5. **README** — update the features list, CLI options, example config, and the relevant rule-nodes table
+
+When deciding shadowing for a new middleware: override `is_exclusive(&self) -> bool { true }` if a deeper redeclaration should *replace* the outer one (typical for layers whose effects compound: latency, fault rates, body logging). Leave the default `false` if effects should naturally stack.
 
 ### Middleware design
 - Prefer general, composable APIs over narrow ones. Middleware that operates on a per-request basis should accept a key function (`Fn(&Request<Body>) -> String`) so users can partition state by any criteria (global, per-host, per-header, per-API-key, etc.)
