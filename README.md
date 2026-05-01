@@ -13,7 +13,7 @@ An HTTP proxy with a pluggable middleware pipeline. Forward mode intercepts HTTP
 - **Built-in middleware** -- traffic logging, header modification, URL rewriting, block list, latency injection, bandwidth throttling, fault injection, rate limiting, sliding window rate limiting, retry with exponential backoff and retry budget, circuit breaker, fixed responses, and TypeScript scripting
 - **Redis backend** -- optional Redis-backed state for rate limiting, sliding window, and circuit breaker middleware. Enables shared state across multiple proxy instances for horizontal scaling. Falls back to in-memory on Redis errors. (`redis` feature)
 - **Conditional rules** -- apply middleware only to requests matching a host, path, or HTTP method (supports glob patterns: `*`, `**`, `?`, `[a-z]`)
-- **TOML config file** -- configure the proxy and middleware rules declaratively
+- **KDL config file** -- configure the proxy and middleware rules declaratively, with nested `match` blocks for layered rules
 - **Upstream connection pooling** -- reuses TLS connections to upstream servers across client tunnels. HTTP/2 connections are multiplexed; HTTP/1.1 connections are recycled from an idle pool.
 - HTTP/1.1 and HTTP/2 support (auto-negotiated via ALPN)
 - Streaming bodies -- middleware can process data as it arrives without buffering
@@ -259,7 +259,7 @@ The CLI provides flags for common middleware without needing a config file.
 Usage: noxy [OPTIONS]
 
 Options:
-      --config <CONFIG>        Path to TOML config file
+      --config <CONFIG>        Path to KDL config file
       --cert <CERT>            Path to CA certificate PEM file [default: ca-cert.pem]
       --key <KEY>              Path to CA private key PEM file [default: ca-key.pem]
   -p, --port <PORT>            Port to listen on [default: 8080]
@@ -387,231 +387,235 @@ noxy --upstream http://localhost:3000 --redis-url redis://localhost:6379 --rate-
 
 ## Config File
 
-For conditional rules and more complex setups, use a TOML config file.
+For conditional rules and more complex setups, use a [KDL](https://kdl.dev) config file.
 
 ```bash
-noxy --config proxy.toml
+noxy --config proxy.kdl
 ```
 
 CLI flags override config file settings for global options (port, bind address, CA paths, etc.) and append additional unconditional rules.
 
+A config has top-level globals (`port`, `bind`, `ca`, …), an optional list of `credential` entries, and a body of rule nodes. Rule nodes are either middleware leaves (`log`, `latency`, `rate-limit`, …) or `match` blocks (with aliases `host`, `path`, `method`, `methods`) that scope nested rules to requests satisfying their predicate. Nested matches AND naturally — `host "x" { path "/y" { … } }` is the same as `match host="x" path="/y" { … }`.
+
 ### Reverse proxy config
 
-```toml
-port = 8080
-upstream = "http://localhost:3000"
+```kdl
+port 8080
+reverse-proxy "http://localhost:3000"
 
-# Optional: serve HTTPS to clients
-# [tls]
-# cert = "server.pem"
-# key = "server-key.pem"
+// Optional: serve HTTPS to clients
+// tls cert="server.pem" key="server-key.pem"
 
-# Optional: use Redis for distributed middleware state (requires redis feature)
-# [redis]
-# url = "redis://localhost:6379"
-# prefix = "noxy:"
+// Optional: use Redis for distributed middleware state (requires redis feature)
+// redis url="redis://localhost:6379"
 
-[[rules]]
-log = true
-
-[[rules]]
-rate_limit = { count = 100, window = "1s" }
+log
+rate-limit count=100 window="1s"
 ```
 
 ### Multi-upstream routing config
 
-```toml
-port = 8080
-upstream = "http://default:3000"
+```kdl
+port 8080
+reverse-proxy "http://default:3000"
 
-# Route /api to a dedicated backend with rate limiting
-[[rules]]
-match = { path_prefix = "/api" }
-upstream = "http://api:8080"
-rate_limit = { count = 100, window = "1s" }
+// Route /api to a dedicated backend with rate limiting
+path "/api/" {
+    upstream "http://api:8080"
+    rate-limit count=100 window="1s"
+}
 
-# Load balance /static across two CDN nodes
-[[rules]]
-match = { path_prefix = "/static" }
-upstream = ["http://cdn1:9000", "http://cdn2:9000"]
-balance = "round-robin"
+// Load balance /static across two CDN nodes
+path "/static/" {
+    upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
+}
 
-# Random selection for /images
-[[rules]]
-match = { path_prefix = "/images" }
-upstream = ["http://img1:9000", "http://img2:9000"]
-balance = "random"
+// Random selection for /images
+path "/images/" {
+    upstream "http://img1:9000" "http://img2:9000" balance="random"
+}
 ```
 
 ### Forward proxy config
 
-```toml
-port = 8080
+```kdl
+port 8080
+ca cert="ca-cert.pem" key="ca-key.pem"
 
-[ca]
-cert = "ca-cert.pem"
-key = "ca-key.pem"
+// accept-invalid-upstream-certs true
+// pool-max-idle-per-host 8
+// pool-idle-timeout "90s"
 
-# accept_invalid_upstream_certs = true
-# pool_max_idle_per_host = 8
-# pool_idle_timeout = "90s"
+// Log all traffic
+log
 
-# Log all traffic
-[[rules]]
-log = true
+// Log with request/response bodies
+// log bodies=true
 
-# Log with request/response bodies
-# [[rules]]
-# log = { bodies = true }
+// Add 200ms latency to API requests
+path "/api/" {
+    latency "200ms"
+}
 
-# Add 200ms latency to API requests
-[[rules]]
-match = { path_prefix = "/api" }
-latency = "200ms"
+// Simulate slow downloads with random latency and bandwidth limit
+path "/downloads/" {
+    latency "50ms..200ms"
+    bandwidth 10240
+}
 
-# Simulate slow downloads with random latency and bandwidth limit
-[[rules]]
-match = { path_prefix = "/downloads" }
-latency = "50ms..200ms"
-bandwidth = 10240
+// Inject faults on a specific endpoint
+path "/flaky" {
+    fault error-rate=0.5 abort-rate=0.02
+}
 
-# Inject faults on a specific endpoint
-[[rules]]
-match = { path = "/flaky" }
-fault = { error_rate = 0.5, abort_rate = 0.02 }
+// Mock a health check endpoint
+path "/health" {
+    respond body="ok"
+}
 
-# Mock a health check endpoint
-[[rules]]
-match = { path = "/health" }
-respond = { body = "ok" }
+// Rate limit: 30 requests per second globally
+rate-limit count=30 window="1s"
 
-# Rate limit: 30 requests per second globally
-[[rules]]
-rate_limit = { count = 30, window = "1s" }
+// Rate limit: 1500 requests per minute, per host, with burst of 100
+rate-limit count=1500 window="60s" burst=100 per-host=true
 
-# Rate limit: 1500 requests per minute, per host, with burst of 100
-[[rules]]
-rate_limit = { count = 1500, window = "60s", burst = 100, per_host = true }
+// Sliding window: hard-cap 10 requests per second (no burst, no smoothing)
+sliding-window count=10 window="1s"
 
-# Sliding window: hard-cap 10 requests per second (no burst, no smoothing)
-[[rules]]
-sliding_window = { count = 10, window = "1s" }
+// Sliding window: per-host, 500 requests per minute
+sliding-window count=500 window="60s" per-host=true
 
-# Sliding window: per-host, 500 requests per minute
-[[rules]]
-sliding_window = { count = 500, window = "60s", per_host = true }
+// Retry failed requests (429, 502, 503, 504) up to 3 times
+retry max-retries=3 backoff="1s" max-replay-body-bytes=1048576
 
-# Retry failed requests (429, 502, 503, 504) up to 3 times
-[[rules]]
-retry = { max_retries = 3, backoff = "1s", max_replay_body_bytes = 1048576 }
+// Retry only 503s with custom statuses, scoped to /api
+path "/api/" {
+    retry max-retries=5 backoff="500ms" {
+        statuses 503
+    }
+}
 
-# Retry only 503s with custom statuses
-[[rules]]
-match = { path_prefix = "/api" }
-retry = { max_retries = 5, backoff = "500ms", statuses = [503] }
+// Retry with budget: at most 20% of requests can be retries (prevents retry storms)
+retry max-retries=3 {
+    budget ratio=0.2 window="10s" min-retries=30
+}
 
-# Retry with budget: at most 20% of requests can be retries (prevents retry storms)
-[[rules]]
-retry = { max_retries = 3, budget = 0.2, budget_window = "10s", budget_min_retries = 30 }
+// Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
+circuit-breaker threshold=5 recovery="30s"
 
-# Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
-[[rules]]
-circuit_breaker = { threshold = 5, recovery = "30s" }
+// Per-host circuit breaker with 2 half-open probes
+circuit-breaker threshold=3 recovery="10s" half-open-probes=2 per-host=true
 
-# Per-host circuit breaker with 2 half-open probes
-[[rules]]
-circuit_breaker = { threshold = 3, recovery = "10s", half_open_probes = 2, per_host = true }
+// Circuit breaker with local cache to reduce Redis round-trips (Redis only)
+circuit-breaker threshold=5 recovery="30s" cache-ttl="100ms"
 
-# Circuit breaker with local cache to reduce Redis round-trips (Redis only)
-[[rules]]
-circuit_breaker = { threshold = 5, recovery = "30s", cache_ttl = "100ms" }
+// Add a request header and strip a response header
+set-request-header "x-proxy" "noxy"
+remove-response-header "server"
 
-# Add a request header and strip a response header
-[[rules]]
-request_headers = { set = { "x-proxy" = "noxy" } }
-response_headers = { remove = ["server"] }
+// Add API version header to /api requests
+path "/api/" {
+    set-request-header "x-api-version" "2"
+}
 
-# Add API version header to /api requests
-[[rules]]
-match = { path_prefix = "/api" }
-request_headers = { set = { "x-api-version" = "2" } }
+// Rewrite request paths using matchit patterns
+rewrite-path "/api/v1/{*rest}" "/v2/{rest}"
 
-# Rewrite request paths using matchit patterns
-[[rules]]
-url_rewrite = { pattern = "/api/v1/{*rest}", replace = "/v2/{rest}" }
+// Rewrite request paths using regex
+rewrite-path-regex "/api/v\\d+/(.*)" "/latest/$1"
 
-# Rewrite request paths using regex
-[[rules]]
-url_rewrite = { regex = "/api/v\\d+/(.*)", replace = "/latest/$1" }
+// Block requests to tracking domains and admin paths
+block {
+    host "*.tracking.com"
+    host "ads.example.com"
+    path "/admin/*"
+}
 
-# Block requests to tracking domains and admin paths
-[[rules]]
-block = { hosts = ["*.tracking.com", "ads.example.com"], paths = ["/admin/*"] }
+// Block with custom status and body
+block {
+    host "internal.corp.com"
+    response status=404 body="not found"
+}
 
-# Block with custom status and body
-[[rules]]
-block = { hosts = ["internal.corp.com"], status = 404, body = "not found" }
+// Run a TypeScript middleware script (requires scripting feature)
+// script "middleware.ts"
 
-# Run a TypeScript middleware script (requires scripting feature)
-# [[rules]]
-# script = { file = "middleware.ts" }
+// Run a script with a shared V8 isolate across all connections, scoped to /api
+// path "/api/" {
+//     script "api_middleware.ts" shared=true
+// }
 
-# Run a script with a shared V8 isolate across all connections
-# [[rules]]
-# match = { path_prefix = "/api" }
-# script = { file = "api_middleware.ts", shared = true }
+// Return 503 for all paths under /fail
+path "/fail/" {
+    respond status=503 body="service unavailable"
+}
 
-# Return 503 for all paths under /fail
-[[rules]]
-match = { path_prefix = "/fail" }
-respond = { status = 503, body = "service unavailable" }
+// Glob patterns in match conditions
+// Match any subdomain of example.com
+host "*.example.com" {
+    latency "100ms"
+}
 
-# Glob patterns in match conditions
-# Match any subdomain of example.com
-[[rules]]
-match = { host = "*.example.com" }
-latency = "100ms"
+// Match any single-segment path under /api/
+path "/api/*/users" {
+    rate-limit count=10 window="1s"
+}
 
-# Match any single-segment path under /api/
-[[rules]]
-match = { path = "/api/*/users" }
-rate_limit = { count = 10, window = "1s" }
+// Match all paths recursively under /static/
+path "/static/**" {
+    set-response-header "cache-control" "public, max-age=86400"
+}
 
-# Match all paths recursively under /static/
-[[rules]]
-match = { path = "/static/**" }
-response_headers = { set = { "cache-control" = "public, max-age=86400" } }
-
-# Match by HTTP method
-[[rules]]
-match = { methods = ["POST", "PUT", "DELETE"], path_prefix = "/api" }
-rate_limit = { count = 10, window = "1s" }
+// Match by HTTP method, scoped to /api
+methods "POST" "PUT" "DELETE" {
+    path "/api/" {
+        rate-limit count=10 window="1s"
+    }
+}
 ```
 
-### Rules
+### Rule nodes
 
-Each rule has an optional `match` condition and one or more middleware configs. Rules without a `match` apply to all requests.
+The body of a config is a sequence of rule nodes. Match nodes scope their nested children to requests satisfying a predicate; middleware nodes apply directly. Match nodes nest, AND-ing predicates as you go deeper.
 
-| Field       | Description                                              |
-|-------------|----------------------------------------------------------|
-| `name`      | Stable identifier for Redis key scoping (e.g. `"api-limiter"`). When set, used instead of the rule's positional index so Redis state survives rule reordering. Must be unique and non-empty. Only relevant when `[redis]` is configured. |
-| `match`     | `{ host = "*.example.com", path = "/api/*/users" }`, `{ path_prefix = "/prefix" }`, or `{ methods = ["GET", "POST"] }` — `host` and `path` support glob patterns (`*`, `**`, `?`, `[a-z]`); `methods` filters by HTTP method (case-insensitive) |
-| `upstream`  | `"http://api:8080"` or `["http://a:8080", "http://b:8080"]` -- route matched requests to a different upstream |
-| `balance`   | `"round-robin"` or `"random"` -- load balancing strategy for multi-upstream rules (default: round-robin) |
-| `url_rewrite` | `{ pattern = "/old/{*rest}", replace = "/new/{rest}" }` or `{ regex = "/v\\d+/(.*)", replace = "/latest/$1" }` -- rewrite request paths |
-| `block`     | `{ hosts = ["*.tracking.com"], paths = ["/admin/*"] }` -- optional `status` and `body` fields (default: 403 empty) |
-| `log`       | `true` or `{ bodies = true }`                            |
-| `latency`   | `"200ms"`, `"1s"`, or `"100ms..500ms"` for random range  |
-| `bandwidth` | Bytes per second throughput limit                         |
-| `fault`     | `{ error_rate = 0.5, abort_rate = 0.02, error_status = 503 }` |
-| `rate_limit` | `{ count = 30, window = "1s" }` -- optional `burst` and `per_host` fields |
-| `sliding_window` | `{ count = 10, window = "1s" }` -- hard-cap with no burst; optional `per_host` |
-| `retry`     | `{ max_retries = 3, backoff = "1s" }` -- retry on 429/502/503/504; optional `statuses`, `max_replay_body_bytes`, `max_backoff`, `budget`, `budget_window`, `budget_min_retries` |
-| `circuit_breaker` | `{ threshold = 5, recovery = "30s" }` -- trips after consecutive 5xx failures; optional `half_open_probes`, `per_host`, and `cache_ttl` (Redis only, caches Closed/Open state locally) |
-| `request_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify request headers |
-| `response_headers` | `{ set = { "name" = "value" }, append = { "name" = "value" }, remove = ["name"] }` -- modify response headers |
-| `respond`   | `{ body = "ok", status = 200 }` -- returns a fixed response without forwarding upstream |
-| `script`    | `{ file = "middleware.ts" }` -- optional `shared = true` and `max_body_bytes = 1048576` (requires `scripting` feature) |
+#### Match nodes
+
+| Node          | Form                                              | Notes |
+|---------------|---------------------------------------------------|-------|
+| `match`       | `match host="..." path="..." method="..." { ... }` | Multi-field predicate. All fields AND together. |
+| `host`        | `host "*.example.com" { ... }`                    | Single-host alias. Glob supported. |
+| `path`        | `path "/api/" { ... }`                            | Single-path alias. Glob supported; trailing `/` means subtree-including-self. |
+| `method`      | `method "GET" { ... }`                            | Single-method alias. |
+| `methods`     | `methods "GET" "POST" { ... }`                    | Multi-method alias (variadic). |
+
+Match properties: `host`, `path`, `method`, and `header { ... }` (child node, name + value). Each match node also accepts an optional `name="..."` for stable Redis key scoping.
+
+Path globs use `*` (single segment), `**` (any depth), `?` (single char), `[a-z]` (character class). Trailing `/` on a path turns it into a "subtree-including-self" match: `path "/v1/"` matches `/v1`, `/v1/foo`, `/v1/foo/bar`.
+
+#### Middleware nodes
+
+| Node                         | Form                                                                    | Notes |
+|------------------------------|-------------------------------------------------------------------------|-------|
+| `log`                        | `log` or `log bodies=true`                                              | Traffic logger. |
+| `latency`                    | `latency "200ms"` or `latency "100ms..500ms"`                           | Fixed or random range. |
+| `bandwidth`                  | `bandwidth 10240`                                                       | Bytes/sec throughput limit. |
+| `fault`                      | `fault error-rate=0.5 abort-rate=0.02 error-status=503`                | Random faults. |
+| `rate-limit`                 | `rate-limit count=30 window="1s" burst=100 per-host=true`              | Token bucket. |
+| `sliding-window`             | `sliding-window count=10 window="1s" per-host=true`                    | Hard-cap, no burst. |
+| `retry`                      | `retry max-retries=3 backoff="1s" max-backoff="30s" max-replay-body-bytes=1048576 { statuses 503 429; budget ratio=0.2 window="10s" min-retries=30 }` | Retry on 429/5xx by default. `statuses` and `budget` are child nodes. |
+| `circuit-breaker`            | `circuit-breaker threshold=5 recovery="30s" half-open-probes=2 per-host=true cache-ttl="100ms"` | `cache-ttl` is Redis-only. |
+| `respond`                    | `respond body="ok" status=200`                                          | Short-circuits without forwarding upstream. |
+| `upstream`                   | `upstream "http://a:80" "http://b:80" balance="round-robin"`           | Variadic URLs; `balance="round-robin"` (default) or `"random"`. Routes matched requests to the given backend(s). |
+| `block`                      | `block { host "*.tracking.com"; path "/admin/*"; response status=404 body="not found" }` | `host` / `path` children stack; `response` child is optional (default 403). |
+| `set-request-header`         | `set-request-header "x-proxy" "noxy"`                                  | Sets one request header. |
+| `append-request-header`      | `append-request-header "via" "noxy"`                                   | Appends one request header. |
+| `remove-request-header`      | `remove-request-header "x-internal"`                                   | Removes one request header. |
+| `set-response-header`        | `set-response-header "x-served-by" "noxy"`                             | Sets one response header. |
+| `append-response-header`     | `append-response-header "via" "noxy"`                                  | Appends one response header. |
+| `remove-response-header`     | `remove-response-header "server"`                                      | Removes one response header. |
+| `rewrite-path`               | `rewrite-path "/api/v1/{*rest}" "/v2/{rest}"`                          | matchit-pattern rewrite. |
+| `rewrite-path-regex`         | `rewrite-path-regex "/v\\d+/(.*)" "/latest/$1"`                        | Regex rewrite. |
+| `script`                     | `script "middleware.ts" shared=true max-body-bytes=1048576`            | Requires `scripting` feature. |
 
 ## Scripting Middleware
 
@@ -698,21 +702,17 @@ Stateful middleware (rate limiting, sliding window, circuit breaker) keeps state
 cargo install noxy --features cli,redis
 ```
 
-### TOML config
+### KDL config
 
-```toml
-[redis]
-url = "redis://localhost:6379"
-# prefix = "noxy:"    # optional key prefix (default: "noxy:")
+```kdl
+redis url="redis://localhost:6379"
+// redis url="redis://localhost:6379" prefix="noxy:"
 
-[[rules]]
-rate_limit = { count = 100, window = "1s" }
-
-[[rules]]
-circuit_breaker = { threshold = 5, recovery = "30s" }
+rate-limit count=100 window="1s"
+circuit-breaker threshold=5 recovery="30s"
 ```
 
-When `[redis]` is configured, all `rate_limit`, `sliding_window`, and `circuit_breaker` rules automatically use Redis. If Redis becomes unreachable, each store transparently falls back to an in-memory store and logs a warning.
+When `redis` is configured, all `rate-limit`, `sliding-window`, and `circuit-breaker` rules automatically use Redis. If Redis becomes unreachable, each store transparently falls back to an in-memory store and logs a warning.
 
 ### CLI
 
@@ -855,25 +855,22 @@ noxy --upstream http://localhost:8080 \
      --rate-limit 1000/60s
 ```
 
-```toml
-# Multi-backend gateway via config file
-port = 443
-bind = "127.0.0.1"
-upstream = "http://web:3000"
+```kdl
+// Multi-backend gateway via config file
+port 443
+bind "127.0.0.1"
+reverse-proxy "http://web:3000"
 
-[tls]
-cert = "server.pem"
-key = "server-key.pem"
+tls cert="server.pem" key="server-key.pem"
 
-[[rules]]
-match = { path_prefix = "/api" }
-upstream = "http://api:8080"
-rate_limit = { count = 1000, window = "60s" }
+path "/api/" {
+    upstream "http://api:8080"
+    rate-limit count=1000 window="60s"
+}
 
-[[rules]]
-match = { path_prefix = "/static" }
-upstream = ["http://cdn1:9000", "http://cdn2:9000"]
-balance = "round-robin"
+path "/static/" {
+    upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
+}
 ```
 
 **Testing and development** -- inject faults, latency, or fixed responses in front of a real API to test client resilience:
@@ -885,25 +882,24 @@ noxy --upstream https://api.example.com \
      --log-bodies
 ```
 
-```toml
-# Surgical fault injection via config file
-port = 8080
-upstream = "https://api.example.com"
+```kdl
+// Surgical fault injection via config file
+port 8080
+reverse-proxy "https://api.example.com"
 
-[[rules]]
-log = { bodies = true }
+log bodies=true
 
-[[rules]]
-match = { path = "/api/checkout" }
-fault = { error_rate = 0.3, error_status = 503 }
+path "/api/checkout" {
+    fault error-rate=0.3 error-status=503
+}
 
-[[rules]]
-match = { path_prefix = "/api/search" }
-latency = "500ms..2s"
+path "/api/search/" {
+    latency "500ms..2s"
+}
 
-[[rules]]
-match = { path = "/api/health" }
-respond = { body = '{"status": "ok"}' }
+path "/api/health" {
+    respond body="{\"status\": \"ok\"}"
+}
 ```
 
 ## License

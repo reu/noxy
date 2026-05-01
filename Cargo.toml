@@ -19,7 +19,7 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [features]
-config = ["serde", "toml"]
+config = ["dep:knus"]
 cli = ["clap", "config", "tracing-subscriber"]
 scripting = ["deno_core", "deno_ast", "deno_error", "serde"]
 redis = ["dep:redis"]
@@ -50,7 +50,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 rustls-pemfile = "2"
 rand = "0.9"
 serde = { version = "1", features = ["derive"], optional = true }
-toml = { version = "0.8", optional = true }
+knus = { version = "3", optional = true }
 base64 = "0.22"
 webpki-roots = "0.26"
 matchit = "0.8"

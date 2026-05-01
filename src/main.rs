@@ -1,10 +1,14 @@
 use clap::Parser;
-use noxy::config::{ProxyConfig, RuleConfig};
+use noxy::config::{
+    BlockConfig, CircuitBreakerConfig, HeaderEntry, HeaderName, HostPattern, LatencyConfig,
+    LogConfig, PathPattern, ProxyConfig, RateLimitConfig, RetryConfig, RewriteSpec, RuleNode,
+    SlidingWindowConfig, parse_duration,
+};
 
 #[derive(Parser)]
 #[command(name = "noxy", about = "TLS man-in-the-middle proxy")]
 struct Cli {
-    /// Path to TOML config file
+    /// Path to KDL config file
     #[arg(short, long)]
     config: Option<String>,
 
@@ -83,10 +87,6 @@ struct Cli {
     /// Max backoff delay for retry exponential backoff (e.g., "30s")
     #[arg(long = "retry-max-backoff")]
     retry_max_backoff: Option<String>,
-
-    /// Retry budget: max fraction of requests that can be retries (e.g., 0.2)
-    #[arg(long = "retry-budget")]
-    retry_budget: Option<f64>,
 
     /// Circuit breaker: trip after N failures, recover after duration (e.g., "5/30s")
     #[arg(long = "circuit-breaker")]
@@ -188,23 +188,21 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Load config file or start with defaults
     let mut config = if let Some(ref path) = cli.config {
-        ProxyConfig::from_toml_file(path)?
+        ProxyConfig::from_kdl_file(path)?
     } else {
         ProxyConfig::default()
     };
 
-    // CLI overrides for global settings
     if let Some(upstream) = cli.upstream {
-        config.upstream = Some(upstream);
+        config.reverse_proxy = Some(upstream);
     }
 
     if let (Some(cert), Some(key)) = (cli.tls_cert, cli.tls_key) {
         config.tls = Some(noxy::config::TlsConfig { cert, key });
     }
 
-    if config.upstream.is_none() && config.ca.is_none() {
+    if config.reverse_proxy.is_none() && config.ca.is_none() {
         config.ca = Some(noxy::config::CaConfig {
             cert: cli.cert,
             key: cli.key,
@@ -226,10 +224,11 @@ async fn main() -> anyhow::Result<()> {
         config.pool_max_idle_per_host = Some(max);
     }
 
-    if let Some(ref timeout_str) = cli.pool_idle_timeout {
-        let d = noxy::config::parse_duration(timeout_str)
+    if let Some(timeout_str) = cli.pool_idle_timeout {
+        // Validate now, store as string for the loader.
+        parse_duration(&timeout_str)
             .map_err(|e| anyhow::anyhow!("invalid pool-idle-timeout: {e}"))?;
-        config.pool_idle_timeout = Some(noxy::config::DurationValue(d));
+        config.pool_idle_timeout = Some(timeout_str);
     }
 
     for cred in cli.credentials {
@@ -250,168 +249,122 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Convert CLI middleware flags to unconditional rules
-    let mut cli_rules = Vec::new();
-
     if cli.log || cli.log_bodies {
-        cli_rules.push(RuleConfig {
-            log: Some(if cli.log_bodies {
-                noxy::config::LogConfig::Detailed(noxy::config::LogDetailConfig { bodies: true })
-            } else {
-                noxy::config::LogConfig::Enabled(true)
-            }),
-            ..Default::default()
-        });
+        config.body.push(RuleNode::Log(LogConfig {
+            bodies: if cli.log_bodies { Some(true) } else { None },
+        }));
     }
 
     if let Some(latency_str) = cli.latency {
-        let duration_or_range: noxy::config::DurationOrRange = latency_str
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid latency value: {e}"))?;
-
-        cli_rules.push(RuleConfig {
-            latency: Some(duration_or_range),
-            ..Default::default()
-        });
+        config
+            .body
+            .push(RuleNode::Latency(LatencyConfig { value: latency_str }));
     }
 
     if let Some(bps) = cli.bandwidth {
-        cli_rules.push(RuleConfig {
-            bandwidth: Some(bps),
-            ..Default::default()
-        });
+        config
+            .body
+            .push(RuleNode::Bandwidth(noxy::config::BandwidthConfig { bps }));
     }
 
-    for rl_str in cli.rate_limits {
-        cli_rules.push(parse_rate_limit_rule(&rl_str, false)?);
+    for rl in cli.rate_limits {
+        config.body.push(parse_rate_limit(&rl, false)?);
     }
-
-    for rl_str in cli.per_host_rate_limits {
-        cli_rules.push(parse_rate_limit_rule(&rl_str, true)?);
+    for rl in cli.per_host_rate_limits {
+        config.body.push(parse_rate_limit(&rl, true)?);
     }
-
-    for sw_str in cli.sliding_windows {
-        cli_rules.push(parse_sliding_window_rule(&sw_str, false)?);
+    for sw in cli.sliding_windows {
+        config.body.push(parse_sliding_window(&sw, false)?);
     }
-
-    for sw_str in cli.per_host_sliding_windows {
-        cli_rules.push(parse_sliding_window_rule(&sw_str, true)?);
+    for sw in cli.per_host_sliding_windows {
+        config.body.push(parse_sliding_window(&sw, true)?);
     }
 
     if let Some(max_retries) = cli.retry {
-        let max_backoff = cli
-            .retry_max_backoff
-            .as_deref()
-            .map(|s| {
-                noxy::config::parse_duration(s)
-                    .map(noxy::config::DurationValue)
-                    .map_err(|e| anyhow::anyhow!("invalid retry-max-backoff: {e}"))
-            })
-            .transpose()?;
-        cli_rules.push(RuleConfig {
-            retry: Some(noxy::config::RetryConfig {
-                max_retries: Some(max_retries),
-                backoff: None,
-                max_backoff,
-                statuses: None,
-                max_replay_body_bytes: cli.retry_max_body,
-                budget: cli.retry_budget,
-                budget_window: None,
-                budget_min_retries: None,
-            }),
-            ..Default::default()
-        });
+        config.body.push(RuleNode::Retry(RetryConfig {
+            max_retries: Some(max_retries),
+            backoff: None,
+            max_backoff: cli.retry_max_backoff,
+            statuses: None,
+            max_replay_body_bytes: cli.retry_max_body,
+            budget: None,
+        }));
     }
 
     if let Some(cb_str) = cli.circuit_breaker {
-        cli_rules.push(parse_circuit_breaker_rule(&cb_str)?);
+        config.body.push(parse_circuit_breaker(&cb_str)?);
     }
 
-    {
-        let mut req_headers = noxy::config::HeaderOpsConfig::default();
-        let mut resp_headers = noxy::config::HeaderOpsConfig::default();
-
-        for h in cli.set_request_headers {
-            let (name, value) = parse_header_arg(&h)?;
-            req_headers.set.insert(name, value);
-        }
-        for name in cli.remove_request_headers {
-            req_headers.remove.push(name);
-        }
-        for h in cli.set_response_headers {
-            let (name, value) = parse_header_arg(&h)?;
-            resp_headers.set.insert(name, value);
-        }
-        for name in cli.remove_response_headers {
-            resp_headers.remove.push(name);
-        }
-
-        let has_req = !req_headers.set.is_empty() || !req_headers.remove.is_empty();
-        let has_resp = !resp_headers.set.is_empty() || !resp_headers.remove.is_empty();
-        if has_req || has_resp {
-            cli_rules.push(RuleConfig {
-                request_headers: if has_req { Some(req_headers) } else { None },
-                response_headers: if has_resp { Some(resp_headers) } else { None },
-                ..Default::default()
-            });
-        }
+    for h in cli.set_request_headers {
+        let (name, value) = parse_header_arg(&h)?;
+        config
+            .body
+            .push(RuleNode::SetRequestHeader(HeaderEntry { name, value }));
+    }
+    for name in cli.remove_request_headers {
+        config
+            .body
+            .push(RuleNode::RemoveRequestHeader(HeaderName { name }));
+    }
+    for h in cli.set_response_headers {
+        let (name, value) = parse_header_arg(&h)?;
+        config
+            .body
+            .push(RuleNode::SetResponseHeader(HeaderEntry { name, value }));
+    }
+    for name in cli.remove_response_headers {
+        config
+            .body
+            .push(RuleNode::RemoveResponseHeader(HeaderName { name }));
     }
 
     for rw in cli.rewrite_paths {
         let (pattern, replace) = rw.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("rewrite-path must be 'pattern=replacement', got '{rw}'")
         })?;
-        cli_rules.push(RuleConfig {
-            url_rewrite: Some(noxy::config::UrlRewriteConfig {
-                pattern: Some(pattern.to_string()),
-                regex: None,
-                replace: replace.to_string(),
-            }),
-            ..Default::default()
-        });
+        config.body.push(RuleNode::RewritePath(RewriteSpec {
+            pattern: pattern.to_string(),
+            replace: replace.to_string(),
+        }));
     }
-
     for rw in cli.rewrite_path_regexes {
-        let (regex, replace) = rw.split_once('=').ok_or_else(|| {
+        let (pattern, replace) = rw.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("rewrite-path-regex must be 'regex=replacement', got '{rw}'")
         })?;
-        cli_rules.push(RuleConfig {
-            url_rewrite: Some(noxy::config::UrlRewriteConfig {
-                pattern: None,
-                regex: Some(regex.to_string()),
-                replace: replace.to_string(),
-            }),
-            ..Default::default()
-        });
+        config.body.push(RuleNode::RewritePathRegex(RewriteSpec {
+            pattern: pattern.to_string(),
+            replace: replace.to_string(),
+        }));
     }
 
     if !cli.block_hosts.is_empty() || !cli.block_paths.is_empty() {
-        cli_rules.push(RuleConfig {
-            block: Some(noxy::config::BlockListConfig {
-                hosts: cli.block_hosts,
-                paths: cli.block_paths,
-                status: None,
-                body: None,
-            }),
-            ..Default::default()
-        });
+        config.body.push(RuleNode::Block(BlockConfig {
+            hosts: cli
+                .block_hosts
+                .into_iter()
+                .map(|pattern| HostPattern { pattern })
+                .collect(),
+            paths: cli
+                .block_paths
+                .into_iter()
+                .map(|pattern| PathPattern { pattern })
+                .collect(),
+            response: None,
+        }));
     }
 
     #[cfg(feature = "scripting")]
     if let Some(script_path) = cli.script {
-        cli_rules.push(RuleConfig {
-            script: Some(noxy::config::ScriptConfig {
+        config
+            .body
+            .push(RuleNode::Script(noxy::config::ScriptConfig {
                 file: script_path,
                 shared: false,
                 max_body_bytes: cli.script_max_body,
-            }),
-            ..Default::default()
-        });
+            }));
     }
 
-    config.append_rules(cli_rules);
-
-    let bind = config.bind.as_deref().unwrap_or(&cli.bind);
+    let bind = config.bind.clone().unwrap_or(cli.bind.clone());
     let port = config.port.unwrap_or(cli.port);
     let listen = format!("{bind}:{port}");
     let proxy = config.into_builder()?.build()?;
@@ -429,65 +382,50 @@ fn parse_header_arg(s: &str) -> anyhow::Result<(String, String)> {
     Ok((name.trim().to_string(), value.trim().to_string()))
 }
 
-fn parse_sliding_window_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {
+fn parse_count_window(s: &str, kind: &str) -> anyhow::Result<(u64, String)> {
     let (count_str, window_str) = s
         .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("sliding window must be count/window (e.g. 30/1s)"))?;
+        .ok_or_else(|| anyhow::anyhow!("{kind} must be count/window (e.g. 30/1s)"))?;
     let count: u64 = count_str
         .parse()
-        .map_err(|e| anyhow::anyhow!("invalid sliding window count: {e}"))?;
-    let window = noxy::config::parse_duration(window_str)
-        .map_err(|e| anyhow::anyhow!("invalid sliding window window: {e}"))?;
-
-    Ok(RuleConfig {
-        sliding_window: Some(noxy::config::SlidingWindowConfig {
-            count,
-            window: noxy::config::DurationValue(window),
-            per_host,
-        }),
-        ..Default::default()
-    })
+        .map_err(|e| anyhow::anyhow!("invalid {kind} count: {e}"))?;
+    parse_duration(window_str).map_err(|e| anyhow::anyhow!("invalid {kind} window: {e}"))?;
+    Ok((count, window_str.to_string()))
 }
 
-fn parse_circuit_breaker_rule(s: &str) -> anyhow::Result<RuleConfig> {
+fn parse_rate_limit(s: &str, per_host: bool) -> anyhow::Result<RuleNode> {
+    let (count, window) = parse_count_window(s, "rate limit")?;
+    Ok(RuleNode::RateLimit(RateLimitConfig {
+        count,
+        window,
+        burst: None,
+        per_host,
+    }))
+}
+
+fn parse_sliding_window(s: &str, per_host: bool) -> anyhow::Result<RuleNode> {
+    let (count, window) = parse_count_window(s, "sliding window")?;
+    Ok(RuleNode::SlidingWindow(SlidingWindowConfig {
+        count,
+        window,
+        per_host,
+    }))
+}
+
+fn parse_circuit_breaker(s: &str) -> anyhow::Result<RuleNode> {
     let (threshold_str, recovery_str) = s.split_once('/').ok_or_else(|| {
         anyhow::anyhow!("circuit breaker must be threshold/recovery (e.g. 5/30s)")
     })?;
     let threshold: u32 = threshold_str
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid circuit breaker threshold: {e}"))?;
-    let recovery = noxy::config::parse_duration(recovery_str)
+    parse_duration(recovery_str)
         .map_err(|e| anyhow::anyhow!("invalid circuit breaker recovery: {e}"))?;
-
-    Ok(RuleConfig {
-        circuit_breaker: Some(noxy::config::CircuitBreakerConfig {
-            threshold,
-            recovery: noxy::config::DurationValue(recovery),
-            half_open_probes: None,
-            per_host: false,
-            cache_ttl: None,
-        }),
-        ..Default::default()
-    })
-}
-
-fn parse_rate_limit_rule(s: &str, per_host: bool) -> anyhow::Result<RuleConfig> {
-    let (count_str, window_str) = s
-        .split_once('/')
-        .ok_or_else(|| anyhow::anyhow!("rate limit must be count/window (e.g. 30/1s)"))?;
-    let count: u64 = count_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid rate limit count: {e}"))?;
-    let window = noxy::config::parse_duration(window_str)
-        .map_err(|e| anyhow::anyhow!("invalid rate limit window: {e}"))?;
-
-    Ok(RuleConfig {
-        rate_limit: Some(noxy::config::RateLimitConfig {
-            count,
-            window: noxy::config::DurationValue(window),
-            burst: None,
-            per_host,
-        }),
-        ..Default::default()
-    })
+    Ok(RuleNode::CircuitBreaker(CircuitBreakerConfig {
+        threshold,
+        recovery: recovery_str.to_string(),
+        half_open_probes: None,
+        per_host: false,
+        cache_ttl: None,
+    }))
 }
