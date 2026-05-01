@@ -83,6 +83,13 @@ pub struct ForwardListener {
     #[knus(children(name = "credential"))]
     pub credentials: Vec<CredentialConfig>,
 
+    /// Listener-level redis override. Shadows any process-level `redis` for
+    /// rules running in this listener (and for the listener's portion of
+    /// global rules). Deeper match-level `redis` declarations shadow this.
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
+
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -102,6 +109,11 @@ pub struct ReverseListener {
 
     #[knus(child)]
     pub tls: Option<TlsConfig>,
+
+    /// Listener-level redis override. See [`ForwardListener::redis`].
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
 
     #[knus(children)]
     pub body: Vec<RuleNode>,
@@ -192,6 +204,11 @@ pub struct GeneralMatch {
     pub name: Option<String>,
     #[knus(child)]
     pub header: Option<HeaderMatch>,
+    /// Match-level redis override. Shadows any enclosing redis for rules in
+    /// this match's body.
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -203,6 +220,9 @@ pub struct HostMatch {
     pub host: String,
     #[knus(property)]
     pub name: Option<String>,
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -214,6 +234,9 @@ pub struct PathMatch {
     pub path: String,
     #[knus(property)]
     pub name: Option<String>,
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -225,6 +248,9 @@ pub struct MethodMatch {
     pub method: String,
     #[knus(property)]
     pub name: Option<String>,
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -236,6 +262,9 @@ pub struct MethodsMatch {
     pub methods: Vec<String>,
     #[knus(property)]
     pub name: Option<String>,
+    #[cfg(feature = "redis")]
+    #[knus(child)]
+    pub redis: Option<RedisConfig>,
     #[knus(children)]
     pub body: Vec<RuleNode>,
 }
@@ -660,8 +689,10 @@ impl ProxyConfig {
     ///
     /// Each `forward { }` and `reverse { }` block produces one
     /// [`CompiledListener`]. The top-level rule body is treated as global
-    /// rules: cloned into every listener's compile pass, with listener-level
+    /// rules: walked into every listener's compile pass, with listener-level
     /// declarations of the same exclusive kind shadowing the global one.
+    /// Redis declarations follow the same shadowing rule — process-level,
+    /// listener-level, and match-level `redis` nest naturally.
     pub fn into_listeners(self) -> anyhow::Result<Vec<CompiledListener>> {
         if self.forwards.is_empty() && self.reverses.is_empty() {
             anyhow::bail!(
@@ -680,46 +711,53 @@ impl ProxyConfig {
         };
 
         #[cfg(feature = "redis")]
-        let redis_conn = if let Some(ref redis) = self.redis {
-            let prefix = redis.prefix.as_deref().unwrap_or("noxy:");
-            Some(crate::middleware::RedisConnection::open_with_prefix(
-                &redis.url, prefix,
-            )?)
-        } else {
-            None
-        };
+        let mut redis_cache: RedisCache = Default::default();
 
-        // Walk globals once. Globals live at path = [], so any listener-internal
-        // decl (path starting with [0]) is a strict extension and shadows them.
-        let mut global_decls: Vec<Decl> = Vec::new();
-        let mut global_walk = WalkCtx {
-            preds: Vec::new(),
-            path: Vec::new(),
+        // Validate global min_scope once (a quick walk with no redis stack —
+        // we only care about which leaves are at the global level).
+        {
+            let mut probe_decls: Vec<Decl> = Vec::new();
             #[cfg(feature = "redis")]
-            scope_stack: Vec::new(),
-            #[cfg(feature = "redis")]
-            scope_counter: 0,
-        };
-        walk_body(self.body, &mut global_walk, &mut global_decls)?;
-        validate_min_scope_global(&global_decls)?;
+            let mut probe_cache: RedisCache = Default::default();
+            let mut probe = WalkCtx {
+                preds: Vec::new(),
+                path: Vec::new(),
+                #[cfg(feature = "redis")]
+                scope_stack: Vec::new(),
+                #[cfg(feature = "redis")]
+                scope_counter: 0,
+                #[cfg(feature = "redis")]
+                redis_stack: Vec::new(),
+                #[cfg(feature = "redis")]
+                redis_cache: &mut probe_cache,
+                #[cfg(not(feature = "redis"))]
+                _phantom: std::marker::PhantomData,
+            };
+            walk_body(self.body.clone(), &mut probe, &mut probe_decls)?;
+            validate_min_scope_global(&probe_decls)?;
+        }
 
         let mut listeners = Vec::new();
         for fwd in self.forwards {
             listeners.push(compile_forward(
                 fwd,
-                &global_decls,
+                &self.body,
                 &process_settings,
                 #[cfg(feature = "redis")]
-                redis_conn.as_ref(),
+                self.redis.as_ref(),
+                #[cfg(feature = "redis")]
+                &mut redis_cache,
             )?);
         }
         for rev in self.reverses {
             listeners.push(compile_reverse(
                 rev,
-                &global_decls,
+                &self.body,
                 &process_settings,
                 #[cfg(feature = "redis")]
-                redis_conn.as_ref(),
+                self.redis.as_ref(),
+                #[cfg(feature = "redis")]
+                &mut redis_cache,
             )?);
         }
 
@@ -782,33 +820,87 @@ fn apply_process_settings(
     Ok(builder)
 }
 
-fn walk_listener_body(body: Vec<RuleNode>, global_decls: &[Decl]) -> anyhow::Result<Vec<Decl>> {
-    // Globals at path=[]; listener-internal at path=[0, ...]. The strict-prefix
-    // shadowing rule treats listener-internal decls as descendants of globals.
-    let mut decls: Vec<Decl> = global_decls.to_vec();
+/// Walk globals + listener body together, into one `Vec<Decl>`. Globals
+/// live at path = [], listener-internal at path = [0, ...]. The strict-
+/// prefix shadowing rule treats listener-internal decls as descendants of
+/// globals. `initial_redis` seeds the redis stack so each decl captures the
+/// closest-enclosing connection (process default, listener override, or
+/// match-level redis pushed during the walk).
+fn walk_listener_body(
+    globals: Vec<RuleNode>,
+    body: Vec<RuleNode>,
+    #[cfg(feature = "redis")] initial_redis: Option<crate::middleware::RedisConnection>,
+    #[cfg(feature = "redis")] redis_cache: &mut RedisCache,
+) -> anyhow::Result<Vec<Decl>> {
+    let mut decls: Vec<Decl> = Vec::new();
     let mut walk = WalkCtx {
         preds: Vec::new(),
-        path: vec![0],
+        path: Vec::new(),
         #[cfg(feature = "redis")]
         scope_stack: Vec::new(),
         #[cfg(feature = "redis")]
         scope_counter: 0,
+        #[cfg(feature = "redis")]
+        redis_stack: initial_redis.into_iter().collect(),
+        #[cfg(feature = "redis")]
+        redis_cache,
+        #[cfg(not(feature = "redis"))]
+        _phantom: std::marker::PhantomData,
     };
+    // Globals: path stays at [].
+    walk_body(globals, &mut walk, &mut decls)?;
+    // Listener body: prefix listener-internal decls with [0] so they
+    // strict-extend any global decl's path.
+    walk.path.push(0);
     walk_body(body, &mut walk, &mut decls)?;
+    walk.path.pop();
     resolve_exclusions(&mut decls);
     Ok(decls)
 }
 
+/// The redis connection in effect at the listener's outermost scope.
+/// Listener-level `redis` overrides the process-level one.
+#[cfg(feature = "redis")]
+fn listener_initial_redis(
+    listener: Option<&RedisConfig>,
+    process: Option<&RedisConfig>,
+    cache: &mut RedisCache,
+) -> anyhow::Result<Option<crate::middleware::RedisConnection>> {
+    let cfg = match listener.or(process) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    let prefix = cfg.prefix.clone().unwrap_or_else(|| "noxy:".to_string());
+    let key = (cfg.url.clone(), prefix.clone());
+    if let Some(existing) = cache.get(&key) {
+        return Ok(Some(existing.clone()));
+    }
+    let conn = crate::middleware::RedisConnection::open_with_prefix(&cfg.url, &prefix)?;
+    cache.insert(key, conn.clone());
+    Ok(Some(conn))
+}
+
 fn compile_forward(
     fwd: ForwardListener,
-    global_decls: &[Decl],
+    globals: &[RuleNode],
     process: &ProcessSettings,
-    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
+    #[cfg(feature = "redis")] process_redis: Option<&RedisConfig>,
+    #[cfg(feature = "redis")] redis_cache: &mut RedisCache,
 ) -> anyhow::Result<CompiledListener> {
     let bind = fwd.bind.unwrap_or_else(|| "127.0.0.1".to_string());
     let addr = format!("{bind}:{}", fwd.port);
 
-    let decls = walk_listener_body(fwd.body, global_decls)?;
+    #[cfg(feature = "redis")]
+    let initial_redis = listener_initial_redis(fwd.redis.as_ref(), process_redis, redis_cache)?;
+
+    let decls = walk_listener_body(
+        globals.to_vec(),
+        fwd.body,
+        #[cfg(feature = "redis")]
+        initial_redis,
+        #[cfg(feature = "redis")]
+        redis_cache,
+    )?;
 
     let mut builder = crate::Proxy::builder();
     builder = apply_process_settings(builder, process)?;
@@ -821,12 +913,7 @@ fn compile_forward(
     }
 
     for decl in decls {
-        builder = emit_decl(
-            builder,
-            decl,
-            #[cfg(feature = "redis")]
-            redis,
-        )?;
+        builder = emit_decl(builder, decl)?;
     }
 
     Ok(CompiledListener {
@@ -837,14 +924,25 @@ fn compile_forward(
 
 fn compile_reverse(
     rev: ReverseListener,
-    global_decls: &[Decl],
+    globals: &[RuleNode],
     process: &ProcessSettings,
-    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
+    #[cfg(feature = "redis")] process_redis: Option<&RedisConfig>,
+    #[cfg(feature = "redis")] redis_cache: &mut RedisCache,
 ) -> anyhow::Result<CompiledListener> {
     let bind = rev.bind.unwrap_or_else(|| "127.0.0.1".to_string());
     let addr = format!("{bind}:{}", rev.port);
 
-    let decls = walk_listener_body(rev.body, global_decls)?;
+    #[cfg(feature = "redis")]
+    let initial_redis = listener_initial_redis(rev.redis.as_ref(), process_redis, redis_cache)?;
+
+    let decls = walk_listener_body(
+        globals.to_vec(),
+        rev.body,
+        #[cfg(feature = "redis")]
+        initial_redis,
+        #[cfg(feature = "redis")]
+        redis_cache,
+    )?;
 
     let mut builder = crate::Proxy::builder();
     builder = apply_process_settings(builder, process)?;
@@ -854,12 +952,7 @@ fn compile_reverse(
     }
 
     for decl in decls {
-        builder = emit_decl(
-            builder,
-            decl,
-            #[cfg(feature = "redis")]
-            redis,
-        )?;
+        builder = emit_decl(builder, decl)?;
     }
 
     Ok(CompiledListener {
@@ -1038,21 +1131,35 @@ struct Decl {
     /// one. Subtracted from `scope_pred` to produce the effective predicate.
     excluded_preds: Vec<Predicate>,
     leaf: RuleNode,
+    /// Closest enclosing redis at walk time (`None` = in-memory only).
+    /// Captured per-decl so different parts of the same listener can use
+    /// different redis connections.
+    #[cfg(feature = "redis")]
+    redis: Option<crate::middleware::RedisConnection>,
     #[cfg(feature = "redis")]
     scope_label: String,
 }
 
-struct WalkCtx {
+#[cfg(feature = "redis")]
+type RedisCache = std::collections::HashMap<(String, String), crate::middleware::RedisConnection>;
+
+struct WalkCtx<'a> {
     preds: Vec<Predicate>,
     path: Vec<usize>,
     #[cfg(feature = "redis")]
     scope_stack: Vec<String>,
     #[cfg(feature = "redis")]
     scope_counter: usize,
+    #[cfg(feature = "redis")]
+    redis_stack: Vec<crate::middleware::RedisConnection>,
+    #[cfg(feature = "redis")]
+    redis_cache: &'a mut RedisCache,
+    #[cfg(not(feature = "redis"))]
+    _phantom: std::marker::PhantomData<&'a ()>,
 }
 
 #[cfg(feature = "redis")]
-impl WalkCtx {
+impl WalkCtx<'_> {
     fn current_scope(&self) -> String {
         self.scope_stack.join(".")
     }
@@ -1065,9 +1172,29 @@ impl WalkCtx {
         });
         self.scope_stack.push(label);
     }
+
+    /// Look up or open a redis connection for `cfg`. Same `(url, prefix)`
+    /// across the config dedupes to one connection.
+    fn open_redis(
+        &mut self,
+        cfg: &RedisConfig,
+    ) -> anyhow::Result<crate::middleware::RedisConnection> {
+        let prefix = cfg.prefix.clone().unwrap_or_else(|| "noxy:".to_string());
+        let key = (cfg.url.clone(), prefix.clone());
+        if let Some(conn) = self.redis_cache.get(&key) {
+            return Ok(conn.clone());
+        }
+        let conn = crate::middleware::RedisConnection::open_with_prefix(&cfg.url, &prefix)?;
+        self.redis_cache.insert(key, conn.clone());
+        Ok(conn)
+    }
 }
 
-fn walk_body(body: Vec<RuleNode>, ctx: &mut WalkCtx, out: &mut Vec<Decl>) -> anyhow::Result<()> {
+fn walk_body(
+    body: Vec<RuleNode>,
+    ctx: &mut WalkCtx<'_>,
+    out: &mut Vec<Decl>,
+) -> anyhow::Result<()> {
     for (idx, node) in body.into_iter().enumerate() {
         walk_node(node, idx, ctx, out)?;
     }
@@ -1077,7 +1204,7 @@ fn walk_body(body: Vec<RuleNode>, ctx: &mut WalkCtx, out: &mut Vec<Decl>) -> any
 fn walk_node(
     node: RuleNode,
     self_idx: usize,
-    ctx: &mut WalkCtx,
+    ctx: &mut WalkCtx<'_>,
     out: &mut Vec<Decl>,
 ) -> anyhow::Result<()> {
     match node {
@@ -1085,6 +1212,8 @@ fn walk_node(
             MatchSpec::from_general(&m),
             m.name,
             m.body,
+            #[cfg(feature = "redis")]
+            m.redis,
             self_idx,
             ctx,
             out,
@@ -1096,6 +1225,8 @@ fn walk_node(
             },
             m.name,
             m.body,
+            #[cfg(feature = "redis")]
+            m.redis,
             self_idx,
             ctx,
             out,
@@ -1107,6 +1238,8 @@ fn walk_node(
             },
             m.name,
             m.body,
+            #[cfg(feature = "redis")]
+            m.redis,
             self_idx,
             ctx,
             out,
@@ -1118,6 +1251,8 @@ fn walk_node(
             },
             m.name,
             m.body,
+            #[cfg(feature = "redis")]
+            m.redis,
             self_idx,
             ctx,
             out,
@@ -1129,6 +1264,8 @@ fn walk_node(
             },
             m.name,
             m.body,
+            #[cfg(feature = "redis")]
+            m.redis,
             self_idx,
             ctx,
             out,
@@ -1139,6 +1276,8 @@ fn walk_node(
                 scope_pred: and_predicates(&ctx.preds),
                 excluded_preds: Vec::new(),
                 leaf,
+                #[cfg(feature = "redis")]
+                redis: ctx.redis_stack.last().cloned(),
                 #[cfg(feature = "redis")]
                 scope_label: ctx.current_scope(),
             });
@@ -1151,8 +1290,9 @@ fn walk_match(
     spec: MatchSpec,
     name: Option<String>,
     body: Vec<RuleNode>,
+    #[cfg(feature = "redis")] redis: Option<RedisConfig>,
     self_idx: usize,
-    ctx: &mut WalkCtx,
+    ctx: &mut WalkCtx<'_>,
     out: &mut Vec<Decl>,
 ) -> anyhow::Result<()> {
     let pred = spec.into_predicate()?;
@@ -1165,10 +1305,23 @@ fn walk_match(
     #[cfg(not(feature = "redis"))]
     let _ = name;
 
+    #[cfg(feature = "redis")]
+    let pushed_redis = if let Some(cfg) = redis {
+        let conn = ctx.open_redis(&cfg)?;
+        ctx.redis_stack.push(conn);
+        true
+    } else {
+        false
+    };
+
     ctx.path.push(self_idx);
     let res = walk_body(body, ctx, out);
     ctx.path.pop();
 
+    #[cfg(feature = "redis")]
+    if pushed_redis {
+        ctx.redis_stack.pop();
+    }
     if pushed {
         ctx.preds.pop();
     }
@@ -1235,15 +1388,11 @@ fn effective_predicate(decl: &Decl) -> Option<Predicate> {
     Some(combined)
 }
 
-fn emit_decl(
-    builder: crate::ProxyBuilder,
-    decl: Decl,
-    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
-) -> anyhow::Result<crate::ProxyBuilder> {
+fn emit_decl(builder: crate::ProxyBuilder, decl: Decl) -> anyhow::Result<crate::ProxyBuilder> {
     let ctx = EmitCtx {
         pred: effective_predicate(&decl),
         #[cfg(feature = "redis")]
-        redis,
+        redis: decl.redis.as_ref(),
         #[cfg(feature = "redis")]
         scope_label: &decl.scope_label,
         #[cfg(not(feature = "redis"))]
@@ -2043,21 +2192,18 @@ mod tests {
         )
         .unwrap();
 
-        // Walk globals
-        let mut global_decls = Vec::new();
-        let mut walk = WalkCtx {
-            preds: Vec::new(),
-            path: Vec::new(),
-            #[cfg(feature = "redis")]
-            scope_stack: Vec::new(),
-            #[cfg(feature = "redis")]
-            scope_counter: 0,
-        };
-        walk_body(cfg.body, &mut walk, &mut global_decls).unwrap();
-
         // Listener 0 (forward) has its own `log`: global is shadowed
-        let fwd_decls = walk_listener_body(cfg.forwards[0].body.clone(), &global_decls).unwrap();
-        // Two log decls: global + listener-internal
+        #[cfg(feature = "redis")]
+        let mut redis_cache: RedisCache = Default::default();
+        let fwd_decls = walk_listener_body(
+            cfg.body.clone(),
+            cfg.forwards[0].body.clone(),
+            #[cfg(feature = "redis")]
+            None,
+            #[cfg(feature = "redis")]
+            &mut redis_cache,
+        )
+        .unwrap();
         let log_decls: Vec<&Decl> = fwd_decls
             .iter()
             .filter(|d| matches!(d.leaf, RuleNode::Log(_)))
@@ -2068,7 +2214,15 @@ mod tests {
         assert_eq!(global_log.excluded_preds.len(), 1);
 
         // Listener 1 (reverse) has no `log`: global is unshadowed
-        let rev_decls = walk_listener_body(cfg.reverses[0].body.clone(), &global_decls).unwrap();
+        let rev_decls = walk_listener_body(
+            cfg.body.clone(),
+            cfg.reverses[0].body.clone(),
+            #[cfg(feature = "redis")]
+            None,
+            #[cfg(feature = "redis")]
+            &mut redis_cache,
+        )
+        .unwrap();
         let log_decls: Vec<&Decl> = rev_decls
             .iter()
             .filter(|d| matches!(d.leaf, RuleNode::Log(_)))
@@ -2076,6 +2230,154 @@ mod tests {
         assert_eq!(log_decls.len(), 1);
         assert!(log_decls[0].path.is_empty());
         assert_eq!(log_decls[0].excluded_preds.len(), 0);
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_scope_shadowing_listener_overrides_process() {
+        // Process-level redis (prefix=p:) seeds every listener; the forward
+        // listener overrides with its own (prefix=f:). Decls inside the
+        // forward listener should capture the f: prefix; decls inside the
+        // reverse listener (no override) should capture p:.
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            redis url="redis://main:6379" prefix="p:"
+
+            forward port=8080 {
+                ca cert="x" key="y"
+                redis url="redis://forward:6379" prefix="f:"
+                rate-limit count=10 window="1s"
+            }
+
+            reverse port=8081 {
+                upstream "http://api:3000"
+                rate-limit count=20 window="1s"
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut redis_cache: RedisCache = Default::default();
+
+        // Forward listener's compile pass
+        let initial = listener_initial_redis(
+            cfg.forwards[0].redis.as_ref(),
+            cfg.redis.as_ref(),
+            &mut redis_cache,
+        )
+        .unwrap();
+        assert_eq!(initial.unwrap().prefix(), "f:");
+
+        let fwd_decls = walk_listener_body(
+            cfg.body.clone(),
+            cfg.forwards[0].body.clone(),
+            listener_initial_redis(
+                cfg.forwards[0].redis.as_ref(),
+                cfg.redis.as_ref(),
+                &mut redis_cache,
+            )
+            .unwrap(),
+            &mut redis_cache,
+        )
+        .unwrap();
+        let rl = fwd_decls
+            .iter()
+            .find(|d| matches!(d.leaf, RuleNode::RateLimit(_)))
+            .expect("forward rate-limit");
+        assert_eq!(rl.redis.as_ref().unwrap().prefix(), "f:");
+
+        // Reverse listener's compile pass — falls back to process redis
+        let rev_decls = walk_listener_body(
+            cfg.body.clone(),
+            cfg.reverses[0].body.clone(),
+            listener_initial_redis(
+                cfg.reverses[0].redis.as_ref(),
+                cfg.redis.as_ref(),
+                &mut redis_cache,
+            )
+            .unwrap(),
+            &mut redis_cache,
+        )
+        .unwrap();
+        let rl = rev_decls
+            .iter()
+            .find(|d| matches!(d.leaf, RuleNode::RateLimit(_)))
+            .expect("reverse rate-limit");
+        assert_eq!(rl.redis.as_ref().unwrap().prefix(), "p:");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_scope_shadowing_match_overrides_listener() {
+        // Match-level `redis` overrides the listener's redis for rules in
+        // its body. Outer rules use listener redis; inner rule uses match.
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            reverse port=8080 {
+                upstream "http://api:3000"
+                redis url="redis://l:6379" prefix="l:"
+                rate-limit count=10 window="1s"
+
+                host "premium.example.com" {
+                    redis url="redis://m:6379" prefix="m:"
+                    rate-limit count=1000 window="1s"
+                }
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut cache: RedisCache = Default::default();
+        let initial =
+            listener_initial_redis(cfg.reverses[0].redis.as_ref(), None, &mut cache).unwrap();
+
+        let decls = walk_listener_body(
+            cfg.body.clone(),
+            cfg.reverses[0].body.clone(),
+            initial,
+            &mut cache,
+        )
+        .unwrap();
+
+        let rls: Vec<&Decl> = decls
+            .iter()
+            .filter(|d| matches!(d.leaf, RuleNode::RateLimit(_)))
+            .collect();
+        assert_eq!(rls.len(), 2);
+
+        // Outer rate-limit (path=[0]) uses listener redis
+        let outer = rls.iter().find(|d| d.path == vec![0]).unwrap();
+        assert_eq!(outer.redis.as_ref().unwrap().prefix(), "l:");
+
+        // Inner (path=[0, ...]) uses match redis
+        let inner = rls.iter().find(|d| d.path.len() > 1).unwrap();
+        assert_eq!(inner.redis.as_ref().unwrap().prefix(), "m:");
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_cache_dedupes_same_url_and_prefix() {
+        // Two scopes declaring the same redis (url, prefix) should share a
+        // single connection in the cache.
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            forward port=8080 {
+                ca cert="x" key="y"
+                redis url="redis://shared:6379" prefix="s:"
+            }
+            forward port=8081 {
+                ca cert="x" key="y"
+                redis url="redis://shared:6379" prefix="s:"
+            }
+            "#,
+        )
+        .unwrap();
+
+        let mut cache: RedisCache = Default::default();
+        let _ = listener_initial_redis(cfg.forwards[0].redis.as_ref(), None, &mut cache).unwrap();
+        let _ = listener_initial_redis(cfg.forwards[1].redis.as_ref(), None, &mut cache).unwrap();
+
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
@@ -2151,6 +2453,8 @@ mod tests {
     fn collect_decls(kdl: &str) -> Vec<Decl> {
         let cfg = ProxyConfig::from_kdl(kdl).unwrap();
         let mut decls = Vec::new();
+        #[cfg(feature = "redis")]
+        let mut redis_cache: RedisCache = Default::default();
         let mut ctx = WalkCtx {
             preds: Vec::new(),
             path: Vec::new(),
@@ -2158,6 +2462,12 @@ mod tests {
             scope_stack: Vec::new(),
             #[cfg(feature = "redis")]
             scope_counter: 0,
+            #[cfg(feature = "redis")]
+            redis_stack: Vec::new(),
+            #[cfg(feature = "redis")]
+            redis_cache: &mut redis_cache,
+            #[cfg(not(feature = "redis"))]
+            _phantom: std::marker::PhantomData,
         };
         walk_body(cfg.body, &mut ctx, &mut decls).unwrap();
         resolve_exclusions(&mut decls);

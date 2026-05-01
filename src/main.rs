@@ -367,6 +367,8 @@ async fn main() -> anyhow::Result<()> {
                     bind: Some(cli.bind.clone()),
                     upstream,
                     tls,
+                    #[cfg(feature = "redis")]
+                    redis: None,
                     body: Vec::new(),
                 });
             }
@@ -380,6 +382,8 @@ async fn main() -> anyhow::Result<()> {
                     },
                     tls: None,
                     credentials: cli_credentials,
+                    #[cfg(feature = "redis")]
+                    redis: None,
                     body: Vec::new(),
                 });
             }

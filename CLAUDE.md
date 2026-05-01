@@ -73,7 +73,9 @@ trait Rule {
 
 **Config alias nodes:** `host "X" { ... }`, `path "Y" { ... }`, `method "GET" { ... }`, and variadic `methods "GET" "POST" { ... }` desugar to the corresponding `match` block. Per-op header types (`SetRequestHeader`, `AppendRequestHeader`, `RemoveRequestHeader`, `SetResponseHeader`, `AppendResponseHeader`, `RemoveResponseHeader`) and rewrite types (`RewritePath`, `RewritePathRegex`) are all dedicated structs — no shared `HeaderEntry` / `RewriteSpec`, since each variant needs its own `impl Rule`.
 
-**Stateful middleware caveat:** a global `rate-limit`/`sliding-window`/`circuit-breaker` is cloned into each listener's compile pass, so each listener gets its own state instance — they do *not* share buckets across listeners. For genuinely shared state across listeners or processes, configure `redis` (truly process-global) and rely on its scope keys.
+**Stateful middleware caveat:** a global `rate-limit`/`sliding-window`/`circuit-breaker` is cloned into each listener's compile pass, so each listener gets its own state instance — they do *not* share buckets across listeners. For genuinely shared state across listeners or processes, configure `redis` and rely on its scope keys.
+
+**Redis scope shadowing:** `redis` is allowed at process top-level, inside listener blocks, and inside match blocks — same shadowing rule as middleware. The walker maintains a `redis_stack`; each match's `walk_match` pushes/pops if the match has a `redis` field. Each `Decl` captures the closest-enclosing connection at walk time (`decl.redis: Option<RedisConnection>`). `EmitCtx.redis` is sourced from the decl, not the listener. The compiler maintains a `RedisCache: HashMap<(url, prefix), RedisConnection>` so the same `(url, prefix)` declared at multiple scopes shares one connection. `RedisConnection::prefix()` exposes the prefix for diagnostics and tests.
 
 ## TODO
 
@@ -103,6 +105,11 @@ trait Rule {
 - Sensitive data scanner — flag responses containing API keys, tokens, SSNs, etc.
 - Cookie tracker — log and analyze cookies across domains
 - HAR recorder — capture full request/response pairs as HAR files
+
+### Scoped-resource abstraction (`src/config.rs`)
+The redis scope-shadowing infrastructure (`redis_stack` + `redis_cache` on `WalkCtx`, per-decl `redis: Option<RedisConnection>`, `walk_match` push/pop, `EmitCtx.redis`) is a specific instance of a general pattern: **scope-shadowed external resource captured per-leaf with dedup-by-key**. Other resources that fit it (database/connection pools, cache backends, telemetry sinks, object storage, auth providers, secret stores) would each need a copy of the same plumbing today.
+
+When the second such resource arrives, factor out a `ScopedContext<T, K>` owning the stack + cache + push/pop + `open_or_cached` so the mechanical part is shared. The schema-side glue (`#[knus(child)] xxx: Option<XxxConfig>` on each match struct + both listener structs — 7 sites per resource) is harder to deduplicate without a proc macro and probably not worth the complexity until we have ≥3 resources. Apply the rule of three: build the abstraction in the PR that introduces the second resource, once we know what the trait actually wants to look like, rather than designing it around redis alone.
 
 ## Project Guidelines
 

@@ -775,6 +775,35 @@ reverse port=8080 {
 
 When `redis` is configured, all `rate-limit`, `sliding-window`, and `circuit-breaker` rules automatically use Redis. If Redis becomes unreachable, each store transparently falls back to an in-memory store and logs a warning.
 
+#### Scoped Redis: per-listener and per-match overrides
+
+`redis` declarations follow the same innermost-wins shadowing rule as middleware. A `redis` at the top level is the default; a listener block can override it; a `match` block can override that:
+
+```kdl
+redis url="redis://main:6379" prefix="main:"
+
+forward port=8080 {
+    ca cert="ca.pem" key="ca-key.pem"
+    // No redis here → uses main:
+    rate-limit count=100 window="1s"
+}
+
+reverse port=8081 {
+    upstream "http://api:3000"
+    // Override for this listener
+    redis url="redis://api:6379" prefix="api:"
+    rate-limit count=1000 window="1s"
+
+    host "premium.example.com" {
+        // Premium tier uses its own redis
+        redis url="redis://premium:6379" prefix="prem:"
+        rate-limit count=10000 window="1s"
+    }
+}
+```
+
+The same `(url, prefix)` declared in multiple scopes opens one connection (deduped automatically), so cross-scope state stays consistent.
+
 ### CLI
 
 ```bash

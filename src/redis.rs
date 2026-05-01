@@ -55,4 +55,10 @@ impl RedisConnection {
     pub(crate) fn prefixed_key(&self, namespace: &str, key: &str) -> String {
         format!("{}{namespace}:{key}", self.prefix)
     }
+
+    /// The configured key prefix for this connection. Used to identify
+    /// connections in tests and diagnostics.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
 }
