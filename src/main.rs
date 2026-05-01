@@ -1,7 +1,8 @@
 use clap::Parser;
 use noxy::config::{
-    BlockConfig, CircuitBreakerConfig, HeaderEntry, HeaderName, HostPattern, LatencyConfig,
-    LogConfig, PathPattern, ProxyConfig, RateLimitConfig, RetryConfig, RewriteSpec, RuleNode,
+    BlockConfig, CircuitBreakerConfig, HostPattern, LatencyConfig, LogConfig, PathPattern,
+    ProxyConfig, RateLimitConfig, RemoveRequestHeader, RemoveResponseHeader, RetryConfig,
+    RewritePath, RewritePathRegex, RuleNode, SetRequestHeader, SetResponseHeader,
     SlidingWindowConfig, parse_duration,
 };
 
@@ -299,30 +300,35 @@ async fn main() -> anyhow::Result<()> {
         let (name, value) = parse_header_arg(&h)?;
         config
             .body
-            .push(RuleNode::SetRequestHeader(HeaderEntry { name, value }));
+            .push(RuleNode::SetRequestHeader(SetRequestHeader { name, value }));
     }
     for name in cli.remove_request_headers {
         config
             .body
-            .push(RuleNode::RemoveRequestHeader(HeaderName { name }));
+            .push(RuleNode::RemoveRequestHeader(RemoveRequestHeader { name }));
     }
     for h in cli.set_response_headers {
         let (name, value) = parse_header_arg(&h)?;
         config
             .body
-            .push(RuleNode::SetResponseHeader(HeaderEntry { name, value }));
+            .push(RuleNode::SetResponseHeader(SetResponseHeader {
+                name,
+                value,
+            }));
     }
     for name in cli.remove_response_headers {
         config
             .body
-            .push(RuleNode::RemoveResponseHeader(HeaderName { name }));
+            .push(RuleNode::RemoveResponseHeader(RemoveResponseHeader {
+                name,
+            }));
     }
 
     for rw in cli.rewrite_paths {
         let (pattern, replace) = rw.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("rewrite-path must be 'pattern=replacement', got '{rw}'")
         })?;
-        config.body.push(RuleNode::RewritePath(RewriteSpec {
+        config.body.push(RuleNode::RewritePath(RewritePath {
             pattern: pattern.to_string(),
             replace: replace.to_string(),
         }));
@@ -331,10 +337,12 @@ async fn main() -> anyhow::Result<()> {
         let (pattern, replace) = rw.split_once('=').ok_or_else(|| {
             anyhow::anyhow!("rewrite-path-regex must be 'regex=replacement', got '{rw}'")
         })?;
-        config.body.push(RuleNode::RewritePathRegex(RewriteSpec {
-            pattern: pattern.to_string(),
-            replace: replace.to_string(),
-        }));
+        config
+            .body
+            .push(RuleNode::RewritePathRegex(RewritePathRegex {
+                pattern: pattern.to_string(),
+                replace: replace.to_string(),
+            }));
     }
 
     if !cli.block_hosts.is_empty() || !cli.block_paths.is_empty() {

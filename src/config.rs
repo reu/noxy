@@ -132,14 +132,14 @@ pub enum RuleNode {
 
     // Additive middlewares.
     Block(BlockConfig),
-    SetRequestHeader(HeaderEntry),
-    AppendRequestHeader(HeaderEntry),
-    RemoveRequestHeader(HeaderName),
-    SetResponseHeader(HeaderEntry),
-    AppendResponseHeader(HeaderEntry),
-    RemoveResponseHeader(HeaderName),
-    RewritePath(RewriteSpec),
-    RewritePathRegex(RewriteSpec),
+    SetRequestHeader(SetRequestHeader),
+    AppendRequestHeader(AppendRequestHeader),
+    RemoveRequestHeader(RemoveRequestHeader),
+    SetResponseHeader(SetResponseHeader),
+    AppendResponseHeader(AppendResponseHeader),
+    RemoveResponseHeader(RemoveResponseHeader),
+    RewritePath(RewritePath),
+    RewritePathRegex(RewritePathRegex),
 
     #[cfg(feature = "scripting")]
     Script(ScriptConfig),
@@ -367,22 +367,68 @@ pub struct BlockResponse {
     pub body: Option<String>,
 }
 
+/// `set-request-header "name" "value"`.
 #[derive(Decode, Debug)]
-pub struct HeaderEntry {
+pub struct SetRequestHeader {
     #[knus(argument)]
     pub name: String,
     #[knus(argument)]
     pub value: String,
 }
 
+/// `append-request-header "name" "value"`.
 #[derive(Decode, Debug)]
-pub struct HeaderName {
+pub struct AppendRequestHeader {
+    #[knus(argument)]
+    pub name: String,
+    #[knus(argument)]
+    pub value: String,
+}
+
+/// `remove-request-header "name"`.
+#[derive(Decode, Debug)]
+pub struct RemoveRequestHeader {
     #[knus(argument)]
     pub name: String,
 }
 
+/// `set-response-header "name" "value"`.
 #[derive(Decode, Debug)]
-pub struct RewriteSpec {
+pub struct SetResponseHeader {
+    #[knus(argument)]
+    pub name: String,
+    #[knus(argument)]
+    pub value: String,
+}
+
+/// `append-response-header "name" "value"`.
+#[derive(Decode, Debug)]
+pub struct AppendResponseHeader {
+    #[knus(argument)]
+    pub name: String,
+    #[knus(argument)]
+    pub value: String,
+}
+
+/// `remove-response-header "name"`.
+#[derive(Decode, Debug)]
+pub struct RemoveResponseHeader {
+    #[knus(argument)]
+    pub name: String,
+}
+
+/// `rewrite-path "/api/v1/{*rest}" "/v2/{rest}"`.
+#[derive(Decode, Debug)]
+pub struct RewritePath {
+    #[knus(argument)]
+    pub pattern: String,
+    #[knus(argument)]
+    pub replace: String,
+}
+
+/// `rewrite-path-regex "/api/v\\d+/(.*)" "/latest/$1"`.
+#[derive(Decode, Debug)]
+pub struct RewritePathRegex {
     #[knus(argument)]
     pub pattern: String,
     #[knus(argument)]
@@ -655,87 +701,75 @@ fn anyhow_str(s: String) -> anyhow::Error {
     anyhow::anyhow!("{s}")
 }
 
-/// Kind of a middleware leaf, used to identify same-kind declarations for
-/// shadowing (innermost-wins) on exclusive middlewares.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MidKind {
-    Log,
-    Latency,
-    Bandwidth,
-    Fault,
-    RateLimit,
-    SlidingWindow,
-    Retry,
-    CircuitBreaker,
-    Respond,
-    Block,
-    SetReqHeader,
-    AppendReqHeader,
-    RemoveReqHeader,
-    SetResHeader,
-    AppendResHeader,
-    RemoveResHeader,
-    RewritePath,
-    RewritePathRegex,
-    Upstream,
-    #[cfg(feature = "scripting")]
-    Script,
-}
-
-impl MidKind {
-    /// Exclusive kinds participate in shadowing: a more deeply-nested
+/// Per-middleware definition: each leaf config implements `Rule` to declare
+/// whether it shadows (innermost-wins) and how to install itself on the
+/// proxy builder. Adding a new middleware is then: define the config struct,
+/// add a `RuleNode` variant, and write one `impl Rule`.
+trait Rule {
+    /// Exclusive rules participate in shadowing: a more deeply-nested
     /// declaration carves its scope out of any outer same-kind declaration.
-    /// Additive kinds always stack.
-    fn is_exclusive(self) -> bool {
-        matches!(
-            self,
-            MidKind::Log
-                | MidKind::Latency
-                | MidKind::Bandwidth
-                | MidKind::Fault
-                | MidKind::Retry
-                | MidKind::CircuitBreaker
-                | MidKind::Respond
-        )
+    /// Default is additive (no shadowing).
+    fn is_exclusive(&self) -> bool {
+        false
     }
+
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder>;
 }
 
-fn leaf_kind(node: &RuleNode) -> Option<MidKind> {
-    Some(match node {
-        RuleNode::Log(_) => MidKind::Log,
-        RuleNode::Latency(_) => MidKind::Latency,
-        RuleNode::Bandwidth(_) => MidKind::Bandwidth,
-        RuleNode::Fault(_) => MidKind::Fault,
-        RuleNode::RateLimit(_) => MidKind::RateLimit,
-        RuleNode::SlidingWindow(_) => MidKind::SlidingWindow,
-        RuleNode::Retry(_) => MidKind::Retry,
-        RuleNode::CircuitBreaker(_) => MidKind::CircuitBreaker,
-        RuleNode::Respond(_) => MidKind::Respond,
-        RuleNode::Block(_) => MidKind::Block,
-        RuleNode::SetRequestHeader(_) => MidKind::SetReqHeader,
-        RuleNode::AppendRequestHeader(_) => MidKind::AppendReqHeader,
-        RuleNode::RemoveRequestHeader(_) => MidKind::RemoveReqHeader,
-        RuleNode::SetResponseHeader(_) => MidKind::SetResHeader,
-        RuleNode::AppendResponseHeader(_) => MidKind::AppendResHeader,
-        RuleNode::RemoveResponseHeader(_) => MidKind::RemoveResHeader,
-        RuleNode::RewritePath(_) => MidKind::RewritePath,
-        RuleNode::RewritePathRegex(_) => MidKind::RewritePathRegex,
-        RuleNode::Upstream(_) => MidKind::Upstream,
+/// Cross-cutting context handed to every `Rule::emit` call.
+struct EmitCtx<'a> {
+    pred: Option<Predicate>,
+    #[cfg(feature = "redis")]
+    redis: Option<&'a crate::middleware::RedisConnection>,
+    #[cfg(feature = "redis")]
+    scope_label: &'a str,
+    #[cfg(not(feature = "redis"))]
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+/// True if the leaf wrapped by this `RuleNode` opts into shadowing.
+/// Match-typed variants never appear as leaves and are reported as additive.
+fn rule_is_exclusive(node: &RuleNode) -> bool {
+    match node {
+        RuleNode::Log(c) => c.is_exclusive(),
+        RuleNode::Latency(c) => c.is_exclusive(),
+        RuleNode::Bandwidth(c) => c.is_exclusive(),
+        RuleNode::Fault(c) => c.is_exclusive(),
+        RuleNode::RateLimit(c) => c.is_exclusive(),
+        RuleNode::SlidingWindow(c) => c.is_exclusive(),
+        RuleNode::Retry(c) => c.is_exclusive(),
+        RuleNode::CircuitBreaker(c) => c.is_exclusive(),
+        RuleNode::Respond(c) => c.is_exclusive(),
+        RuleNode::Block(c) => c.is_exclusive(),
+        RuleNode::SetRequestHeader(c) => c.is_exclusive(),
+        RuleNode::AppendRequestHeader(c) => c.is_exclusive(),
+        RuleNode::RemoveRequestHeader(c) => c.is_exclusive(),
+        RuleNode::SetResponseHeader(c) => c.is_exclusive(),
+        RuleNode::AppendResponseHeader(c) => c.is_exclusive(),
+        RuleNode::RemoveResponseHeader(c) => c.is_exclusive(),
+        RuleNode::RewritePath(c) => c.is_exclusive(),
+        RuleNode::RewritePathRegex(c) => c.is_exclusive(),
+        RuleNode::Upstream(c) => c.is_exclusive(),
         #[cfg(feature = "scripting")]
-        RuleNode::Script(_) => MidKind::Script,
+        RuleNode::Script(c) => c.is_exclusive(),
         RuleNode::Match(_)
         | RuleNode::Host(_)
         | RuleNode::Path(_)
         | RuleNode::Method(_)
-        | RuleNode::Methods(_) => return None,
-    })
+        | RuleNode::Methods(_) => false,
+    }
 }
 
 /// A collected leaf declaration. `path` records its position in the tree of
 /// enclosing matches (one entry per enclosing match, by its index in the
 /// parent body), enabling descendant detection during shadow resolution.
+/// Same-kind comparison uses `std::mem::discriminant` on `leaf`, so no
+/// parallel kind-tag is needed.
 struct Decl {
-    kind: MidKind,
     path: Vec<usize>,
     scope_pred: Option<Predicate>,
     /// Predicates of same-kind declarations nested strictly deeper than this
@@ -838,9 +872,7 @@ fn walk_node(
             out,
         ),
         leaf => {
-            let kind = leaf_kind(&leaf).expect("only leaves reach this branch");
             out.push(Decl {
-                kind,
                 path: ctx.path.clone(),
                 scope_pred: and_predicates(&ctx.preds),
                 excluded_preds: Vec::new(),
@@ -887,18 +919,19 @@ fn walk_match(
 /// declaration nested strictly deeper into its `excluded_preds`. The effective
 /// predicate is then `scope_pred AND NOT (any of the exclusions)`.
 fn resolve_exclusions(decls: &mut [Decl]) {
+    use std::mem::discriminant;
     let n = decls.len();
     #[allow(clippy::needless_range_loop)]
     // index used both for `decls[i]` reads and the later mutating assign
     for i in 0..n {
-        if !decls[i].kind.is_exclusive() {
+        if !rule_is_exclusive(&decls[i].leaf) {
             continue;
         }
-        let kind = decls[i].kind;
+        let disc_i = discriminant(&decls[i].leaf);
         let path_i = decls[i].path.clone();
         let mut excluded = Vec::new();
         for (j, decl) in decls.iter().enumerate() {
-            if i == j || decl.kind != kind {
+            if i == j || discriminant(&decl.leaf) != disc_i {
                 continue;
             }
             // j shadows i iff j's scope is strictly more nested than i's:
@@ -937,226 +970,408 @@ fn effective_predicate(decl: &Decl) -> Option<Predicate> {
 }
 
 fn emit_decl(
-    mut builder: crate::ProxyBuilder,
+    builder: crate::ProxyBuilder,
     decl: Decl,
     #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
 ) -> anyhow::Result<crate::ProxyBuilder> {
-    let pred = effective_predicate(&decl);
-    #[cfg(feature = "redis")]
-    let scope_label = decl.scope_label.clone();
-
+    let ctx = EmitCtx {
+        pred: effective_predicate(&decl),
+        #[cfg(feature = "redis")]
+        redis,
+        #[cfg(feature = "redis")]
+        scope_label: &decl.scope_label,
+        #[cfg(not(feature = "redis"))]
+        _phantom: std::marker::PhantomData,
+    };
     match decl.leaf {
-        RuleNode::Upstream(u) => {
-            let mut upstream = if u.urls.len() == 1 {
-                Upstream::new([u.urls.into_iter().next().unwrap()])?
-            } else {
-                Upstream::balanced(u.urls)?
-            };
-            if let Some(ref balance) = u.balance {
-                upstream = upstream.strategy(parse_balance_strategy(balance)?);
-            }
-            if let Some(p) = pred {
-                builder = builder.route(move |req| p(req), upstream);
-            } else {
-                builder = builder.route(|_| true, upstream);
-            }
-        }
-        RuleNode::Log(c) => {
-            let logger = if let Some(true) = c.bodies {
-                TrafficLogger::new().log_bodies(true)
-            } else {
-                TrafficLogger::new()
-            };
-            builder = apply_layer(builder, pred, logger);
-        }
-        RuleNode::Latency(c) => {
-            let injector = match DurationOrRange::from_str(&c.value).map_err(anyhow_str)? {
-                DurationOrRange::Fixed(d) => LatencyInjector::fixed(d),
-                DurationOrRange::Range(lo, hi) => LatencyInjector::uniform(lo..hi),
-            };
-            builder = apply_layer(builder, pred, injector);
-        }
-        RuleNode::Bandwidth(c) => {
-            builder = apply_layer(builder, pred, BandwidthThrottle::new(c.bps));
-        }
-        RuleNode::Fault(c) => {
-            let mut inj = FaultInjector::new()
-                .error_rate(c.error_rate)
-                .abort_rate(c.abort_rate);
-            if let Some(status) = c.error_status {
-                let status = http::StatusCode::from_u16(status)
-                    .map_err(|e| anyhow::anyhow!("invalid error_status: {e}"))?;
-                inj = inj.error_status(status);
-            }
-            builder = apply_layer(builder, pred, inj);
-        }
-        RuleNode::RateLimit(c) => {
-            let window = parse_duration(&c.window).map_err(anyhow_str)?;
-            #[cfg(feature = "redis")]
-            if let Some(conn) = redis {
-                let rate = c.count as f64 / window.as_secs_f64();
-                let burst = c.burst.map(|b| b as f64).unwrap_or(c.count as f64);
-                let store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst)
-                    .scope(&scope_label);
-                let limiter = if c.per_host {
-                    RateLimiter::with_store(store, host_key)
-                } else {
-                    RateLimiter::with_store(store, |_| String::new())
-                };
-                builder = apply_layer(builder, pred, limiter);
-            } else {
-                builder = apply_layer(builder, pred, build_rate_limiter(&c, window));
-            }
-            #[cfg(not(feature = "redis"))]
-            {
-                builder = apply_layer(builder, pred, build_rate_limiter(&c, window));
-            }
-        }
-        RuleNode::SlidingWindow(c) => {
-            let window = parse_duration(&c.window).map_err(anyhow_str)?;
-            #[cfg(feature = "redis")]
-            if let Some(conn) = redis {
-                let store =
-                    crate::middleware::RedisSlidingWindowStore::new(conn.clone(), c.count, window)
-                        .scope(&scope_label);
-                let sw = if c.per_host {
-                    SlidingWindow::with_store(store, host_key)
-                } else {
-                    SlidingWindow::with_store(store, |_| String::new())
-                };
-                builder = apply_layer(builder, pred, sw);
-            } else {
-                let sw = if c.per_host {
-                    SlidingWindow::per_host(c.count, window)
-                } else {
-                    SlidingWindow::global(c.count, window)
-                };
-                builder = apply_layer(builder, pred, sw);
-            }
-            #[cfg(not(feature = "redis"))]
-            {
-                let sw = if c.per_host {
-                    SlidingWindow::per_host(c.count, window)
-                } else {
-                    SlidingWindow::global(c.count, window)
-                };
-                builder = apply_layer(builder, pred, sw);
-            }
-        }
-        RuleNode::Retry(c) => {
-            builder = apply_layer(builder, pred, build_retry(c)?);
-        }
-        RuleNode::CircuitBreaker(c) => {
-            let recovery = parse_duration(&c.recovery).map_err(anyhow_str)?;
-            #[cfg(feature = "redis")]
-            if let Some(conn) = redis {
-                let mut store = crate::middleware::RedisCircuitBreakerStore::new(
-                    conn.clone(),
-                    c.threshold,
-                    recovery,
-                )
-                .scope(&scope_label);
-                if let Some(probes) = c.half_open_probes {
-                    store = store.half_open_probes(probes);
-                }
-                if let Some(ref ttl) = c.cache_ttl {
-                    store = store.cache_ttl(parse_duration(ttl).map_err(anyhow_str)?);
-                }
-                let cb = if c.per_host {
-                    CircuitBreaker::with_store(store, host_key)
-                } else {
-                    CircuitBreaker::with_store(store, |_| String::new())
-                };
-                builder = apply_layer(builder, pred, cb);
-            } else {
-                builder = apply_layer(builder, pred, build_circuit_breaker(&c, recovery));
-            }
-            #[cfg(not(feature = "redis"))]
-            {
-                builder = apply_layer(builder, pred, build_circuit_breaker(&c, recovery));
-            }
-        }
-        RuleNode::Respond(c) => {
-            let status = c.status.unwrap_or(200);
-            let status = http::StatusCode::from_u16(status)
-                .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
-            builder = apply_layer(builder, pred, SetResponse::new(status, c.body));
-        }
-        RuleNode::Block(c) => {
-            let mut bl = BlockList::new();
-            for h in c.hosts {
-                bl = bl
-                    .host(&h.pattern)
-                    .map_err(|e| anyhow::anyhow!("invalid block host '{}': {e}", h.pattern))?;
-            }
-            for p in c.paths {
-                bl = bl
-                    .path(&p.pattern)
-                    .map_err(|e| anyhow::anyhow!("invalid block path '{}': {e}", p.pattern))?;
-            }
-            if let Some(resp) = c.response {
-                let status = resp.status.unwrap_or(403);
-                let status = http::StatusCode::from_u16(status)
-                    .map_err(|e| anyhow::anyhow!("invalid block status: {e}"))?;
-                let body = resp.body.unwrap_or_default();
-                bl = bl.response(status, body);
-            }
-            builder = apply_layer(builder, pred, bl);
-        }
-        RuleNode::SetRequestHeader(h) => {
-            let m = ModifyHeaders::new().set_request(&h.name, &h.value);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::AppendRequestHeader(h) => {
-            let m = ModifyHeaders::new().append_request(&h.name, &h.value);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::RemoveRequestHeader(h) => {
-            let m = ModifyHeaders::new().remove_request(&h.name);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::SetResponseHeader(h) => {
-            let m = ModifyHeaders::new().set_response(&h.name, &h.value);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::AppendResponseHeader(h) => {
-            let m = ModifyHeaders::new().append_response(&h.name, &h.value);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::RemoveResponseHeader(h) => {
-            let m = ModifyHeaders::new().remove_response(&h.name);
-            builder = apply_layer(builder, pred, m);
-        }
-        RuleNode::RewritePath(c) => {
-            let rw = UrlRewrite::path(&c.pattern, &c.replace).map_err(|e| {
-                anyhow::anyhow!("invalid rewrite-path pattern '{}': {e}", c.pattern)
-            })?;
-            builder = apply_layer(builder, pred, rw);
-        }
-        RuleNode::RewritePathRegex(c) => {
-            let rw = UrlRewrite::regex(&c.pattern, &c.replace).map_err(|e| {
-                anyhow::anyhow!("invalid rewrite-path-regex regex '{}': {e}", c.pattern)
-            })?;
-            builder = apply_layer(builder, pred, rw);
-        }
+        RuleNode::Log(c) => c.emit(builder, &ctx),
+        RuleNode::Latency(c) => c.emit(builder, &ctx),
+        RuleNode::Bandwidth(c) => c.emit(builder, &ctx),
+        RuleNode::Fault(c) => c.emit(builder, &ctx),
+        RuleNode::RateLimit(c) => c.emit(builder, &ctx),
+        RuleNode::SlidingWindow(c) => c.emit(builder, &ctx),
+        RuleNode::Retry(c) => c.emit(builder, &ctx),
+        RuleNode::CircuitBreaker(c) => c.emit(builder, &ctx),
+        RuleNode::Respond(c) => c.emit(builder, &ctx),
+        RuleNode::Block(c) => c.emit(builder, &ctx),
+        RuleNode::SetRequestHeader(c) => c.emit(builder, &ctx),
+        RuleNode::AppendRequestHeader(c) => c.emit(builder, &ctx),
+        RuleNode::RemoveRequestHeader(c) => c.emit(builder, &ctx),
+        RuleNode::SetResponseHeader(c) => c.emit(builder, &ctx),
+        RuleNode::AppendResponseHeader(c) => c.emit(builder, &ctx),
+        RuleNode::RemoveResponseHeader(c) => c.emit(builder, &ctx),
+        RuleNode::RewritePath(c) => c.emit(builder, &ctx),
+        RuleNode::RewritePathRegex(c) => c.emit(builder, &ctx),
+        RuleNode::Upstream(c) => c.emit(builder, &ctx),
         #[cfg(feature = "scripting")]
-        RuleNode::Script(c) => {
-            let mut layer = crate::middleware::ScriptLayer::from_file(&c.file)?;
-            if let Some(max) = c.max_body_bytes {
-                layer = layer.max_body_bytes(max);
-            }
-            if c.shared {
-                layer = layer.shared();
-            }
-            builder = apply_layer(builder, pred, layer);
-        }
+        RuleNode::Script(c) => c.emit(builder, &ctx),
         RuleNode::Match(_)
         | RuleNode::Host(_)
         | RuleNode::Path(_)
         | RuleNode::Method(_)
         | RuleNode::Methods(_) => unreachable!("walk only emits leaf decls"),
     }
-    Ok(builder)
+}
+
+impl Rule for LogConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let logger = if let Some(true) = self.bodies {
+            TrafficLogger::new().log_bodies(true)
+        } else {
+            TrafficLogger::new()
+        };
+        Ok(apply_layer(builder, ctx.pred.clone(), logger))
+    }
+}
+
+impl Rule for LatencyConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let injector = match DurationOrRange::from_str(&self.value).map_err(anyhow_str)? {
+            DurationOrRange::Fixed(d) => LatencyInjector::fixed(d),
+            DurationOrRange::Range(lo, hi) => LatencyInjector::uniform(lo..hi),
+        };
+        Ok(apply_layer(builder, ctx.pred.clone(), injector))
+    }
+}
+
+impl Rule for BandwidthConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        Ok(apply_layer(
+            builder,
+            ctx.pred.clone(),
+            BandwidthThrottle::new(self.bps),
+        ))
+    }
+}
+
+impl Rule for FaultConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut inj = FaultInjector::new()
+            .error_rate(self.error_rate)
+            .abort_rate(self.abort_rate);
+        if let Some(status) = self.error_status {
+            let status = http::StatusCode::from_u16(status)
+                .map_err(|e| anyhow::anyhow!("invalid error_status: {e}"))?;
+            inj = inj.error_status(status);
+        }
+        Ok(apply_layer(builder, ctx.pred.clone(), inj))
+    }
+}
+
+impl Rule for RateLimitConfig {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let window = parse_duration(&self.window).map_err(anyhow_str)?;
+        #[cfg(feature = "redis")]
+        if let Some(conn) = ctx.redis {
+            let rate = self.count as f64 / window.as_secs_f64();
+            let burst = self.burst.map(|b| b as f64).unwrap_or(self.count as f64);
+            let store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst)
+                .scope(ctx.scope_label);
+            let limiter = if self.per_host {
+                RateLimiter::with_store(store, host_key)
+            } else {
+                RateLimiter::with_store(store, |_| String::new())
+            };
+            return Ok(apply_layer(builder, ctx.pred.clone(), limiter));
+        }
+        Ok(apply_layer(
+            builder,
+            ctx.pred.clone(),
+            build_rate_limiter(&self, window),
+        ))
+    }
+}
+
+impl Rule for SlidingWindowConfig {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let window = parse_duration(&self.window).map_err(anyhow_str)?;
+        #[cfg(feature = "redis")]
+        if let Some(conn) = ctx.redis {
+            let store =
+                crate::middleware::RedisSlidingWindowStore::new(conn.clone(), self.count, window)
+                    .scope(ctx.scope_label);
+            let sw = if self.per_host {
+                SlidingWindow::with_store(store, host_key)
+            } else {
+                SlidingWindow::with_store(store, |_| String::new())
+            };
+            return Ok(apply_layer(builder, ctx.pred.clone(), sw));
+        }
+        let sw = if self.per_host {
+            SlidingWindow::per_host(self.count, window)
+        } else {
+            SlidingWindow::global(self.count, window)
+        };
+        Ok(apply_layer(builder, ctx.pred.clone(), sw))
+    }
+}
+
+impl Rule for RetryConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        Ok(apply_layer(builder, ctx.pred.clone(), build_retry(self)?))
+    }
+}
+
+impl Rule for CircuitBreakerConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let recovery = parse_duration(&self.recovery).map_err(anyhow_str)?;
+        #[cfg(feature = "redis")]
+        if let Some(conn) = ctx.redis {
+            let mut store = crate::middleware::RedisCircuitBreakerStore::new(
+                conn.clone(),
+                self.threshold,
+                recovery,
+            )
+            .scope(ctx.scope_label);
+            if let Some(probes) = self.half_open_probes {
+                store = store.half_open_probes(probes);
+            }
+            if let Some(ref ttl) = self.cache_ttl {
+                store = store.cache_ttl(parse_duration(ttl).map_err(anyhow_str)?);
+            }
+            let cb = if self.per_host {
+                CircuitBreaker::with_store(store, host_key)
+            } else {
+                CircuitBreaker::with_store(store, |_| String::new())
+            };
+            return Ok(apply_layer(builder, ctx.pred.clone(), cb));
+        }
+        Ok(apply_layer(
+            builder,
+            ctx.pred.clone(),
+            build_circuit_breaker(&self, recovery),
+        ))
+    }
+}
+
+impl Rule for RespondConfig {
+    fn is_exclusive(&self) -> bool {
+        true
+    }
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let status = self.status.unwrap_or(200);
+        let status = http::StatusCode::from_u16(status)
+            .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
+        Ok(apply_layer(
+            builder,
+            ctx.pred.clone(),
+            SetResponse::new(status, self.body),
+        ))
+    }
+}
+
+impl Rule for BlockConfig {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut bl = BlockList::new();
+        for h in self.hosts {
+            bl = bl
+                .host(&h.pattern)
+                .map_err(|e| anyhow::anyhow!("invalid block host '{}': {e}", h.pattern))?;
+        }
+        for p in self.paths {
+            bl = bl
+                .path(&p.pattern)
+                .map_err(|e| anyhow::anyhow!("invalid block path '{}': {e}", p.pattern))?;
+        }
+        if let Some(resp) = self.response {
+            let status = resp.status.unwrap_or(403);
+            let status = http::StatusCode::from_u16(status)
+                .map_err(|e| anyhow::anyhow!("invalid block status: {e}"))?;
+            let body = resp.body.unwrap_or_default();
+            bl = bl.response(status, body);
+        }
+        Ok(apply_layer(builder, ctx.pred.clone(), bl))
+    }
+}
+
+impl Rule for SetRequestHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().set_request(&self.name, &self.value);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for AppendRequestHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().append_request(&self.name, &self.value);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for RemoveRequestHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().remove_request(&self.name);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for SetResponseHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().set_response(&self.name, &self.value);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for AppendResponseHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().append_response(&self.name, &self.value);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for RemoveResponseHeader {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let m = ModifyHeaders::new().remove_response(&self.name);
+        Ok(apply_layer(builder, ctx.pred.clone(), m))
+    }
+}
+
+impl Rule for RewritePath {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let rw = UrlRewrite::path(&self.pattern, &self.replace)
+            .map_err(|e| anyhow::anyhow!("invalid rewrite-path pattern '{}': {e}", self.pattern))?;
+        Ok(apply_layer(builder, ctx.pred.clone(), rw))
+    }
+}
+
+impl Rule for RewritePathRegex {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let rw = UrlRewrite::regex(&self.pattern, &self.replace).map_err(|e| {
+            anyhow::anyhow!("invalid rewrite-path-regex regex '{}': {e}", self.pattern)
+        })?;
+        Ok(apply_layer(builder, ctx.pred.clone(), rw))
+    }
+}
+
+impl Rule for UpstreamConfig {
+    fn emit(
+        self,
+        mut builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut upstream = if self.urls.len() == 1 {
+            Upstream::new([self.urls.into_iter().next().unwrap()])?
+        } else {
+            Upstream::balanced(self.urls)?
+        };
+        if let Some(ref balance) = self.balance {
+            upstream = upstream.strategy(parse_balance_strategy(balance)?);
+        }
+        if let Some(p) = ctx.pred.clone() {
+            builder = builder.route(move |req| p(req), upstream);
+        } else {
+            builder = builder.route(|_| true, upstream);
+        }
+        Ok(builder)
+    }
+}
+
+#[cfg(feature = "scripting")]
+impl Rule for ScriptConfig {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut layer = crate::middleware::ScriptLayer::from_file(&self.file)?;
+        if let Some(max) = self.max_body_bytes {
+            layer = layer.max_body_bytes(max);
+        }
+        if self.shared {
+            layer = layer.shared();
+        }
+        Ok(apply_layer(builder, ctx.pred.clone(), layer))
+    }
 }
 
 fn apply_layer<L>(
