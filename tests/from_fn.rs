@@ -95,14 +95,14 @@ async fn from_fn_short_circuits_without_calling_next() {
 }
 
 #[tokio::test]
-async fn http_middleware_builder_method() {
+async fn middleware_builder_method() {
     let upstream_addr = start_upstream("original").await;
 
     let proxy = noxy::Proxy::builder()
         .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
         .unwrap()
         .danger_accept_invalid_upstream_certs()
-        .http_middleware(|req, next| async move {
+        .middleware(|req, next| async move {
             let mut resp = next.run(req).await?;
             resp.headers_mut()
                 .insert("x-middleware", "works".parse().unwrap());
@@ -140,7 +140,7 @@ async fn from_fn_with_shared_state() {
         .ca_pem_files("tests/dummy-cert.pem", "tests/dummy-key.pem")
         .unwrap()
         .danger_accept_invalid_upstream_certs()
-        .http_middleware(move |req, next| {
+        .middleware(move |req, next| {
             let counter = counter_clone.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
@@ -171,7 +171,7 @@ async fn from_fn_reverse_proxy() {
     let proxy = noxy::Proxy::builder()
         .reverse_proxy(&format!("http://127.0.0.1:{}", upstream_addr.port()))
         .unwrap()
-        .http_middleware(|req, next| async move {
+        .middleware(|req, next| async move {
             let mut resp = next.run(req).await?;
             resp.headers_mut()
                 .insert("x-reverse-fn", "yes".parse().unwrap());

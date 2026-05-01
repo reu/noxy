@@ -29,7 +29,7 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 - `handle_reverse_connection()` — reverse proxy: builds tower chain with fixed upstream, optionally TLS-accepts client, serves via hyper
 - `serve_client()` — shared hyper auto-builder + idle timeout + shutdown select, used by both modes
 - `HyperServiceAdapter` — bridges tower's `&mut self` call model to hyper's `&self` via `Arc<Mutex>`
-- `http_layer()` — accepts any `tower::Layer<HttpService>`, type-erased via `LayerFn` closures
+- `layer()` — accepts any `tower::Layer<HttpService>`, type-erased via `LayerFn` closures
 
 ### Scripting middleware (`src/middleware/script.rs`, behind `scripting` feature)
 - `ScriptLayer` / `ScriptService` — tower Layer/Service that runs JS/TS scripts via embedded V8 (`deno_core`)
@@ -119,7 +119,7 @@ Use `src/foo.rs` + `src/foo/bar.rs` layout instead of `src/foo/mod.rs`. This app
 ### Middleware checklist
 Every middleware should support all five surfaces. Adding one touches:
 
-1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `http_layer()` (in `src/middleware/<name>.rs`)
+1. **Direct API** — `RateLimiter::global(30, Duration::from_secs(1))` via `layer()` (in `src/middleware/<name>.rs`)
 2. **ProxyBuilder helper** — convenience method like `.rate_limit(30, Duration::from_secs(1))` (in `src/lib.rs`)
 3. **KDL config** (`src/config.rs`):
    - Define a `<Name>Config` struct with `#[derive(knus::Decode)]`

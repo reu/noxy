@@ -31,37 +31,37 @@ use noxy::middleware::*;
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
     // Log all traffic with request/response bodies
-    .http_layer(TrafficLogger::new().log_bodies(true))
+    .layer(TrafficLogger::new().log_bodies(true))
     // Decode gzip/brotli/deflate/zstd response bodies
-    .http_layer(ContentDecoder::new())
+    .layer(ContentDecoder::new())
     // Add latency to every request
-    .http_layer(LatencyInjector::fixed(Duration::from_millis(200)))
+    .layer(LatencyInjector::fixed(Duration::from_millis(200)))
     // Limit bandwidth to 50 KB/s
-    .http_layer(BandwidthThrottle::new(50 * 1024))
+    .layer(BandwidthThrottle::new(50 * 1024))
     // Global rate limit: 100 requests per second
-    .http_layer(RateLimiter::global(100, Duration::from_secs(1)))
+    .layer(RateLimiter::global(100, Duration::from_secs(1)))
     // Per-host sliding window: 10 req/s per hostname
-    .http_layer(SlidingWindow::per_host(10, Duration::from_secs(1)))
+    .layer(SlidingWindow::per_host(10, Duration::from_secs(1)))
     // Retry 429/5xx responses up to 3 times with exponential backoff
-    .http_layer(Retry::default().max_retries(3))
+    .layer(Retry::default().max_retries(3))
     // Trip circuit after 5 consecutive failures, recover in 30s
-    .http_layer(CircuitBreaker::global(5, Duration::from_secs(30)))
+    .layer(CircuitBreaker::global(5, Duration::from_secs(30)))
     // Inject request/response headers
-    .http_layer(
+    .layer(
         ModifyHeaders::new()
             .set_request("x-proxy", "noxy")
             .remove_response("server"),
     )
     // Rewrite request paths
-    .http_layer(UrlRewrite::path("/api/v1/{*rest}", "/v2/{rest}")?)
+    .layer(UrlRewrite::path("/api/v1/{*rest}", "/v2/{rest}")?)
     // Block tracking domains
-    .http_layer(BlockList::new().host("*.tracking.com")?)
+    .layer(BlockList::new().host("*.tracking.com")?)
     // 50% of requests to /flaky return 503
-    .http_layer(FaultInjector::new().error_rate(0.5).when_path("/flaky"))
+    .layer(FaultInjector::new().error_rate(0.5).when_path("/flaky"))
     // Glob pattern: add latency to all paths under /api/*/slow
-    .http_layer(LatencyInjector::fixed(Duration::from_millis(500)).when_path_glob("/api/*/slow")?)
+    .layer(LatencyInjector::fixed(Duration::from_millis(500)).when_path_glob("/api/*/slow")?)
     // Return a fixed response for /health
-    .http_layer(SetResponse::ok("ok").when_path("/health"))
+    .layer(SetResponse::ok("ok").when_path("/health"))
     .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
@@ -74,7 +74,7 @@ use noxy::Proxy;
 
 let proxy = Proxy::builder()
     .reverse_proxy("http://localhost:3000")?
-    .http_layer(my_tower_layer)
+    .layer(my_tower_layer)
     .build()?;
 
 proxy.listen("127.0.0.1:8080").await?;
@@ -106,14 +106,14 @@ Any tower `Layer<HttpService>` works in both modes. The innermost service forwar
 
 ### Custom middleware
 
-Use `http_middleware` to create middleware from an async closure instead of implementing `Layer` + `Service` manually. The closure receives each request and a `Next` handle for forwarding it downstream:
+Use `middleware` to create middleware from an async closure instead of implementing `Layer` + `Service` manually. The closure receives each request and a `Next` handle for forwarding it downstream:
 
 ```rust,ignore
 use noxy::Proxy;
 
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    .http_middleware(|mut req, next| async move {
+    .middleware(|mut req, next| async move {
         // Modify the request before forwarding
         req.headers_mut().insert("x-proxy", "noxy".parse().unwrap());
 
@@ -137,7 +137,7 @@ use noxy::http::full_body;
 
 let proxy = Proxy::builder()
     .reverse_proxy("http://localhost:3000")?
-    .http_middleware(|req, _next| async move {
+    .middleware(|req, _next| async move {
         if req.uri().path() == "/health" {
             return Ok(http::Response::new(full_body("ok")));
         }
@@ -157,7 +157,7 @@ let c = counter.clone();
 
 let proxy = Proxy::builder()
     .reverse_proxy("http://localhost:3000")?
-    .http_middleware(move |req, next| {
+    .middleware(move |req, next| {
         let c = c.clone();
         async move {
             c.fetch_add(1, Ordering::Relaxed);
@@ -167,7 +167,7 @@ let proxy = Proxy::builder()
     .build()?;
 ```
 
-The equivalent `from_fn` function works with `http_layer` for composability with `Conditional` and other layers:
+The equivalent `from_fn` function works with `layer` for composability with `Conditional` and other layers:
 
 ```rust,ignore
 use noxy::Proxy;
@@ -175,7 +175,7 @@ use noxy::middleware::from_fn;
 
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    .http_layer(from_fn(|req, next| async move {
+    .layer(from_fn(|req, next| async move {
         next.run(req).await
     }))
     .build()?;
@@ -685,7 +685,7 @@ use noxy::middleware::ScriptLayer;
 
 let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    .http_layer(ScriptLayer::from_file("middleware.ts")?)
+    .layer(ScriptLayer::from_file("middleware.ts")?)
     .build();
 ```
 
@@ -823,7 +823,7 @@ let limiter = RateLimiter::with_store(store, |_| String::new());  // global key
 
 let proxy = Proxy::builder()
     .reverse_proxy("http://localhost:3000")?
-    .http_layer(limiter)
+    .layer(limiter)
     .build()?;
 ```
 

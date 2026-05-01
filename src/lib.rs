@@ -99,7 +99,7 @@ enum ProxyMode {
 /// Builder for configuring a [`Proxy`].
 pub struct ProxyBuilder {
     ca: Option<CertificateAuthority>,
-    http_layers: Vec<LayerFn>,
+    layers: Vec<LayerFn>,
     accept_invalid_upstream_certs: bool,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
@@ -142,14 +142,14 @@ impl ProxyBuilder {
     /// is the outermost and sees requests first — matching the convention
     /// used by tower's `ServiceBuilder`. The innermost service forwards
     /// requests to the upstream server.
-    pub fn http_layer<L>(mut self, layer: L) -> Self
+    pub fn layer<L>(mut self, layer: L) -> Self
     where
         L: tower::Layer<HttpService> + Send + Sync + 'static,
         L::Service:
             Service<Request<Body>, Response = Response<Body>, Error = BoxError> + Send + 'static,
         <L::Service as Service<Request<Body>>>::Future: Send,
     {
-        self.http_layers.push(Box::new(move |svc| {
+        self.layers.push(Box::new(move |svc| {
             tower::util::BoxService::new(layer.layer(svc))
         }));
         self
@@ -157,7 +157,7 @@ impl ProxyBuilder {
 
     /// Add middleware from an async function.
     ///
-    /// This is a convenience wrapper around [`http_layer`](Self::http_layer)
+    /// This is a convenience wrapper around [`layer`](Self::layer)
     /// that avoids implementing [`Layer`](tower::Layer) and
     /// [`Service`](tower::Service) manually. The function receives each
     /// request and a [`Next`](middleware::Next) handle; call
@@ -172,7 +172,7 @@ impl ProxyBuilder {
     /// # fn main() -> anyhow::Result<()> {
     /// let proxy = Proxy::builder()
     ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    ///     .http_middleware(|mut req, next| async move {
+    ///     .middleware(|mut req, next| async move {
     ///         req.headers_mut()
     ///             .insert("x-proxy", "noxy".parse().unwrap());
     ///         let mut response = next.run(req).await?;
@@ -185,47 +185,47 @@ impl ProxyBuilder {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn http_middleware<F, Fut>(self, f: F) -> Self
+    pub fn middleware<F, Fut>(self, f: F) -> Self
     where
         F: Fn(Request<Body>, middleware::Next) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Response<Body>, BoxError>> + Send + 'static,
     {
-        self.http_layer(middleware::from_fn(f))
+        self.layer(middleware::from_fn(f))
     }
 
     /// Add a traffic logger that logs request/response metadata to stderr.
     ///
     /// Use [`TrafficLogger`](middleware::TrafficLogger) directly with
-    /// [`http_layer`](Self::http_layer) for more control (custom writer,
+    /// [`layer`](Self::layer) for more control (custom writer,
     /// body logging).
     pub fn traffic_logger(self) -> Self {
-        self.http_layer(middleware::TrafficLogger::new())
+        self.layer(middleware::TrafficLogger::new())
     }
 
     /// Add a fixed latency before each request is forwarded upstream.
     ///
     /// Use [`LatencyInjector`](middleware::LatencyInjector) directly with
-    /// [`http_layer`](Self::http_layer) for more control (e.g., random range).
+    /// [`layer`](Self::layer) for more control (e.g., random range).
     pub fn latency(self, delay: std::time::Duration) -> Self {
-        self.http_layer(middleware::LatencyInjector::fixed(delay))
+        self.layer(middleware::LatencyInjector::fixed(delay))
     }
 
     /// Throttle response body throughput to the given bytes per second.
     ///
     /// Use [`BandwidthThrottle`](middleware::BandwidthThrottle) directly with
-    /// [`http_layer`](Self::http_layer) for more control.
+    /// [`layer`](Self::layer) for more control.
     pub fn bandwidth(self, bytes_per_second: u64) -> Self {
-        self.http_layer(middleware::BandwidthThrottle::new(bytes_per_second))
+        self.layer(middleware::BandwidthThrottle::new(bytes_per_second))
     }
 
     /// Rate-limit requests globally: `count` requests per `window`.
     ///
     /// Stack multiple calls for multi-window limiting (e.g., per-second +
     /// per-minute). Use [`RateLimiter`](middleware::RateLimiter) directly
-    /// with [`http_layer`](Self::http_layer) for per-host keying or custom
+    /// with [`layer`](Self::layer) for per-host keying or custom
     /// burst.
     pub fn rate_limit(self, count: u64, window: Duration) -> Self {
-        self.http_layer(middleware::RateLimiter::global(count, window))
+        self.layer(middleware::RateLimiter::global(count, window))
     }
 
     /// Sliding window rate-limit: hard-cap `count` requests per `window`
@@ -233,74 +233,74 @@ impl ProxyBuilder {
     /// enforces a strict count with no burst or smoothing.
     ///
     /// Use [`SlidingWindow`](middleware::SlidingWindow) directly with
-    /// [`http_layer`](Self::http_layer) for per-host keying or custom key
+    /// [`layer`](Self::layer) for per-host keying or custom key
     /// functions.
     pub fn sliding_window(self, count: u64, window: Duration) -> Self {
-        self.http_layer(middleware::SlidingWindow::global(count, window))
+        self.layer(middleware::SlidingWindow::global(count, window))
     }
 
     /// Retry failed requests up to `max_retries` times with exponential
     /// backoff. Retries on 429, 502, 503, and 504 by default.
     ///
     /// Use [`Retry`](middleware::Retry) directly with
-    /// [`http_layer`](Self::http_layer) for custom status codes or backoff.
+    /// [`layer`](Self::layer) for custom status codes or backoff.
     pub fn retry(self, max_retries: u32) -> Self {
-        self.http_layer(middleware::Retry::default().max_retries(max_retries))
+        self.layer(middleware::Retry::default().max_retries(max_retries))
     }
 
     /// Circuit breaker that trips after `threshold` consecutive 5xx failures
     /// and recovers after `recovery` duration.
     ///
     /// Use [`CircuitBreaker`](middleware::CircuitBreaker) directly with
-    /// [`http_layer`](Self::http_layer) for per-host keying, custom failure
+    /// [`layer`](Self::layer) for per-host keying, custom failure
     /// policies, or half-open probe configuration.
     pub fn circuit_breaker(self, threshold: u32, recovery: Duration) -> Self {
-        self.http_layer(middleware::CircuitBreaker::global(threshold, recovery))
+        self.layer(middleware::CircuitBreaker::global(threshold, recovery))
     }
 
     /// Set (insert or replace) a request header on all proxied requests.
     ///
     /// Use [`ModifyHeaders`](middleware::ModifyHeaders) directly with
-    /// [`http_layer`](Self::http_layer) for multiple operations or
+    /// [`layer`](Self::layer) for multiple operations or
     /// response header modifications.
     pub fn set_request_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.http_layer(middleware::ModifyHeaders::new().set_request(name, value))
+        self.layer(middleware::ModifyHeaders::new().set_request(name, value))
     }
 
     /// Remove a request header from all proxied requests.
     pub fn remove_request_header(self, name: impl AsRef<str>) -> Self {
-        self.http_layer(middleware::ModifyHeaders::new().remove_request(name))
+        self.layer(middleware::ModifyHeaders::new().remove_request(name))
     }
 
     /// Set (insert or replace) a response header on all proxied responses.
     pub fn set_response_header(self, name: impl AsRef<str>, value: impl AsRef<str>) -> Self {
-        self.http_layer(middleware::ModifyHeaders::new().set_response(name, value))
+        self.layer(middleware::ModifyHeaders::new().set_response(name, value))
     }
 
     /// Remove a response header from all proxied responses.
     pub fn remove_response_header(self, name: impl AsRef<str>) -> Self {
-        self.http_layer(middleware::ModifyHeaders::new().remove_response(name))
+        self.layer(middleware::ModifyHeaders::new().remove_response(name))
     }
 
     /// Block requests to hosts matching any of the given glob patterns.
     ///
     /// Blocked requests receive a `403 Forbidden` response. Use
     /// [`BlockList`](middleware::BlockList) directly with
-    /// [`http_layer`](Self::http_layer) for custom status codes, response
+    /// [`layer`](Self::layer) for custom status codes, response
     /// bodies, or path-based blocking.
     pub fn block_hosts(
         self,
         patterns: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self, globset::Error> {
-        Ok(self.http_layer(middleware::BlockList::hosts(patterns)?))
+        Ok(self.layer(middleware::BlockList::hosts(patterns)?))
     }
 
     /// Rewrite request paths using a `matchit`-style route pattern.
     ///
     /// Use [`UrlRewrite`](middleware::UrlRewrite) directly with
-    /// [`http_layer`](Self::http_layer) for regex rewrites or multiple rules.
+    /// [`layer`](Self::layer) for regex rewrites or multiple rules.
     pub fn rewrite_path(self, pattern: &str, replacement: &str) -> Self {
-        self.http_layer(
+        self.layer(
             middleware::UrlRewrite::path(pattern, replacement).expect("invalid rewrite pattern"),
         )
     }
@@ -309,13 +309,13 @@ impl ProxyBuilder {
     ///
     /// Blocked requests receive a `403 Forbidden` response. Use
     /// [`BlockList`](middleware::BlockList) directly with
-    /// [`http_layer`](Self::http_layer) for custom status codes, response
+    /// [`layer`](Self::layer) for custom status codes, response
     /// bodies, or host-based blocking.
     pub fn block_paths(
         self,
         patterns: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self, globset::Error> {
-        Ok(self.http_layer(middleware::BlockList::paths(patterns)?))
+        Ok(self.layer(middleware::BlockList::paths(patterns)?))
     }
 
     /// Set a timeout for the handshake phase before `serve_connection`:
@@ -526,7 +526,7 @@ impl ProxyBuilder {
             }
         };
 
-        let mut http_layers = self.http_layers;
+        let mut layers = self.layers;
         if !self.routes.is_empty() {
             let mut router = middleware::Router::new();
             for (predicate, upstream) in self.routes {
@@ -536,12 +536,12 @@ impl ProxyBuilder {
             let router_layer: LayerFn = Box::new(move |svc| {
                 tower::util::BoxService::new(tower::Layer::layer(&router, svc))
             });
-            http_layers.push(router_layer);
+            layers.push(router_layer);
         }
 
         Ok(Proxy {
             mode,
-            http_layers: Arc::new(http_layers),
+            layers: Arc::new(layers),
             upstream_client,
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
@@ -627,7 +627,7 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
 #[derive(Clone)]
 pub struct Proxy {
     mode: ProxyMode,
-    http_layers: Arc<Vec<LayerFn>>,
+    layers: Arc<Vec<LayerFn>>,
     upstream_client: UpstreamClient,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
@@ -640,7 +640,7 @@ impl Proxy {
     pub fn builder() -> ProxyBuilder {
         ProxyBuilder {
             ca: None,
-            http_layers: Vec::new(),
+            layers: Vec::new(),
             accept_invalid_upstream_certs: false,
             handshake_timeout: None,
             idle_timeout: None,
@@ -831,7 +831,7 @@ impl Proxy {
     ) -> HttpService {
         let forward = ForwardService::new(self.upstream_client.clone(), authority, scheme);
         let mut service: HttpService = tower::util::BoxService::new(forward);
-        for layer_fn in self.http_layers.iter().rev() {
+        for layer_fn in self.layers.iter().rev() {
             service = layer_fn(service);
         }
         service

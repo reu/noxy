@@ -39,7 +39,7 @@ struct Rule {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(
+///     .layer(
 ///         Conditional::new()
 ///             .when(
 ///                 |req| req.uri().path().starts_with("/slow"),
@@ -146,7 +146,7 @@ impl Conditional {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(BandwidthThrottle::new(50 * 1024).when_path("/downloads"))
+///     .layer(BandwidthThrottle::new(50 * 1024).when_path("/downloads"))
 ///     .build()?;
 /// # Ok(())
 /// # }

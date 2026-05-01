@@ -44,7 +44,7 @@ impl Next {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(from_fn(|mut req, next: noxy::middleware::Next| async move {
+///     .layer(from_fn(|mut req, next: noxy::middleware::Next| async move {
 ///         req.headers_mut()
 ///             .insert("x-injected", "true".parse().unwrap());
 ///         next.run(req).await

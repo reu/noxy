@@ -183,8 +183,8 @@ impl RateLimitStore for InMemoryRateLimitStore {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(RateLimiter::global(30, Duration::from_secs(1)))
-///     .http_layer(RateLimiter::keyed(100, Duration::from_secs(1), |req| {
+///     .layer(RateLimiter::global(30, Duration::from_secs(1)))
+///     .layer(RateLimiter::keyed(100, Duration::from_secs(1), |req| {
 ///         req.headers()
 ///             .get("x-api-key")
 ///             .and_then(|v| v.to_str().ok())

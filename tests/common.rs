@@ -53,7 +53,7 @@ pub async fn start_proxy(
         .danger_accept_invalid_upstream_certs();
 
     for layer in layers {
-        builder = builder.http_layer(BoxedLayer(layer));
+        builder = builder.layer(BoxedLayer(layer));
     }
 
     let proxy = builder.build().unwrap();
@@ -172,7 +172,7 @@ pub async fn start_reverse_proxy(
         .danger_accept_invalid_upstream_certs();
 
     for layer in layers {
-        builder = builder.http_layer(BoxedLayer(layer));
+        builder = builder.layer(BoxedLayer(layer));
     }
 
     let proxy = builder.build().unwrap();

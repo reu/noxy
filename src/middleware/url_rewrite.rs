@@ -55,7 +55,7 @@ impl RewriteRule {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(UrlRewrite::path("/api/v1/{*rest}", "/v2/{rest}")?)
+///     .layer(UrlRewrite::path("/api/v1/{*rest}", "/v2/{rest}")?)
 ///     .build()?;
 /// # Ok(())
 /// # }

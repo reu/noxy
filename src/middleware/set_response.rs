@@ -21,7 +21,7 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(
+///     .layer(
 ///         Conditional::new()
 ///             .when(
 ///                 |req| req.uri().path() == "/health",

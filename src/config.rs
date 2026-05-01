@@ -1811,9 +1811,9 @@ where
     <L::Service as tower::Service<Request<Body>>>::Future: Send,
 {
     if let Some(p) = pred {
-        builder.http_layer(Conditional::new().when(move |req| p(req), layer))
+        builder.layer(Conditional::new().when(move |req| p(req), layer))
     } else {
-        builder.http_layer(layer)
+        builder.layer(layer)
     }
 }
 

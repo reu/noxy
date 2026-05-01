@@ -111,7 +111,7 @@ impl Clone for PolicyKind {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(Retry::default())
+///     .layer(Retry::default())
 ///     .build()?;
 /// # Ok(())
 /// # }
@@ -236,7 +236,7 @@ impl Retry {
     /// # fn main() -> anyhow::Result<()> {
     /// let proxy = Proxy::builder()
     ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    ///     .http_layer(
+    ///     .layer(
     ///         Retry::default().max_retries(3).policy_headers(|parts, attempt| {
     ///             if parts.status.is_server_error() {
     ///                 Some(Duration::from_secs(1 << attempt))
@@ -277,7 +277,7 @@ impl Retry {
     /// # fn main() -> anyhow::Result<()> {
     /// let proxy = Proxy::builder()
     ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-    ///     .http_layer(
+    ///     .layer(
     ///         Retry::default().max_retries(3).policy(|resp, attempt| {
     ///             if resp.body().starts_with(b"error") {
     ///                 Some(Duration::from_secs(1 << attempt))

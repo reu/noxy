@@ -35,7 +35,7 @@ enum Phase {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(
+///     .layer(
 ///         ModifyHeaders::new()
 ///             .set_request("x-proxy", "noxy")
 ///             .remove_response("server")

@@ -64,7 +64,7 @@ async fn proxy_relays_data() {
 }
 
 #[tokio::test]
-async fn proxy_applies_http_layer() {
+async fn proxy_applies_layer() {
     let upstream_addr = start_upstream("hello").await;
     let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
         tower::util::BoxService::new(AddResponseHeader {
@@ -87,7 +87,7 @@ async fn proxy_applies_http_layer() {
 }
 
 #[tokio::test]
-async fn proxy_chains_http_layers() {
+async fn proxy_chains_layers() {
     let upstream_addr = start_upstream("hello").await;
     let proxy_addr = start_proxy(vec![
         Box::new(|inner: HttpService| {

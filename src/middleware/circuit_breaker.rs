@@ -236,7 +236,7 @@ impl CircuitBreakerStore for InMemoryCircuitBreakerStore {
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(CircuitBreaker::global(5, Duration::from_secs(30)))
+///     .layer(CircuitBreaker::global(5, Duration::from_secs(30)))
 ///     .build()?;
 /// # Ok(())
 /// # }

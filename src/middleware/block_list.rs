@@ -26,7 +26,7 @@ type ResponseFn = Arc<dyn Fn(&Request<Body>) -> Response<Body> + Send + Sync>;
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .http_layer(BlockList::hosts(["*.tracking.com", "ads.example.com"])?)
+///     .layer(BlockList::hosts(["*.tracking.com", "ads.example.com"])?)
 ///     .build()?;
 /// # Ok(())
 /// # }
