@@ -673,16 +673,24 @@ fn and_predicates(preds: &[Predicate]) -> Option<Predicate> {
 
 impl ProxyConfig {
     /// Parse config from a KDL string.
-    pub fn from_kdl(s: &str) -> anyhow::Result<Self> {
-        knus::parse::<Self>("<config>", s).map_err(|e| anyhow::anyhow!("{e:?}"))
+    ///
+    /// Errors are returned as [`miette::Report`] so they keep their source
+    /// spans. With the `fancy` feature on miette enabled in the binary,
+    /// failures render as a colored snippet pointing at the offending token.
+    pub fn from_kdl(s: &str) -> miette::Result<Self> {
+        knus::parse::<Self>("<config>", s).map_err(miette::Report::new)
     }
 
-    /// Load config from a KDL file.
-    pub fn from_kdl_file(path: impl AsRef<std::path::Path>) -> anyhow::Result<Self> {
+    /// Load config from a KDL file. Errors carry source spans for fancy
+    /// rendering — see [`from_kdl`](Self::from_kdl).
+    pub fn from_kdl_file(path: impl AsRef<std::path::Path>) -> miette::Result<Self> {
+        use miette::IntoDiagnostic;
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path)?;
+        let content = std::fs::read_to_string(path)
+            .into_diagnostic()
+            .map_err(|e| e.wrap_err(format!("failed to read {}", path.display())))?;
         let label = path.display().to_string();
-        knus::parse::<Self>(&label, &content).map_err(|e| anyhow::anyhow!("{e:?}"))
+        knus::parse::<Self>(&label, &content).map_err(miette::Report::new)
     }
 
     /// Compile this config into a list of bindable proxy listeners.

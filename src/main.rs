@@ -162,7 +162,9 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> miette::Result<()> {
+    use miette::IntoDiagnostic;
+
     let cli = Cli::parse();
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -182,19 +184,31 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if cli.generate {
-        let ca = noxy::CertificateAuthority::generate_with_cn("Noxy CA")?;
-        ca.to_pem_files(&cli.cert, &cli.key)?;
+        let ca = noxy::CertificateAuthority::generate_with_cn("Noxy CA").into_diagnostic()?;
+        ca.to_pem_files(&cli.cert, &cli.key).into_diagnostic()?;
         tracing::info!(path = %cli.cert, "generated CA certificate");
         tracing::info!(path = %cli.key, "generated CA private key");
         return Ok(());
     }
 
-    let mut config = if let Some(ref path) = cli.config {
+    // Native miette path: knus errors keep their source spans and render
+    // through the fancy reporter on Err.
+    let config = if let Some(ref path) = cli.config {
         ProxyConfig::from_kdl_file(path)?
     } else {
         ProxyConfig::default()
     };
 
+    // Everything below is anyhow-flavored — apply CLI overrides, build, run.
+    // Convert at the boundary so the miette-flavored from_kdl_file error is
+    // never downgraded. (`anyhow::Error` doesn't implement `std::error::Error`
+    // in this version, so we render through Display rather than `into_diagnostic`.)
+    apply_cli_and_run(cli, config)
+        .await
+        .map_err(|e| miette::miette!("{e:#}"))
+}
+
+async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<()> {
     if cli.accept_invalid_certs {
         config.accept_invalid_upstream_certs = true;
     }
