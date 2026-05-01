@@ -188,7 +188,9 @@ pub enum RuleNode {
     RewritePathRegex(RewritePathRegex),
 
     #[cfg(feature = "scripting")]
-    Script(ScriptConfig),
+    Script(Script),
+    #[cfg(feature = "scripting")]
+    ScriptFile(ScriptFile),
 }
 
 /// `match host="..." path="..." method="..." { ... }` — multi-field.
@@ -498,9 +500,22 @@ pub struct RewritePathRegex {
     pub replace: String,
 }
 
+/// `script r#"..."#` — inline TypeScript or JavaScript source.
 #[cfg(feature = "scripting")]
 #[derive(Decode, Debug, Clone)]
-pub struct ScriptConfig {
+pub struct Script {
+    #[knus(argument)]
+    pub source: String,
+    #[knus(property, default)]
+    pub shared: bool,
+    #[knus(property)]
+    pub max_body_bytes: Option<usize>,
+}
+
+/// `script-file "path.ts"` — load script from a file. TS is transpiled.
+#[cfg(feature = "scripting")]
+#[derive(Decode, Debug, Clone)]
+pub struct ScriptFile {
     #[knus(argument)]
     pub file: String,
     #[knus(property, default)]
@@ -1056,6 +1071,8 @@ fn rule_is_exclusive(node: &RuleNode) -> bool {
         RuleNode::Upstream(c) => c.is_exclusive(),
         #[cfg(feature = "scripting")]
         RuleNode::Script(c) => c.is_exclusive(),
+        #[cfg(feature = "scripting")]
+        RuleNode::ScriptFile(c) => c.is_exclusive(),
         RuleNode::Match(_)
         | RuleNode::Host(_)
         | RuleNode::Path(_)
@@ -1087,6 +1104,8 @@ fn rule_min_scope(node: &RuleNode) -> RuleScope {
         RuleNode::Upstream(c) => c.min_scope(),
         #[cfg(feature = "scripting")]
         RuleNode::Script(c) => c.min_scope(),
+        #[cfg(feature = "scripting")]
+        RuleNode::ScriptFile(c) => c.min_scope(),
         RuleNode::Match(_)
         | RuleNode::Host(_)
         | RuleNode::Path(_)
@@ -1118,6 +1137,8 @@ fn rule_node_name(node: &RuleNode) -> &'static str {
         RuleNode::Upstream(_) => "upstream",
         #[cfg(feature = "scripting")]
         RuleNode::Script(_) => "script",
+        #[cfg(feature = "scripting")]
+        RuleNode::ScriptFile(_) => "script-file",
         RuleNode::Match(_) => "match",
         RuleNode::Host(_) => "host",
         RuleNode::Path(_) => "path",
@@ -1428,6 +1449,8 @@ fn emit_decl(builder: crate::ProxyBuilder, decl: Decl) -> anyhow::Result<crate::
         RuleNode::Upstream(c) => c.emit(builder, &ctx),
         #[cfg(feature = "scripting")]
         RuleNode::Script(c) => c.emit(builder, &ctx),
+        #[cfg(feature = "scripting")]
+        RuleNode::ScriptFile(c) => c.emit(builder, &ctx),
         RuleNode::Match(_)
         | RuleNode::Host(_)
         | RuleNode::Path(_)
@@ -1786,7 +1809,25 @@ impl Rule for UpstreamConfig {
 }
 
 #[cfg(feature = "scripting")]
-impl Rule for ScriptConfig {
+impl Rule for Script {
+    fn emit(
+        self,
+        builder: crate::ProxyBuilder,
+        ctx: &EmitCtx<'_>,
+    ) -> anyhow::Result<crate::ProxyBuilder> {
+        let mut layer = crate::middleware::ScriptLayer::from_ts_source(&self.source, "<inline>")?;
+        if let Some(max) = self.max_body_bytes {
+            layer = layer.max_body_bytes(max);
+        }
+        if self.shared {
+            layer = layer.shared();
+        }
+        Ok(apply_layer(builder, ctx.pred.clone(), layer))
+    }
+}
+
+#[cfg(feature = "scripting")]
+impl Rule for ScriptFile {
     fn emit(
         self,
         builder: crate::ProxyBuilder,
@@ -2130,6 +2171,70 @@ mod tests {
             assert_eq!(u.balance.as_deref(), Some("round-robin"));
         } else {
             panic!("expected Upstream");
+        }
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn parse_script_inline() {
+        let cfg = ProxyConfig::from_kdl(
+            r##"
+            script shared=true max-body-bytes=2048 r#"
+                export default async function(req, respond) {
+                    return await respond(req);
+                }
+            "#
+            "##,
+        )
+        .unwrap();
+        if let RuleNode::Script(ref s) = cfg.body[0] {
+            assert!(s.source.contains("export default async function"));
+            assert!(s.shared);
+            assert_eq!(s.max_body_bytes, Some(2048));
+        } else {
+            panic!("expected Script (inline)");
+        }
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn into_listeners_inline_script_transpiles_ts() {
+        install_crypto_provider();
+        let cfg = ProxyConfig::from_kdl(
+            r##"
+            forward port=8080 {
+                ca cert="tests/dummy-cert.pem" key="tests/dummy-key.pem"
+
+                script r#"
+                    export default async function(req: Request, respond: Function) {
+                        const res: Response = await respond(req);
+                        return res;
+                    }
+                "#
+            }
+            "##,
+        )
+        .unwrap();
+        // Builds successfully = transpile + layer construction worked.
+        let listeners = cfg.into_listeners().unwrap();
+        assert_eq!(listeners.len(), 1);
+    }
+
+    #[cfg(feature = "scripting")]
+    #[test]
+    fn parse_script_file() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            script-file "middleware.ts" shared=true max-body-bytes=4096
+            "#,
+        )
+        .unwrap();
+        if let RuleNode::ScriptFile(ref s) = cfg.body[0] {
+            assert_eq!(s.file, "middleware.ts");
+            assert!(s.shared);
+            assert_eq!(s.max_body_bytes, Some(4096));
+        } else {
+            panic!("expected ScriptFile");
         }
     }
 

@@ -559,12 +559,20 @@ forward port=8080 {
         response status=404 body="not found"
     }
 
-    // Run a TypeScript middleware script (requires scripting feature)
-    // script "middleware.ts"
+    // Run a TypeScript middleware script from a file (requires scripting feature)
+    // script-file "middleware.ts"
+
+    // Or inline the script source directly with a raw string
+    // script r#"
+    //     export default async function(req, respond) {
+    //         req.headers.set("x-from-inline", "yes");
+    //         return await respond(req);
+    //     }
+    // "#
 
     // Run a script with a shared V8 isolate across all connections, scoped to /api
     // path "/api/" {
-    //     script "api_middleware.ts" shared=true
+    //     script-file "api_middleware.ts" shared=true
     // }
 
     // Return 503 for all paths under /fail
@@ -673,7 +681,8 @@ Path globs use `*` (single segment), `**` (any depth), `?` (single char), `[a-z]
 | `remove-response-header`     | `remove-response-header "server"`                                      | Removes one response header. |
 | `rewrite-path`               | `rewrite-path "/api/v1/{*rest}" "/v2/{rest}"`                          | matchit-pattern rewrite. |
 | `rewrite-path-regex`         | `rewrite-path-regex "/v\\d+/(.*)" "/latest/$1"`                        | Regex rewrite. |
-| `script`                     | `script "middleware.ts" shared=true max-body-bytes=1048576`            | Requires `scripting` feature. |
+| `script`                     | `` script r#" /* inline TS or JS source */ "# shared=true max-body-bytes=1048576 ``  | Requires `scripting` feature. The positional arg is the source; use a raw string for multiline content. |
+| `script-file`                | `script-file "middleware.ts" shared=true max-body-bytes=1048576`       | Requires `scripting` feature. Loads the script from disk; TS is transpiled. |
 
 ## Scripting Middleware
 
@@ -687,6 +696,25 @@ let proxy = Proxy::builder()
     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
     .layer(ScriptLayer::from_file("middleware.ts")?)
     .build();
+```
+
+In KDL configs you can either point at a file or inline the source as a raw string. The inline `script` form is convenient for short scripts, demos, and tests; `script-file` is the right choice once a script grows past a handful of lines.
+
+```kdl
+forward port=8080 {
+    ca cert="ca.pem" key="ca-key.pem"
+
+    // Short script inline
+    script r#"
+        export default async function(req, respond) {
+            req.headers.set("x-injected", "yes");
+            return await respond(req);
+        }
+    "#
+
+    // Or load from a file (TS is transpiled automatically)
+    // script-file "middleware.ts" shared=true
+}
 ```
 
 The script exports a default async function that receives the request and a `respond` function to forward it upstream:

@@ -35,8 +35,10 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 - `ScriptLayer` / `ScriptService` — tower Layer/Service that runs JS/TS scripts via embedded V8 (`deno_core`)
 - Dedicated V8 thread (since `JsRuntime` is `!Send`) communicating via `mpsc`/`oneshot` channels
 - TypeScript transpiled at construction time via `deno_ast`
+- Three constructors: `ScriptLayer::from_file(path)` reads + transpiles + builds; `ScriptLayer::from_ts_source(source, name)` transpiles inline TS/JS; `ScriptLayer::from_source(source)` for already-JS source (skips transpile)
 - JS runtime shim (`script_runtime.js`) provides `Headers`, `Request`, `Response` classes and the `__noxy_handle` orchestrator
 - User script exports a default async function receiving `(req, respond)` — `respond` forwards upstream, returning without it short-circuits
+- KDL exposes both forms: `script r#"..."#` (inline source, positional arg) and `script-file "path.ts"` (file path)
 
 ### Config (`src/config.rs`, behind `config` feature)
 KDL config (parsed via `knus` 3.x, KDL 1.x syntax — `true`/`false`, **not** `#true`/`#false`). The top level has three zones:
@@ -67,7 +69,7 @@ trait Rule {
 
 **Exclusive vs additive (shadowing model):**
 - Exclusive (innermost-wins, outer carved out): `log`, `latency`, `bandwidth`, `fault`, `retry`, `circuit-breaker`, `respond`. Inner declaration replaces outer for matching requests.
-- Additive (all stack): `block`, all six `*-request-header` / `*-response-header` ops, `rewrite-path`, `rewrite-path-regex`, `rate-limit`, `sliding-window`, `upstream`, `script`. (`rate-limit` and `sliding-window` are technically additive because most-restrictive-wins is already correct semantics; `upstream` routes via the Router's first-match-wins.)
+- Additive (all stack): `block`, all six `*-request-header` / `*-response-header` ops, `rewrite-path`, `rewrite-path-regex`, `rate-limit`, `sliding-window`, `upstream`, `script`, `script-file`. (`rate-limit` and `sliding-window` are technically additive because most-restrictive-wins is already correct semantics; `upstream` routes via the Router's first-match-wins.)
 
 **Path matching:** `path "/v1"` is exact match. `path "/v1/"` (trailing slash) means "subtree-including-self" — matches `/v1`, `/v1/foo`, `/v1/foo/bar`. `path "/v1/**"` matches `/v1/foo` and below but not `/v1` itself. There is no `path-prefix` field anymore; trailing-slash is the convention.
 

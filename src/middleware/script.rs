@@ -465,6 +465,14 @@ impl ScriptLayer {
         Ok(Self::from_transpiled(source.to_string()))
     }
 
+    /// Load a script from inline TypeScript or JavaScript source.
+    /// `name` is used for error reporting (e.g., `"<inline>"`). TypeScript
+    /// is transpiled automatically.
+    pub fn from_ts_source(source: &str, name: &str) -> anyhow::Result<Self> {
+        let transpiled = transpile_source(source, name)?;
+        Ok(Self::from_transpiled(transpiled))
+    }
+
     fn from_transpiled(transpiled: String) -> Self {
         Self {
             source: Arc::new(transpiled),

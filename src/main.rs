@@ -360,7 +360,7 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
     if let Some(script_path) = cli.script {
         config
             .body
-            .push(RuleNode::Script(noxy::config::ScriptConfig {
+            .push(RuleNode::ScriptFile(noxy::config::ScriptFile {
                 file: script_path,
                 shared: false,
                 max_body_bytes: cli.script_max_body,
