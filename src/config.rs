@@ -625,22 +625,26 @@ impl ProxyConfig {
             None
         };
 
-        #[cfg(feature = "redis")]
-        let mut scope_counter: usize = 0;
-        let mut ctx = CompileCtx {
+        let mut decls: Vec<Decl> = Vec::new();
+        let mut walk = WalkCtx {
             preds: Vec::new(),
+            path: Vec::new(),
             #[cfg(feature = "redis")]
             scope_stack: Vec::new(),
             #[cfg(feature = "redis")]
-            scope_counter: &mut scope_counter,
-            #[cfg(feature = "redis")]
-            redis: redis_conn.as_ref(),
-            #[cfg(not(feature = "redis"))]
-            _phantom: std::marker::PhantomData,
+            scope_counter: 0,
         };
+        walk_body(self.body, &mut walk, &mut decls)?;
 
-        for node in self.body {
-            builder = compile_node(builder, node, &mut ctx)?;
+        resolve_exclusions(&mut decls);
+
+        for decl in decls {
+            builder = emit_decl(
+                builder,
+                decl,
+                #[cfg(feature = "redis")]
+                redis_conn.as_ref(),
+            )?;
         }
 
         Ok(builder)
@@ -651,45 +655,212 @@ fn anyhow_str(s: String) -> anyhow::Error {
     anyhow::anyhow!("{s}")
 }
 
-struct CompileCtx<'a> {
+/// Kind of a middleware leaf, used to identify same-kind declarations for
+/// shadowing (innermost-wins) on exclusive middlewares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MidKind {
+    Log,
+    Latency,
+    Bandwidth,
+    Fault,
+    RateLimit,
+    SlidingWindow,
+    Retry,
+    CircuitBreaker,
+    Respond,
+    Block,
+    SetReqHeader,
+    AppendReqHeader,
+    RemoveReqHeader,
+    SetResHeader,
+    AppendResHeader,
+    RemoveResHeader,
+    RewritePath,
+    RewritePathRegex,
+    Upstream,
+    #[cfg(feature = "scripting")]
+    Script,
+}
+
+impl MidKind {
+    /// Exclusive kinds participate in shadowing: a more deeply-nested
+    /// declaration carves its scope out of any outer same-kind declaration.
+    /// Additive kinds always stack.
+    fn is_exclusive(self) -> bool {
+        matches!(
+            self,
+            MidKind::Log
+                | MidKind::Latency
+                | MidKind::Bandwidth
+                | MidKind::Fault
+                | MidKind::Retry
+                | MidKind::CircuitBreaker
+                | MidKind::Respond
+        )
+    }
+}
+
+fn leaf_kind(node: &RuleNode) -> Option<MidKind> {
+    Some(match node {
+        RuleNode::Log(_) => MidKind::Log,
+        RuleNode::Latency(_) => MidKind::Latency,
+        RuleNode::Bandwidth(_) => MidKind::Bandwidth,
+        RuleNode::Fault(_) => MidKind::Fault,
+        RuleNode::RateLimit(_) => MidKind::RateLimit,
+        RuleNode::SlidingWindow(_) => MidKind::SlidingWindow,
+        RuleNode::Retry(_) => MidKind::Retry,
+        RuleNode::CircuitBreaker(_) => MidKind::CircuitBreaker,
+        RuleNode::Respond(_) => MidKind::Respond,
+        RuleNode::Block(_) => MidKind::Block,
+        RuleNode::SetRequestHeader(_) => MidKind::SetReqHeader,
+        RuleNode::AppendRequestHeader(_) => MidKind::AppendReqHeader,
+        RuleNode::RemoveRequestHeader(_) => MidKind::RemoveReqHeader,
+        RuleNode::SetResponseHeader(_) => MidKind::SetResHeader,
+        RuleNode::AppendResponseHeader(_) => MidKind::AppendResHeader,
+        RuleNode::RemoveResponseHeader(_) => MidKind::RemoveResHeader,
+        RuleNode::RewritePath(_) => MidKind::RewritePath,
+        RuleNode::RewritePathRegex(_) => MidKind::RewritePathRegex,
+        RuleNode::Upstream(_) => MidKind::Upstream,
+        #[cfg(feature = "scripting")]
+        RuleNode::Script(_) => MidKind::Script,
+        RuleNode::Match(_)
+        | RuleNode::Host(_)
+        | RuleNode::Path(_)
+        | RuleNode::Method(_)
+        | RuleNode::Methods(_) => return None,
+    })
+}
+
+/// A collected leaf declaration. `path` records its position in the tree of
+/// enclosing matches (one entry per enclosing match, by its index in the
+/// parent body), enabling descendant detection during shadow resolution.
+struct Decl {
+    kind: MidKind,
+    path: Vec<usize>,
+    scope_pred: Option<Predicate>,
+    /// Predicates of same-kind declarations nested strictly deeper than this
+    /// one. Subtracted from `scope_pred` to produce the effective predicate.
+    excluded_preds: Vec<Predicate>,
+    leaf: RuleNode,
+    #[cfg(feature = "redis")]
+    scope_label: String,
+}
+
+struct WalkCtx {
     preds: Vec<Predicate>,
+    path: Vec<usize>,
     #[cfg(feature = "redis")]
     scope_stack: Vec<String>,
     #[cfg(feature = "redis")]
-    scope_counter: &'a mut usize,
-    #[cfg(feature = "redis")]
-    redis: Option<&'a crate::middleware::RedisConnection>,
-    #[cfg(not(feature = "redis"))]
-    _phantom: std::marker::PhantomData<&'a ()>,
+    scope_counter: usize,
 }
 
 #[cfg(feature = "redis")]
-impl CompileCtx<'_> {
-    fn scope(&self) -> String {
+impl WalkCtx {
+    fn current_scope(&self) -> String {
         self.scope_stack.join(".")
     }
 
     fn push_scope(&mut self, name: Option<String>) {
         let label = name.unwrap_or_else(|| {
-            let n = *self.scope_counter;
-            *self.scope_counter += 1;
+            let n = self.scope_counter;
+            self.scope_counter += 1;
             n.to_string()
         });
         self.scope_stack.push(label);
     }
+}
 
-    fn pop_scope(&mut self) {
-        self.scope_stack.pop();
+fn walk_body(body: Vec<RuleNode>, ctx: &mut WalkCtx, out: &mut Vec<Decl>) -> anyhow::Result<()> {
+    for (idx, node) in body.into_iter().enumerate() {
+        walk_node(node, idx, ctx, out)?;
+    }
+    Ok(())
+}
+
+fn walk_node(
+    node: RuleNode,
+    self_idx: usize,
+    ctx: &mut WalkCtx,
+    out: &mut Vec<Decl>,
+) -> anyhow::Result<()> {
+    match node {
+        RuleNode::Match(m) => walk_match(
+            MatchSpec::from_general(&m),
+            m.name,
+            m.body,
+            self_idx,
+            ctx,
+            out,
+        ),
+        RuleNode::Host(m) => walk_match(
+            MatchSpec {
+                host: Some(m.host),
+                ..MatchSpec::default()
+            },
+            m.name,
+            m.body,
+            self_idx,
+            ctx,
+            out,
+        ),
+        RuleNode::Path(m) => walk_match(
+            MatchSpec {
+                path: Some(m.path),
+                ..MatchSpec::default()
+            },
+            m.name,
+            m.body,
+            self_idx,
+            ctx,
+            out,
+        ),
+        RuleNode::Method(m) => walk_match(
+            MatchSpec {
+                methods: vec![m.method],
+                ..MatchSpec::default()
+            },
+            m.name,
+            m.body,
+            self_idx,
+            ctx,
+            out,
+        ),
+        RuleNode::Methods(m) => walk_match(
+            MatchSpec {
+                methods: m.methods,
+                ..MatchSpec::default()
+            },
+            m.name,
+            m.body,
+            self_idx,
+            ctx,
+            out,
+        ),
+        leaf => {
+            let kind = leaf_kind(&leaf).expect("only leaves reach this branch");
+            out.push(Decl {
+                kind,
+                path: ctx.path.clone(),
+                scope_pred: and_predicates(&ctx.preds),
+                excluded_preds: Vec::new(),
+                leaf,
+                #[cfg(feature = "redis")]
+                scope_label: ctx.current_scope(),
+            });
+            Ok(())
+        }
     }
 }
 
-fn compile_match(
-    mut builder: crate::ProxyBuilder,
+fn walk_match(
     spec: MatchSpec,
     name: Option<String>,
     body: Vec<RuleNode>,
-    ctx: &mut CompileCtx<'_>,
-) -> anyhow::Result<crate::ProxyBuilder> {
+    self_idx: usize,
+    ctx: &mut WalkCtx,
+    out: &mut Vec<Decl>,
+) -> anyhow::Result<()> {
     let pred = spec.into_predicate()?;
     let pushed = pred.is_some();
     if let Some(p) = pred {
@@ -700,57 +871,81 @@ fn compile_match(
     #[cfg(not(feature = "redis"))]
     let _ = name;
 
-    for node in body {
-        builder = compile_node(builder, node, ctx)?;
-    }
+    ctx.path.push(self_idx);
+    let res = walk_body(body, ctx, out);
+    ctx.path.pop();
 
     if pushed {
         ctx.preds.pop();
     }
     #[cfg(feature = "redis")]
-    ctx.pop_scope();
-    Ok(builder)
+    ctx.scope_stack.pop();
+    res
 }
 
-fn compile_node(
-    mut builder: crate::ProxyBuilder,
-    node: RuleNode,
-    ctx: &mut CompileCtx<'_>,
-) -> anyhow::Result<crate::ProxyBuilder> {
-    match node {
-        RuleNode::Match(m) => {
-            let spec = MatchSpec::from_general(&m);
-            return compile_match(builder, spec, m.name, m.body, ctx);
+/// For each exclusive declaration, OR the scope predicates of every same-kind
+/// declaration nested strictly deeper into its `excluded_preds`. The effective
+/// predicate is then `scope_pred AND NOT (any of the exclusions)`.
+fn resolve_exclusions(decls: &mut [Decl]) {
+    let n = decls.len();
+    #[allow(clippy::needless_range_loop)]
+    // index used both for `decls[i]` reads and the later mutating assign
+    for i in 0..n {
+        if !decls[i].kind.is_exclusive() {
+            continue;
         }
-        RuleNode::Host(m) => {
-            let spec = MatchSpec {
-                host: Some(m.host),
-                ..MatchSpec::default()
-            };
-            return compile_match(builder, spec, m.name, m.body, ctx);
+        let kind = decls[i].kind;
+        let path_i = decls[i].path.clone();
+        let mut excluded = Vec::new();
+        for (j, decl) in decls.iter().enumerate() {
+            if i == j || decl.kind != kind {
+                continue;
+            }
+            // j shadows i iff j's scope is strictly more nested than i's:
+            // i's path is a strict prefix of j's path.
+            if decl.path.len() > path_i.len()
+                && decl.path.starts_with(&path_i)
+                && let Some(ref p) = decl.scope_pred
+            {
+                excluded.push(p.clone());
+            }
         }
-        RuleNode::Path(m) => {
-            let spec = MatchSpec {
-                path: Some(m.path),
-                ..MatchSpec::default()
-            };
-            return compile_match(builder, spec, m.name, m.body, ctx);
-        }
-        RuleNode::Method(m) => {
-            let spec = MatchSpec {
-                methods: vec![m.method],
-                ..MatchSpec::default()
-            };
-            return compile_match(builder, spec, m.name, m.body, ctx);
-        }
-        RuleNode::Methods(m) => {
-            let spec = MatchSpec {
-                methods: m.methods,
-                ..MatchSpec::default()
-            };
-            return compile_match(builder, spec, m.name, m.body, ctx);
-        }
+        decls[i].excluded_preds = excluded;
+    }
+}
 
+/// `(scope_pred) AND NOT (excl_1 OR excl_2 OR …)`. Returns `None` when
+/// effectively "always" (no scope, no exclusions).
+fn effective_predicate(decl: &Decl) -> Option<Predicate> {
+    let scope = decl.scope_pred.clone();
+    if decl.excluded_preds.is_empty() {
+        return scope;
+    }
+    let exclusions = decl.excluded_preds.clone();
+    let combined: Predicate = Arc::new(move |req: &Request<Body>| {
+        let in_scope = match scope {
+            Some(ref p) => p(req),
+            None => true,
+        };
+        if !in_scope {
+            return false;
+        }
+        // Reject if any descendant scope matches.
+        !exclusions.iter().any(|p| p(req))
+    });
+    Some(combined)
+}
+
+fn emit_decl(
+    mut builder: crate::ProxyBuilder,
+    decl: Decl,
+    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
+) -> anyhow::Result<crate::ProxyBuilder> {
+    let pred = effective_predicate(&decl);
+    #[cfg(feature = "redis")]
+    let scope_label = decl.scope_label.clone();
+
+    match decl.leaf {
         RuleNode::Upstream(u) => {
             let mut upstream = if u.urls.len() == 1 {
                 Upstream::new([u.urls.into_iter().next().unwrap()])?
@@ -760,31 +955,29 @@ fn compile_node(
             if let Some(ref balance) = u.balance {
                 upstream = upstream.strategy(parse_balance_strategy(balance)?);
             }
-            let pred = and_predicates(&ctx.preds);
             if let Some(p) = pred {
                 builder = builder.route(move |req| p(req), upstream);
             } else {
                 builder = builder.route(|_| true, upstream);
             }
         }
-
         RuleNode::Log(c) => {
             let logger = if let Some(true) = c.bodies {
                 TrafficLogger::new().log_bodies(true)
             } else {
                 TrafficLogger::new()
             };
-            builder = apply_layer(builder, ctx, logger);
+            builder = apply_layer(builder, pred, logger);
         }
         RuleNode::Latency(c) => {
             let injector = match DurationOrRange::from_str(&c.value).map_err(anyhow_str)? {
                 DurationOrRange::Fixed(d) => LatencyInjector::fixed(d),
                 DurationOrRange::Range(lo, hi) => LatencyInjector::uniform(lo..hi),
             };
-            builder = apply_layer(builder, ctx, injector);
+            builder = apply_layer(builder, pred, injector);
         }
         RuleNode::Bandwidth(c) => {
-            builder = apply_layer(builder, ctx, BandwidthThrottle::new(c.bps));
+            builder = apply_layer(builder, pred, BandwidthThrottle::new(c.bps));
         }
         RuleNode::Fault(c) => {
             let mut inj = FaultInjector::new()
@@ -795,52 +988,50 @@ fn compile_node(
                     .map_err(|e| anyhow::anyhow!("invalid error_status: {e}"))?;
                 inj = inj.error_status(status);
             }
-            builder = apply_layer(builder, ctx, inj);
+            builder = apply_layer(builder, pred, inj);
         }
         RuleNode::RateLimit(c) => {
             let window = parse_duration(&c.window).map_err(anyhow_str)?;
             #[cfg(feature = "redis")]
-            if let Some(conn) = ctx.redis {
-                let scope = ctx.scope();
+            if let Some(conn) = redis {
                 let rate = c.count as f64 / window.as_secs_f64();
                 let burst = c.burst.map(|b| b as f64).unwrap_or(c.count as f64);
                 let store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst)
-                    .scope(&scope);
+                    .scope(&scope_label);
                 let limiter = if c.per_host {
                     RateLimiter::with_store(store, host_key)
                 } else {
                     RateLimiter::with_store(store, |_| String::new())
                 };
-                builder = apply_layer(builder, ctx, limiter);
+                builder = apply_layer(builder, pred, limiter);
             } else {
-                builder = apply_layer(builder, ctx, build_rate_limiter(&c, window));
+                builder = apply_layer(builder, pred, build_rate_limiter(&c, window));
             }
             #[cfg(not(feature = "redis"))]
             {
-                builder = apply_layer(builder, ctx, build_rate_limiter(&c, window));
+                builder = apply_layer(builder, pred, build_rate_limiter(&c, window));
             }
         }
         RuleNode::SlidingWindow(c) => {
             let window = parse_duration(&c.window).map_err(anyhow_str)?;
             #[cfg(feature = "redis")]
-            if let Some(conn) = ctx.redis {
-                let scope = ctx.scope();
+            if let Some(conn) = redis {
                 let store =
                     crate::middleware::RedisSlidingWindowStore::new(conn.clone(), c.count, window)
-                        .scope(&scope);
+                        .scope(&scope_label);
                 let sw = if c.per_host {
                     SlidingWindow::with_store(store, host_key)
                 } else {
                     SlidingWindow::with_store(store, |_| String::new())
                 };
-                builder = apply_layer(builder, ctx, sw);
+                builder = apply_layer(builder, pred, sw);
             } else {
                 let sw = if c.per_host {
                     SlidingWindow::per_host(c.count, window)
                 } else {
                     SlidingWindow::global(c.count, window)
                 };
-                builder = apply_layer(builder, ctx, sw);
+                builder = apply_layer(builder, pred, sw);
             }
             #[cfg(not(feature = "redis"))]
             {
@@ -849,23 +1040,22 @@ fn compile_node(
                 } else {
                     SlidingWindow::global(c.count, window)
                 };
-                builder = apply_layer(builder, ctx, sw);
+                builder = apply_layer(builder, pred, sw);
             }
         }
         RuleNode::Retry(c) => {
-            builder = apply_layer(builder, ctx, build_retry(c)?);
+            builder = apply_layer(builder, pred, build_retry(c)?);
         }
         RuleNode::CircuitBreaker(c) => {
             let recovery = parse_duration(&c.recovery).map_err(anyhow_str)?;
             #[cfg(feature = "redis")]
-            if let Some(conn) = ctx.redis {
-                let scope = ctx.scope();
+            if let Some(conn) = redis {
                 let mut store = crate::middleware::RedisCircuitBreakerStore::new(
                     conn.clone(),
                     c.threshold,
                     recovery,
                 )
-                .scope(&scope);
+                .scope(&scope_label);
                 if let Some(probes) = c.half_open_probes {
                     store = store.half_open_probes(probes);
                 }
@@ -877,20 +1067,20 @@ fn compile_node(
                 } else {
                     CircuitBreaker::with_store(store, |_| String::new())
                 };
-                builder = apply_layer(builder, ctx, cb);
+                builder = apply_layer(builder, pred, cb);
             } else {
-                builder = apply_layer(builder, ctx, build_circuit_breaker(&c, recovery));
+                builder = apply_layer(builder, pred, build_circuit_breaker(&c, recovery));
             }
             #[cfg(not(feature = "redis"))]
             {
-                builder = apply_layer(builder, ctx, build_circuit_breaker(&c, recovery));
+                builder = apply_layer(builder, pred, build_circuit_breaker(&c, recovery));
             }
         }
         RuleNode::Respond(c) => {
             let status = c.status.unwrap_or(200);
             let status = http::StatusCode::from_u16(status)
                 .map_err(|e| anyhow::anyhow!("invalid respond status: {e}"))?;
-            builder = apply_layer(builder, ctx, SetResponse::new(status, c.body));
+            builder = apply_layer(builder, pred, SetResponse::new(status, c.body));
         }
         RuleNode::Block(c) => {
             let mut bl = BlockList::new();
@@ -911,45 +1101,44 @@ fn compile_node(
                 let body = resp.body.unwrap_or_default();
                 bl = bl.response(status, body);
             }
-            builder = apply_layer(builder, ctx, bl);
+            builder = apply_layer(builder, pred, bl);
         }
         RuleNode::SetRequestHeader(h) => {
             let m = ModifyHeaders::new().set_request(&h.name, &h.value);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::AppendRequestHeader(h) => {
             let m = ModifyHeaders::new().append_request(&h.name, &h.value);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::RemoveRequestHeader(h) => {
             let m = ModifyHeaders::new().remove_request(&h.name);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::SetResponseHeader(h) => {
             let m = ModifyHeaders::new().set_response(&h.name, &h.value);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::AppendResponseHeader(h) => {
             let m = ModifyHeaders::new().append_response(&h.name, &h.value);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::RemoveResponseHeader(h) => {
             let m = ModifyHeaders::new().remove_response(&h.name);
-            builder = apply_layer(builder, ctx, m);
+            builder = apply_layer(builder, pred, m);
         }
         RuleNode::RewritePath(c) => {
             let rw = UrlRewrite::path(&c.pattern, &c.replace).map_err(|e| {
                 anyhow::anyhow!("invalid rewrite-path pattern '{}': {e}", c.pattern)
             })?;
-            builder = apply_layer(builder, ctx, rw);
+            builder = apply_layer(builder, pred, rw);
         }
         RuleNode::RewritePathRegex(c) => {
             let rw = UrlRewrite::regex(&c.pattern, &c.replace).map_err(|e| {
                 anyhow::anyhow!("invalid rewrite-path-regex regex '{}': {e}", c.pattern)
             })?;
-            builder = apply_layer(builder, ctx, rw);
+            builder = apply_layer(builder, pred, rw);
         }
-
         #[cfg(feature = "scripting")]
         RuleNode::Script(c) => {
             let mut layer = crate::middleware::ScriptLayer::from_file(&c.file)?;
@@ -959,15 +1148,20 @@ fn compile_node(
             if c.shared {
                 layer = layer.shared();
             }
-            builder = apply_layer(builder, ctx, layer);
+            builder = apply_layer(builder, pred, layer);
         }
+        RuleNode::Match(_)
+        | RuleNode::Host(_)
+        | RuleNode::Path(_)
+        | RuleNode::Method(_)
+        | RuleNode::Methods(_) => unreachable!("walk only emits leaf decls"),
     }
     Ok(builder)
 }
 
 fn apply_layer<L>(
     builder: crate::ProxyBuilder,
-    ctx: &CompileCtx<'_>,
+    pred: Option<Predicate>,
     layer: L,
 ) -> crate::ProxyBuilder
 where
@@ -980,7 +1174,6 @@ where
         + 'static,
     <L::Service as tower::Service<Request<Body>>>::Future: Send,
 {
-    let pred = and_predicates(&ctx.preds);
     if let Some(p) = pred {
         builder.http_layer(Conditional::new().when(move |req| p(req), layer))
     } else {
@@ -1295,5 +1488,203 @@ mod tests {
         assert!(m.is_match("/api/v1"));
         assert!(m.is_match("/api/v1/users"));
         assert!(!m.is_match("/other"));
+    }
+
+    fn collect_decls(kdl: &str) -> Vec<Decl> {
+        let cfg = ProxyConfig::from_kdl(kdl).unwrap();
+        let mut decls = Vec::new();
+        let mut ctx = WalkCtx {
+            preds: Vec::new(),
+            path: Vec::new(),
+            #[cfg(feature = "redis")]
+            scope_stack: Vec::new(),
+            #[cfg(feature = "redis")]
+            scope_counter: 0,
+        };
+        walk_body(cfg.body, &mut ctx, &mut decls).unwrap();
+        resolve_exclusions(&mut decls);
+        decls
+    }
+
+    fn req(host: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(format!("https://{host}{path}"))
+            .body(crate::http::empty_body())
+            .unwrap()
+    }
+
+    #[test]
+    fn shadowing_inner_excludes_outer_log() {
+        // Outer log applies everywhere except inside host=cdn.
+        let decls = collect_decls(
+            r#"
+            log
+            host "cdn.example.com" {
+                log bodies=true
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 2);
+        // Outer is at path=[] with one exclusion (the inner's scope_pred).
+        assert_eq!(decls[0].path, Vec::<usize>::new());
+        assert_eq!(decls[0].excluded_preds.len(), 1);
+        // Inner is at path=[1] with no exclusions.
+        assert_eq!(decls[1].path, vec![1]);
+        assert_eq!(decls[1].excluded_preds.len(), 0);
+
+        // Verify effective predicates behave correctly.
+        let outer_pred = effective_predicate(&decls[0]).unwrap();
+        let inner_pred = effective_predicate(&decls[1]).unwrap();
+
+        // For non-cdn host: outer fires, inner doesn't.
+        let r = req("api.example.com", "/foo");
+        assert!(outer_pred(&r));
+        assert!(!inner_pred(&r));
+
+        // For cdn: inner fires, outer is shadowed.
+        let r = req("cdn.example.com", "/foo");
+        assert!(!outer_pred(&r));
+        assert!(inner_pred(&r));
+    }
+
+    #[test]
+    fn shadowing_sibling_matches_do_not_shadow_each_other() {
+        let decls = collect_decls(
+            r#"
+            host "a.example.com" {
+                log
+            }
+            host "b.example.com" {
+                log
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 2);
+        // Neither sibling shadows the other.
+        assert_eq!(decls[0].excluded_preds.len(), 0);
+        assert_eq!(decls[1].excluded_preds.len(), 0);
+    }
+
+    #[test]
+    fn shadowing_same_scope_no_shadow() {
+        let decls = collect_decls(
+            r#"
+            log
+            log bodies=true
+            "#,
+        );
+        assert_eq!(decls.len(), 2);
+        // Same scope (path=[]) — neither shadows the other.
+        assert_eq!(decls[0].excluded_preds.len(), 0);
+        assert_eq!(decls[1].excluded_preds.len(), 0);
+    }
+
+    #[test]
+    fn shadowing_different_kinds_dont_interact() {
+        let decls = collect_decls(
+            r#"
+            log
+            host "cdn.example.com" {
+                latency "100ms"
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 2);
+        // Different kinds — no shadowing.
+        assert_eq!(decls[0].excluded_preds.len(), 0);
+        assert_eq!(decls[1].excluded_preds.len(), 0);
+    }
+
+    #[test]
+    fn shadowing_three_levels_nested() {
+        let decls = collect_decls(
+            r#"
+            log
+            host "api.example.com" {
+                log
+                path "/v1/" {
+                    log
+                }
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 3);
+        // Outermost (path=[]) excluded by both deeper.
+        assert_eq!(decls[0].path, Vec::<usize>::new());
+        assert_eq!(decls[0].excluded_preds.len(), 2);
+        // Middle (path=[1]) excluded only by deepest.
+        assert_eq!(decls[1].path, vec![1]);
+        assert_eq!(decls[1].excluded_preds.len(), 1);
+        // Deepest (path=[1, 1]) — no exclusions.
+        assert_eq!(decls[2].path, vec![1, 1]);
+        assert_eq!(decls[2].excluded_preds.len(), 0);
+
+        let outer = effective_predicate(&decls[0]).unwrap();
+        let middle = effective_predicate(&decls[1]).unwrap();
+        let deepest = effective_predicate(&decls[2]).unwrap();
+
+        // /other on different host → only outer fires.
+        let r = req("other.com", "/foo");
+        assert!(outer(&r));
+        assert!(!middle(&r));
+        assert!(!deepest(&r));
+
+        // api.example.com but not /v1 → only middle fires.
+        let r = req("api.example.com", "/v2/foo");
+        assert!(!outer(&r));
+        assert!(middle(&r));
+        assert!(!deepest(&r));
+
+        // api.example.com /v1/* → only deepest fires.
+        let r = req("api.example.com", "/v1/foo");
+        assert!(!outer(&r));
+        assert!(!middle(&r));
+        assert!(deepest(&r));
+    }
+
+    #[test]
+    fn additive_kind_no_exclusion_even_when_nested() {
+        // Block is additive — both declarations should fire on matching requests.
+        let decls = collect_decls(
+            r#"
+            block {
+                host "*.tracking.com"
+            }
+            host "api.example.com" {
+                block {
+                    host "internal.api.example.com"
+                }
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 2);
+        // Block is not exclusive: no exclusions computed.
+        assert_eq!(decls[0].excluded_preds.len(), 0);
+        assert_eq!(decls[1].excluded_preds.len(), 0);
+    }
+
+    #[test]
+    fn shadowing_two_siblings_both_exclude_outer() {
+        let decls = collect_decls(
+            r#"
+            log
+            host "a.example.com" {
+                log bodies=true
+            }
+            host "b.example.com" {
+                log bodies=true
+            }
+            "#,
+        );
+        assert_eq!(decls.len(), 3);
+        // Outer (path=[]) excluded by BOTH inner sibling scopes.
+        assert_eq!(decls[0].path, Vec::<usize>::new());
+        assert_eq!(decls[0].excluded_preds.len(), 2);
+
+        let outer = effective_predicate(&decls[0]).unwrap();
+        // Outer fires on neither sibling host.
+        assert!(!outer(&req("a.example.com", "/")));
+        assert!(!outer(&req("b.example.com", "/")));
+        assert!(outer(&req("c.example.com", "/")));
     }
 }
