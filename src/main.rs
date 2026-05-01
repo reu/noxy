@@ -195,28 +195,6 @@ async fn main() -> anyhow::Result<()> {
         ProxyConfig::default()
     };
 
-    if let Some(upstream) = cli.upstream {
-        config.reverse_proxy = Some(upstream);
-    }
-
-    if let (Some(cert), Some(key)) = (cli.tls_cert, cli.tls_key) {
-        config.tls = Some(noxy::config::TlsConfig { cert, key });
-    }
-
-    if config.reverse_proxy.is_none() && config.ca.is_none() {
-        config.ca = Some(noxy::config::CaConfig {
-            cert: cli.cert,
-            key: cli.key,
-        });
-    }
-
-    if config.port.is_none() {
-        config.port = Some(cli.port);
-    }
-    if config.bind.is_none() {
-        config.bind = Some(cli.bind.clone());
-    }
-
     if cli.accept_invalid_certs {
         config.accept_invalid_upstream_certs = true;
     }
@@ -226,20 +204,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some(timeout_str) = cli.pool_idle_timeout {
-        // Validate now, store as string for the loader.
         parse_duration(&timeout_str)
             .map_err(|e| anyhow::anyhow!("invalid pool-idle-timeout: {e}"))?;
         config.pool_idle_timeout = Some(timeout_str);
-    }
-
-    for cred in cli.credentials {
-        let (user, pass) = cred
-            .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("credential must be username:password"))?;
-        config.credentials.push(noxy::config::CredentialConfig {
-            username: user.to_string(),
-            password: pass.to_string(),
-        });
     }
 
     #[cfg(feature = "redis")]
@@ -249,6 +216,20 @@ async fn main() -> anyhow::Result<()> {
             prefix: None,
         });
     }
+
+    let cli_credentials: Vec<noxy::config::CredentialConfig> = cli
+        .credentials
+        .into_iter()
+        .map(|cred| {
+            let (user, pass) = cred
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("credential must be username:password"))?;
+            Ok(noxy::config::CredentialConfig {
+                username: user.to_string(),
+                password: pass.to_string(),
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
 
     if cli.log || cli.log_bodies {
         config.body.push(RuleNode::Log(LogConfig {
@@ -372,15 +353,97 @@ async fn main() -> anyhow::Result<()> {
             }));
     }
 
-    let bind = config.bind.clone().unwrap_or(cli.bind.clone());
-    let port = config.port.unwrap_or(cli.port);
-    let listen = format!("{bind}:{port}");
-    let proxy = config.into_builder()?.build()?;
-    proxy
-        .listen_with_shutdown(&listen, async {
-            tokio::signal::ctrl_c().await.ok();
-        })
-        .await
+    // If the config file has no listener blocks, synthesize one from CLI
+    // flags. --upstream → reverse, otherwise → forward.
+    if config.forwards.is_empty() && config.reverses.is_empty() {
+        match cli.upstream.clone() {
+            Some(upstream) => {
+                let tls = match (cli.tls_cert.clone(), cli.tls_key.clone()) {
+                    (Some(cert), Some(key)) => Some(noxy::config::TlsConfig { cert, key }),
+                    _ => None,
+                };
+                config.reverses.push(noxy::config::ReverseListener {
+                    port: cli.port,
+                    bind: Some(cli.bind.clone()),
+                    upstream,
+                    tls,
+                    body: Vec::new(),
+                });
+            }
+            None => {
+                config.forwards.push(noxy::config::ForwardListener {
+                    port: cli.port,
+                    bind: Some(cli.bind.clone()),
+                    ca: noxy::config::CaConfig {
+                        cert: cli.cert.clone(),
+                        key: cli.key.clone(),
+                    },
+                    tls: None,
+                    credentials: cli_credentials,
+                    body: Vec::new(),
+                });
+            }
+        }
+    } else if !cli_credentials.is_empty() {
+        // Append CLI credentials to every forward listener (they're forward-only).
+        for fwd in &mut config.forwards {
+            fwd.credentials.extend(cli_credentials.iter().cloned());
+        }
+    }
+
+    let listeners = config.into_listeners()?;
+
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let shutdown_signal = {
+        let tx = shutdown_tx.clone();
+        async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(());
+        }
+    };
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tasks.spawn(async move {
+            let addr = listener.addr.clone();
+            let result = listener
+                .proxy
+                .listen_with_shutdown(&listener.addr, async move {
+                    let _ = shutdown_rx.recv().await;
+                })
+                .await;
+            (addr, result)
+        });
+    }
+
+    tokio::spawn(shutdown_signal);
+
+    let mut first_err: Option<anyhow::Error> = None;
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok((addr, Ok(()))) => tracing::info!(%addr, "listener stopped"),
+            Ok((addr, Err(e))) => {
+                tracing::error!(%addr, error = %e, "listener failed");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+                let _ = shutdown_tx.send(());
+            }
+            Err(join_err) => {
+                tracing::error!(error = %join_err, "listener task panicked");
+                if first_err.is_none() {
+                    first_err = Some(anyhow::anyhow!("listener task panicked: {join_err}"));
+                }
+                let _ = shutdown_tx.send(());
+            }
+        }
+    }
+
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn parse_header_arg(s: &str) -> anyhow::Result<(String, String)> {

@@ -5,10 +5,10 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 ## Architecture
 
 ### Entry point (`src/main.rs`)
-- `main()` — CLI interface (behind `cli` feature), loads CA cert/key or upstream URL, builds proxy, runs accept loop
+- `main()` — CLI interface (behind `cli` feature), loads config or synthesizes one from CLI flags, builds all listeners, runs them concurrently via `JoinSet` with a single broadcast shutdown signal
 - CA generation via `--generate` flag
-- `--upstream <URL>` enables reverse proxy mode (sets `config.reverse_proxy`); `--tls-cert`/`--tls-key` for client-facing TLS
-- `--config <path>` loads a KDL config file; CLI middleware flags append unconditional rule nodes onto `config.body` after the file is loaded
+- `--config <path>` loads a KDL config file; CLI middleware flags append to `config.body` (global rules applied to every listener)
+- When the config has no listener blocks, a synthetic listener is built from CLI flags: `--upstream` → reverse listener, otherwise → forward listener using `--cert`/`--key`. `--tls-cert`/`--tls-key` add client-facing TLS to the synthetic reverse listener.
 
 ### HTTP types and forwarding (`src/http.rs`)
 - `Body` — `BoxBody<Bytes, BoxError>`, supports both buffered and streaming access
@@ -39,21 +39,31 @@ Noxy is an HTTP proxy written in Rust supporting both forward (TLS MITM) and rev
 - User script exports a default async function receiving `(req, respond)` — `respond` forwards upstream, returning without it short-circuits
 
 ### Config (`src/config.rs`, behind `config` feature)
-KDL config (parsed via `knus` 3.x, KDL 1.x syntax — `true`/`false`, **not** `#true`/`#false`). Top-level holds globals (`port`, `bind`, `ca`, `tls`, `reverse-proxy`, timeouts, `credential` repeated, optional `redis`) plus a `body: Vec<RuleNode>` of rule nodes. The body is a recursive tree: rule nodes are either match scopes (`match`/`host`/`path`/`method`/`methods`) that AND-compose their predicates with enclosing matches, or middleware leaves.
+KDL config (parsed via `knus` 3.x, KDL 1.x syntax — `true`/`false`, **not** `#true`/`#false`). The top level has three zones:
 
-**Two-pass compilation in `into_builder`:**
-1. `walk_body` walks the rule tree, collecting each leaf into a `Decl` carrying its tree-path (indices through enclosing matches), scope predicate, and the leaf `RuleNode` value.
-2. `resolve_exclusions` finds same-kind decls where one's path is a strict prefix of another's; the inner ones contribute their scope predicates to the outer's `excluded_preds` set. Same-kind comparison uses `std::mem::discriminant(&decl.leaf)` — no parallel kind-tag enum.
-3. `emit_decl` is a thin dispatcher: for each `Decl`, compute `effective_predicate = scope_pred AND NOT (any exclusion)`, then dispatch into `Rule::emit` on the leaf config.
+1. **Process settings** — `accept-invalid-upstream-certs`, timeouts, pool sizing, optional `redis`. Apply across every listener.
+2. **Global rules** (`body: Vec<RuleNode>`) — middleware leaves and match scopes declared at the top level. Cloned into every listener's compile pass; shadowed innermost-wins by listener-internal rules of the same exclusive kind.
+3. **Listener blocks** — `forwards: Vec<ForwardListener>` and `reverses: Vec<ReverseListener>`. Each owns its own port, mode-specific config (forward: `ca`, optional `credential`s, optional client-facing `tls`; reverse: `upstream`, optional client-facing `tls`), and rule body.
+
+`ProxyConfig::into_listeners()` returns `Vec<CompiledListener { addr, proxy }>` — one per listener block. The CLI runs them all concurrently.
+
+**Compilation flow:**
+1. `walk_body` walks the global rule tree once, producing `global_decls` at path `[]`.
+2. `validate_min_scope_global` rejects rules whose `min_scope` is `Listener` (e.g. `upstream`) at the global level.
+3. For each listener: `walk_listener_body` clones `global_decls`, walks the listener body with `path = [0]` so listener-internal decls strict-extend globals, then `resolve_exclusions` over the union.
+4. Per-listener `emit_decl` is a thin dispatcher that calls `Rule::emit` on each leaf config; the listener's `ProxyBuilder` is wired with mode-specific config (`ca`/`credential`/`upstream`/`tls`) before emission, then `.build()`.
+
+Same-kind comparison in `resolve_exclusions` uses `std::mem::discriminant(&decl.leaf)` — no parallel kind-tag enum. When a descendant decl has `scope_pred = None` (always-fires within its containing scope), the contributed exclusion is "always true," so the outer is fully shadowed within that scope.
 
 **`Rule` trait** — every leaf config (`LogConfig`, `LatencyConfig`, `BlockConfig`, …) implements this:
 ```rust
 trait Rule {
     fn is_exclusive(&self) -> bool { false }
+    fn min_scope(&self) -> RuleScope { RuleScope::Global }
     fn emit(self, builder: ProxyBuilder, ctx: &EmitCtx<'_>) -> anyhow::Result<ProxyBuilder>;
 }
 ```
-`is_exclusive` controls shadowing (default: additive). `emit` constructs the actual tower layer (or route, for `UpstreamConfig`) and applies it via `apply_layer` using `ctx.pred`.
+`is_exclusive` controls shadowing (default: additive). `min_scope` controls where the rule is allowed (default: anywhere; `UpstreamConfig` overrides to `Listener` since routing needs a listener context). `emit` constructs the actual tower layer (or route, for `UpstreamConfig`) and applies it via `apply_layer` using `ctx.pred`.
 
 **Exclusive vs additive (shadowing model):**
 - Exclusive (innermost-wins, outer carved out): `log`, `latency`, `bandwidth`, `fault`, `retry`, `circuit-breaker`, `respond`. Inner declaration replaces outer for matching requests.
@@ -62,6 +72,8 @@ trait Rule {
 **Path matching:** `path "/v1"` is exact match. `path "/v1/"` (trailing slash) means "subtree-including-self" — matches `/v1`, `/v1/foo`, `/v1/foo/bar`. `path "/v1/**"` matches `/v1/foo` and below but not `/v1` itself. There is no `path-prefix` field anymore; trailing-slash is the convention.
 
 **Config alias nodes:** `host "X" { ... }`, `path "Y" { ... }`, `method "GET" { ... }`, and variadic `methods "GET" "POST" { ... }` desugar to the corresponding `match` block. Per-op header types (`SetRequestHeader`, `AppendRequestHeader`, `RemoveRequestHeader`, `SetResponseHeader`, `AppendResponseHeader`, `RemoveResponseHeader`) and rewrite types (`RewritePath`, `RewritePathRegex`) are all dedicated structs — no shared `HeaderEntry` / `RewriteSpec`, since each variant needs its own `impl Rule`.
+
+**Stateful middleware caveat:** a global `rate-limit`/`sliding-window`/`circuit-breaker` is cloned into each listener's compile pass, so each listener gets its own state instance — they do *not* share buckets across listeners. For genuinely shared state across listeners or processes, configure `redis` (truly process-global) and rely on its scope keys.
 
 ## TODO
 

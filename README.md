@@ -393,186 +393,244 @@ For conditional rules and more complex setups, use a [KDL](https://kdl.dev) conf
 noxy --config proxy.kdl
 ```
 
-CLI flags override config file settings for global options (port, bind address, CA paths, etc.) and append additional unconditional rules.
+A config has three zones at the top level:
 
-A config has top-level globals (`port`, `bind`, `ca`, …), an optional list of `credential` entries, and a body of rule nodes. Rule nodes are either middleware leaves (`log`, `latency`, `rate-limit`, …) or `match` blocks (with aliases `host`, `path`, `method`, `methods`) that scope nested rules to requests satisfying their predicate. Nested matches AND naturally — `host "x" { path "/y" { … } }` is the same as `match host="x" path="/y" { … }`.
+1. **Process settings** — `redis`, timeouts, pool sizing, etc. Apply across every listener.
+2. **Global rules** — middleware leaves and `match` blocks declared at the top level. They are applied to every listener, with innermost-wins shadowing if a listener redeclares the same exclusive kind.
+3. **Listener blocks** — one or more `forward { … }` or `reverse { … }` blocks. Each block declares its own port, mode-specific config (`ca` for forward, `upstream` for reverse), and rule body.
 
-### Reverse proxy config
+Rule nodes are either middleware leaves (`log`, `latency`, `rate-limit`, …) or `match` blocks (with aliases `host`, `path`, `method`, `methods`) that scope nested rules to requests satisfying their predicate. Nested matches AND naturally — `host "x" { path "/y" { … } }` is the same as `match host="x" path="/y" { … }`.
+
+CLI middleware flags (`--rate-limit`, `--log`, …) append to the global rule body and apply to every listener. CLI listener flags (`--port`, `--upstream`, `--cert`/`--key`) synthesize a single listener block when the config has none.
+
+### Forward proxy (basic)
 
 ```kdl
-port 8080
-reverse-proxy "http://localhost:3000"
+forward port=8080 {
+    ca cert="ca-cert.pem" key="ca-key.pem"
 
-// Optional: serve HTTPS to clients
-// tls cert="server.pem" key="server-key.pem"
+    log
 
-// Optional: use Redis for distributed middleware state (requires redis feature)
-// redis url="redis://localhost:6379"
-
-log
-rate-limit count=100 window="1s"
+    block {
+        host "*.tracking.com"
+    }
+}
 ```
 
-### Multi-upstream routing config
+Point a browser or HTTP client at `localhost:8080` as its proxy, install the CA cert in your trust store, and Noxy will MITM every HTTPS connection — logging traffic and blocking tracking domains.
+
+### Reverse proxy (sidecar)
 
 ```kdl
-port 8080
-reverse-proxy "http://default:3000"
+reverse port=8080 {
+    upstream "http://localhost:3000"
 
-// Route /api to a dedicated backend with rate limiting
-path "/api/" {
-    upstream "http://api:8080"
+    // Optional: serve HTTPS to clients
+    // tls cert="server.pem" key="server-key.pem"
+
+    log
     rate-limit count=100 window="1s"
 }
 
-// Load balance /static across two CDN nodes
-path "/static/" {
-    upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
-}
+// Optional: use Redis for distributed middleware state (requires redis feature)
+// redis url="redis://localhost:6379"
+```
 
-// Random selection for /images
-path "/images/" {
-    upstream "http://img1:9000" "http://img2:9000" balance="random"
+### Multi-upstream routing
+
+```kdl
+reverse port=8080 {
+    upstream "http://default:3000"
+
+    // Route /api to a dedicated backend with rate limiting
+    path "/api/" {
+        upstream "http://api:8080"
+        rate-limit count=100 window="1s"
+    }
+
+    // Load balance /static across two CDN nodes
+    path "/static/" {
+        upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
+    }
+
+    // Random selection for /images
+    path "/images/" {
+        upstream "http://img1:9000" "http://img2:9000" balance="random"
+    }
 }
 ```
 
-### Forward proxy config
+### Forward proxy
 
 ```kdl
-port 8080
-ca cert="ca-cert.pem" key="ca-key.pem"
-
+// Process-level settings (apply to all listeners)
 // accept-invalid-upstream-certs true
 // pool-max-idle-per-host 8
 // pool-idle-timeout "90s"
 
-// Log all traffic
+// Global rules — apply to every listener below
 log
 
-// Log with request/response bodies
-// log bodies=true
-
-// Add 200ms latency to API requests
-path "/api/" {
-    latency "200ms"
-}
-
-// Simulate slow downloads with random latency and bandwidth limit
-path "/downloads/" {
-    latency "50ms..200ms"
-    bandwidth 10240
-}
-
-// Inject faults on a specific endpoint
-path "/flaky" {
-    fault error-rate=0.5 abort-rate=0.02
-}
-
-// Mock a health check endpoint
-path "/health" {
-    respond body="ok"
-}
-
-// Rate limit: 30 requests per second globally
-rate-limit count=30 window="1s"
-
-// Rate limit: 1500 requests per minute, per host, with burst of 100
-rate-limit count=1500 window="60s" burst=100 per-host=true
-
-// Sliding window: hard-cap 10 requests per second (no burst, no smoothing)
-sliding-window count=10 window="1s"
-
-// Sliding window: per-host, 500 requests per minute
-sliding-window count=500 window="60s" per-host=true
-
-// Retry failed requests (429, 502, 503, 504) up to 3 times
-retry max-retries=3 backoff="1s" max-replay-body-bytes=1048576
-
-// Retry only 503s with custom statuses, scoped to /api
-path "/api/" {
-    retry max-retries=5 backoff="500ms" {
-        statuses 503
-    }
-}
-
-// Retry with budget: at most 20% of requests can be retries (prevents retry storms)
-retry max-retries=3 {
-    budget ratio=0.2 window="10s" min-retries=30
-}
-
-// Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
-circuit-breaker threshold=5 recovery="30s"
-
-// Per-host circuit breaker with 2 half-open probes
-circuit-breaker threshold=3 recovery="10s" half-open-probes=2 per-host=true
-
-// Circuit breaker with local cache to reduce Redis round-trips (Redis only)
-circuit-breaker threshold=5 recovery="30s" cache-ttl="100ms"
-
-// Add a request header and strip a response header
-set-request-header "x-proxy" "noxy"
-remove-response-header "server"
-
-// Add API version header to /api requests
-path "/api/" {
-    set-request-header "x-api-version" "2"
-}
-
-// Rewrite request paths using matchit patterns
-rewrite-path "/api/v1/{*rest}" "/v2/{rest}"
-
-// Rewrite request paths using regex
-rewrite-path-regex "/api/v\\d+/(.*)" "/latest/$1"
-
-// Block requests to tracking domains and admin paths
+// Block tracking domains for everyone
 block {
     host "*.tracking.com"
     host "ads.example.com"
     path "/admin/*"
 }
 
-// Block with custom status and body
-block {
-    host "internal.corp.com"
-    response status=404 body="not found"
-}
+forward port=8080 {
+    ca cert="ca-cert.pem" key="ca-key.pem"
 
-// Run a TypeScript middleware script (requires scripting feature)
-// script "middleware.ts"
+    // Forward-only proxy auth
+    // credential "alice" "secret"
 
-// Run a script with a shared V8 isolate across all connections, scoped to /api
-// path "/api/" {
-//     script "api_middleware.ts" shared=true
-// }
-
-// Return 503 for all paths under /fail
-path "/fail/" {
-    respond status=503 body="service unavailable"
-}
-
-// Glob patterns in match conditions
-// Match any subdomain of example.com
-host "*.example.com" {
-    latency "100ms"
-}
-
-// Match any single-segment path under /api/
-path "/api/*/users" {
-    rate-limit count=10 window="1s"
-}
-
-// Match all paths recursively under /static/
-path "/static/**" {
-    set-response-header "cache-control" "public, max-age=86400"
-}
-
-// Match by HTTP method, scoped to /api
-methods "POST" "PUT" "DELETE" {
+    // Add 200ms latency to API requests
     path "/api/" {
+        latency "200ms"
+    }
+
+    // Simulate slow downloads with random latency and bandwidth limit
+    path "/downloads/" {
+        latency "50ms..200ms"
+        bandwidth 10240
+    }
+
+    // Inject faults on a specific endpoint
+    path "/flaky" {
+        fault error-rate=0.5 abort-rate=0.02
+    }
+
+    // Mock a health check endpoint
+    path "/health" {
+        respond body="ok"
+    }
+
+    // Rate limit: 30 requests per second globally for this listener
+    rate-limit count=30 window="1s"
+
+    // Rate limit: 1500 requests per minute, per host, with burst of 100
+    rate-limit count=1500 window="60s" burst=100 per-host=true
+
+    // Sliding window: hard-cap 10 requests per second (no burst, no smoothing)
+    sliding-window count=10 window="1s"
+
+    // Retry failed requests (429, 502, 503, 504) up to 3 times
+    retry max-retries=3 backoff="1s" max-replay-body-bytes=1048576
+
+    // Retry only 503s with custom statuses, scoped to /api
+    path "/api/" {
+        retry max-retries=5 backoff="500ms" {
+            statuses 503
+        }
+    }
+
+    // Retry with budget: at most 20% of requests can be retries (prevents retry storms)
+    retry max-retries=3 {
+        budget ratio=0.2 window="10s" min-retries=30
+    }
+
+    // Circuit breaker: trip after 5 consecutive 5xx failures, recover after 30s
+    circuit-breaker threshold=5 recovery="30s"
+
+    // Per-host circuit breaker with 2 half-open probes
+    circuit-breaker threshold=3 recovery="10s" half-open-probes=2 per-host=true
+
+    // Circuit breaker with local cache to reduce Redis round-trips (Redis only)
+    circuit-breaker threshold=5 recovery="30s" cache-ttl="100ms"
+
+    // Add a request header and strip a response header
+    set-request-header "x-proxy" "noxy"
+    remove-response-header "server"
+
+    // Add API version header to /api requests
+    path "/api/" {
+        set-request-header "x-api-version" "2"
+    }
+
+    // Rewrite request paths using matchit patterns
+    rewrite-path "/api/v1/{*rest}" "/v2/{rest}"
+
+    // Rewrite request paths using regex
+    rewrite-path-regex "/api/v\\d+/(.*)" "/latest/$1"
+
+    // Block with custom status and body
+    block {
+        host "internal.corp.com"
+        response status=404 body="not found"
+    }
+
+    // Run a TypeScript middleware script (requires scripting feature)
+    // script "middleware.ts"
+
+    // Run a script with a shared V8 isolate across all connections, scoped to /api
+    // path "/api/" {
+    //     script "api_middleware.ts" shared=true
+    // }
+
+    // Return 503 for all paths under /fail
+    path "/fail/" {
+        respond status=503 body="service unavailable"
+    }
+
+    // Glob patterns in match conditions
+    // Match any subdomain of example.com
+    host "*.example.com" {
+        latency "100ms"
+    }
+
+    // Match any single-segment path under /api/
+    path "/api/*/users" {
         rate-limit count=10 window="1s"
+    }
+
+    // Match all paths recursively under /static/
+    path "/static/**" {
+        set-response-header "cache-control" "public, max-age=86400"
+    }
+
+    // Match by HTTP method, scoped to /api
+    methods "POST" "PUT" "DELETE" {
+        path "/api/" {
+            rate-limit count=10 window="1s"
+        }
     }
 }
 ```
+
+### Multiple listeners in one process
+
+A single config can declare any mix of forward and reverse listeners. Each listener has its own port and rule body; global rules apply to every listener.
+
+```kdl
+// Global: log and block trackers everywhere
+log
+block {
+    host "*.tracking.com"
+}
+
+// Forward proxy on 8080 (HTTPS MITM)
+forward port=8080 {
+    ca cert="ca.pem" key="ca-key.pem"
+    credential "alice" "secret"
+}
+
+// Sidecar #1: in front of the API backend
+reverse port=8081 {
+    upstream "http://api:3000"
+    rate-limit count=100 window="1s"
+}
+
+// Sidecar #2: in front of the search backend, with a stricter circuit breaker
+reverse port=8082 {
+    upstream "http://search:4000"
+    circuit-breaker threshold=3 recovery="30s"
+
+    // Override the global log: skip body logging for high-volume search
+    log bodies=false
+}
+```
+
+The last listener overrides the global `log` for itself only — the forward proxy and the API sidecar still log with default settings.
 
 ### Rule nodes
 
@@ -708,8 +766,11 @@ cargo install noxy --features cli,redis
 redis url="redis://localhost:6379"
 // redis url="redis://localhost:6379" prefix="noxy:"
 
-rate-limit count=100 window="1s"
-circuit-breaker threshold=5 recovery="30s"
+reverse port=8080 {
+    upstream "http://api:3000"
+    rate-limit count=100 window="1s"
+    circuit-breaker threshold=5 recovery="30s"
+}
 ```
 
 When `redis` is configured, all `rate-limit`, `sliding-window`, and `circuit-breaker` rules automatically use Redis. If Redis becomes unreachable, each store transparently falls back to an in-memory store and logs a warning.
@@ -857,19 +918,18 @@ noxy --upstream http://localhost:8080 \
 
 ```kdl
 // Multi-backend gateway via config file
-port 443
-bind "127.0.0.1"
-reverse-proxy "http://web:3000"
+reverse port=443 bind="127.0.0.1" {
+    upstream "http://web:3000"
+    tls cert="server.pem" key="server-key.pem"
 
-tls cert="server.pem" key="server-key.pem"
+    path "/api/" {
+        upstream "http://api:8080"
+        rate-limit count=1000 window="60s"
+    }
 
-path "/api/" {
-    upstream "http://api:8080"
-    rate-limit count=1000 window="60s"
-}
-
-path "/static/" {
-    upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
+    path "/static/" {
+        upstream "http://cdn1:9000" "http://cdn2:9000" balance="round-robin"
+    }
 }
 ```
 
@@ -884,21 +944,22 @@ noxy --upstream https://api.example.com \
 
 ```kdl
 // Surgical fault injection via config file
-port 8080
-reverse-proxy "https://api.example.com"
+reverse port=8080 {
+    upstream "https://api.example.com"
 
-log bodies=true
+    log bodies=true
 
-path "/api/checkout" {
-    fault error-rate=0.3 error-status=503
-}
+    path "/api/checkout" {
+        fault error-rate=0.3 error-status=503
+    }
 
-path "/api/search/" {
-    latency "500ms..2s"
-}
+    path "/api/search/" {
+        latency "500ms..2s"
+    }
 
-path "/api/health" {
-    respond body="{\"status\": \"ok\"}"
+    path "/api/health" {
+        respond body="{\"status\": \"ok\"}"
+    }
 }
 ```
 

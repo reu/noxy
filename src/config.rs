@@ -1,10 +1,12 @@
 //! KDL-based proxy configuration.
 //!
 //! Configs are written in [KDL](https://kdl.dev) and parsed via [`knus`].
-//! The top level holds proxy-wide settings (`port`, `bind`, `ca`, …) plus a
-//! body of rule nodes — middlewares and (possibly nested) `match` blocks. A
-//! `match` block AND-s its predicate with any enclosing match, so rules
-//! compose by nesting.
+//! The top level holds process-wide settings (timeouts, pool, optional
+//! redis) plus a body of *global* rule nodes and one or more `forward { }`
+//! / `reverse { }` listener blocks. Each listener has its own port, mode
+//! config, and rule body. Global rules are applied to every listener,
+//! shadowed by listener-internal rules of the same kind under the
+//! innermost-wins semantic.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,25 +24,8 @@ use crate::middleware::{
 };
 
 /// Top-level proxy configuration.
-#[derive(Decode, Debug, Default)]
+#[derive(Decode, Debug, Clone, Default)]
 pub struct ProxyConfig {
-    #[knus(child, unwrap(argument))]
-    pub port: Option<u16>,
-
-    #[knus(child, unwrap(argument))]
-    pub bind: Option<String>,
-
-    /// Reverse-proxy mode: forward all traffic to this upstream URL.
-    /// Distinct from rule-level `upstream` routing.
-    #[knus(child, unwrap(argument))]
-    pub reverse_proxy: Option<String>,
-
-    #[knus(child)]
-    pub ca: Option<CaConfig>,
-
-    #[knus(child)]
-    pub tls: Option<TlsConfig>,
-
     #[knus(child, unwrap(argument), default)]
     pub accept_invalid_upstream_certs: bool,
 
@@ -66,6 +51,35 @@ pub struct ProxyConfig {
     #[knus(child)]
     pub redis: Option<RedisConfig>,
 
+    #[knus(children(name = "forward"))]
+    pub forwards: Vec<ForwardListener>,
+
+    #[knus(children(name = "reverse"))]
+    pub reverses: Vec<ReverseListener>,
+
+    /// Global rules applied to every listener (with innermost-wins shadowing).
+    #[knus(children)]
+    pub body: Vec<RuleNode>,
+}
+
+/// A forward proxy listener — accepts CONNECT tunnels and MITMs TLS using a
+/// CA. Each forward listener has its own port, CA, and rule body.
+#[derive(Decode, Debug, Clone)]
+pub struct ForwardListener {
+    #[knus(property)]
+    pub port: u16,
+    #[knus(property)]
+    pub bind: Option<String>,
+
+    #[knus(child)]
+    pub ca: CaConfig,
+
+    /// Optional client-facing TLS — clients connect to the proxy port over
+    /// TLS rather than plain HTTP. The CONNECT tunnel still happens *inside*
+    /// that TLS session.
+    #[knus(child)]
+    pub tls: Option<TlsConfig>,
+
     #[knus(children(name = "credential"))]
     pub credentials: Vec<CredentialConfig>,
 
@@ -73,7 +87,27 @@ pub struct ProxyConfig {
     pub body: Vec<RuleNode>,
 }
 
-#[derive(Decode, Debug)]
+/// A reverse proxy listener — accepts plain HTTP (or client-facing TLS)
+/// requests and forwards them to a fixed upstream. Each reverse listener
+/// has its own port, upstream, and rule body.
+#[derive(Decode, Debug, Clone)]
+pub struct ReverseListener {
+    #[knus(property)]
+    pub port: u16,
+    #[knus(property)]
+    pub bind: Option<String>,
+
+    #[knus(child, unwrap(argument))]
+    pub upstream: String,
+
+    #[knus(child)]
+    pub tls: Option<TlsConfig>,
+
+    #[knus(children)]
+    pub body: Vec<RuleNode>,
+}
+
+#[derive(Decode, Debug, Clone)]
 pub struct CaConfig {
     #[knus(property)]
     pub cert: String,
@@ -81,7 +115,7 @@ pub struct CaConfig {
     pub key: String,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct TlsConfig {
     #[knus(property)]
     pub cert: String,
@@ -89,7 +123,7 @@ pub struct TlsConfig {
     pub key: String,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct CredentialConfig {
     #[knus(argument)]
     pub username: String,
@@ -98,7 +132,7 @@ pub struct CredentialConfig {
 }
 
 #[cfg(feature = "redis")]
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RedisConfig {
     #[knus(property)]
     pub url: String,
@@ -108,7 +142,7 @@ pub struct RedisConfig {
 
 /// A node in the rule body. Either a (possibly nested) match scope or a
 /// middleware leaf.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub enum RuleNode {
     Match(GeneralMatch),
     Host(HostMatch),
@@ -146,7 +180,7 @@ pub enum RuleNode {
 }
 
 /// `match host="..." path="..." method="..." { ... }` — multi-field.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct GeneralMatch {
     #[knus(property)]
     pub host: Option<String>,
@@ -163,7 +197,7 @@ pub struct GeneralMatch {
 }
 
 /// `host "X" { ... }` alias.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct HostMatch {
     #[knus(argument)]
     pub host: String,
@@ -174,7 +208,7 @@ pub struct HostMatch {
 }
 
 /// `path "/foo/" { ... }` alias. Trailing slash means "subtree-including-self".
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct PathMatch {
     #[knus(argument)]
     pub path: String,
@@ -185,7 +219,7 @@ pub struct PathMatch {
 }
 
 /// `method "GET" { ... }` alias.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct MethodMatch {
     #[knus(argument)]
     pub method: String,
@@ -196,7 +230,7 @@ pub struct MethodMatch {
 }
 
 /// `methods "GET" "POST" { ... }` alias (variadic).
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct MethodsMatch {
     #[knus(arguments)]
     pub methods: Vec<String>,
@@ -206,7 +240,7 @@ pub struct MethodsMatch {
     pub body: Vec<RuleNode>,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct HeaderMatch {
     #[knus(argument)]
     pub name: String,
@@ -215,28 +249,28 @@ pub struct HeaderMatch {
 }
 
 /// `log` (default) or `log bodies=#true`.
-#[derive(Decode, Debug, Default)]
+#[derive(Decode, Debug, Clone, Default)]
 pub struct LogConfig {
     #[knus(property)]
     pub bodies: Option<bool>,
 }
 
 /// `latency "200ms"` or `latency "100ms..500ms"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct LatencyConfig {
     #[knus(argument)]
     pub value: String,
 }
 
 /// `bandwidth 10240` (bytes/sec).
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct BandwidthConfig {
     #[knus(argument)]
     pub bps: u64,
 }
 
 /// `fault error-rate=0.5 abort-rate=0.02 error-status=503`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct FaultConfig {
     #[knus(property, default)]
     pub error_rate: f64,
@@ -247,7 +281,7 @@ pub struct FaultConfig {
 }
 
 /// `rate-limit count=30 window="1s" burst=100 per-host=#true`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RateLimitConfig {
     #[knus(property)]
     pub count: u64,
@@ -260,7 +294,7 @@ pub struct RateLimitConfig {
 }
 
 /// `sliding-window count=30 window="1s" per-host=#true`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct SlidingWindowConfig {
     #[knus(property)]
     pub count: u64,
@@ -271,7 +305,7 @@ pub struct SlidingWindowConfig {
 }
 
 /// `retry max-retries=3 backoff="500ms" { statuses 503 429 }`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RetryConfig {
     #[knus(property)]
     pub max_retries: Option<u32>,
@@ -287,7 +321,7 @@ pub struct RetryConfig {
     pub budget: Option<RetryBudget>,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RetryBudget {
     #[knus(property)]
     pub ratio: f64,
@@ -298,7 +332,7 @@ pub struct RetryBudget {
 }
 
 /// `circuit-breaker threshold=5 recovery="30s" half-open-probes=2 per-host=#true cache-ttl="100ms"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct CircuitBreakerConfig {
     #[knus(property)]
     pub threshold: u32,
@@ -313,7 +347,7 @@ pub struct CircuitBreakerConfig {
 }
 
 /// `respond body="..." status=200`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RespondConfig {
     #[knus(property)]
     pub body: String,
@@ -322,7 +356,7 @@ pub struct RespondConfig {
 }
 
 /// `upstream "http://a:80" "http://b:80" balance="round-robin"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct UpstreamConfig {
     #[knus(arguments)]
     pub urls: Vec<String>,
@@ -337,7 +371,7 @@ pub struct UpstreamConfig {
 ///     response status=404 body="not found"
 /// }
 /// ```
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct BlockConfig {
     #[knus(children(name = "host"))]
     pub hosts: Vec<HostPattern>,
@@ -347,19 +381,19 @@ pub struct BlockConfig {
     pub response: Option<BlockResponse>,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct HostPattern {
     #[knus(argument)]
     pub pattern: String,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct PathPattern {
     #[knus(argument)]
     pub pattern: String,
 }
 
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct BlockResponse {
     #[knus(property)]
     pub status: Option<u16>,
@@ -368,7 +402,7 @@ pub struct BlockResponse {
 }
 
 /// `set-request-header "name" "value"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct SetRequestHeader {
     #[knus(argument)]
     pub name: String,
@@ -377,7 +411,7 @@ pub struct SetRequestHeader {
 }
 
 /// `append-request-header "name" "value"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct AppendRequestHeader {
     #[knus(argument)]
     pub name: String,
@@ -386,14 +420,14 @@ pub struct AppendRequestHeader {
 }
 
 /// `remove-request-header "name"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RemoveRequestHeader {
     #[knus(argument)]
     pub name: String,
 }
 
 /// `set-response-header "name" "value"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct SetResponseHeader {
     #[knus(argument)]
     pub name: String,
@@ -402,7 +436,7 @@ pub struct SetResponseHeader {
 }
 
 /// `append-response-header "name" "value"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct AppendResponseHeader {
     #[knus(argument)]
     pub name: String,
@@ -411,14 +445,14 @@ pub struct AppendResponseHeader {
 }
 
 /// `remove-response-header "name"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RemoveResponseHeader {
     #[knus(argument)]
     pub name: String,
 }
 
 /// `rewrite-path "/api/v1/{*rest}" "/v2/{rest}"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RewritePath {
     #[knus(argument)]
     pub pattern: String,
@@ -427,7 +461,7 @@ pub struct RewritePath {
 }
 
 /// `rewrite-path-regex "/api/v\\d+/(.*)" "/latest/$1"`.
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct RewritePathRegex {
     #[knus(argument)]
     pub pattern: String,
@@ -436,7 +470,7 @@ pub struct RewritePathRegex {
 }
 
 #[cfg(feature = "scripting")]
-#[derive(Decode, Debug)]
+#[derive(Decode, Debug, Clone)]
 pub struct ScriptConfig {
     #[knus(argument)]
     pub file: String,
@@ -622,44 +656,28 @@ impl ProxyConfig {
         knus::parse::<Self>(&label, &content).map_err(|e| anyhow::anyhow!("{e:?}"))
     }
 
-    /// Build a [`ProxyBuilder`](crate::ProxyBuilder) from this config.
-    pub fn into_builder(self) -> anyhow::Result<crate::ProxyBuilder> {
-        let mut builder = crate::Proxy::builder();
-
-        if let Some(ref upstream) = self.reverse_proxy {
-            builder = builder.reverse_proxy(upstream)?;
-        }
-        if let Some(ref tls) = self.tls {
-            builder = builder.tls_identity(&tls.cert, &tls.key)?;
-        }
-        if let Some(ca) = self.ca {
-            builder = builder.ca_pem_files(&ca.cert, &ca.key)?;
-        }
-        if self.accept_invalid_upstream_certs {
-            builder = builder.danger_accept_invalid_upstream_certs();
-        }
-        if let Some(ref s) = self.handshake_timeout {
-            builder = builder.handshake_timeout(parse_duration(s).map_err(anyhow_str)?);
-        }
-        if let Some(ref s) = self.idle_timeout {
-            builder = builder.idle_timeout(parse_duration(s).map_err(anyhow_str)?);
-        }
-        if let Some(max) = self.max_connections {
-            builder = builder.max_connections(max);
-        }
-        if let Some(ref s) = self.drain_timeout {
-            builder = builder.drain_timeout(parse_duration(s).map_err(anyhow_str)?);
-        }
-        if let Some(max) = self.pool_max_idle_per_host {
-            builder = builder.pool_max_idle_per_host(max);
-        }
-        if let Some(ref s) = self.pool_idle_timeout {
-            builder = builder.pool_idle_timeout(parse_duration(s).map_err(anyhow_str)?);
+    /// Compile this config into a list of bindable proxy listeners.
+    ///
+    /// Each `forward { }` and `reverse { }` block produces one
+    /// [`CompiledListener`]. The top-level rule body is treated as global
+    /// rules: cloned into every listener's compile pass, with listener-level
+    /// declarations of the same exclusive kind shadowing the global one.
+    pub fn into_listeners(self) -> anyhow::Result<Vec<CompiledListener>> {
+        if self.forwards.is_empty() && self.reverses.is_empty() {
+            anyhow::bail!(
+                "config has no listeners — declare at least one `forward {{ }}` or `reverse {{ }}` block"
+            );
         }
 
-        for cred in self.credentials {
-            builder = builder.credential(cred.username, cred.password);
-        }
+        let process_settings = ProcessSettings {
+            accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
+            handshake_timeout: self.handshake_timeout.clone(),
+            idle_timeout: self.idle_timeout.clone(),
+            max_connections: self.max_connections,
+            drain_timeout: self.drain_timeout.clone(),
+            pool_max_idle_per_host: self.pool_max_idle_per_host,
+            pool_idle_timeout: self.pool_idle_timeout.clone(),
+        };
 
         #[cfg(feature = "redis")]
         let redis_conn = if let Some(ref redis) = self.redis {
@@ -671,8 +689,10 @@ impl ProxyConfig {
             None
         };
 
-        let mut decls: Vec<Decl> = Vec::new();
-        let mut walk = WalkCtx {
+        // Walk globals once. Globals live at path = [], so any listener-internal
+        // decl (path starting with [0]) is a strict extension and shadows them.
+        let mut global_decls: Vec<Decl> = Vec::new();
+        let mut global_walk = WalkCtx {
             preds: Vec::new(),
             path: Vec::new(),
             #[cfg(feature = "redis")]
@@ -680,25 +700,199 @@ impl ProxyConfig {
             #[cfg(feature = "redis")]
             scope_counter: 0,
         };
-        walk_body(self.body, &mut walk, &mut decls)?;
+        walk_body(self.body, &mut global_walk, &mut global_decls)?;
+        validate_min_scope_global(&global_decls)?;
 
-        resolve_exclusions(&mut decls);
-
-        for decl in decls {
-            builder = emit_decl(
-                builder,
-                decl,
+        let mut listeners = Vec::new();
+        for fwd in self.forwards {
+            listeners.push(compile_forward(
+                fwd,
+                &global_decls,
+                &process_settings,
                 #[cfg(feature = "redis")]
                 redis_conn.as_ref(),
-            )?;
+            )?);
+        }
+        for rev in self.reverses {
+            listeners.push(compile_reverse(
+                rev,
+                &global_decls,
+                &process_settings,
+                #[cfg(feature = "redis")]
+                redis_conn.as_ref(),
+            )?);
         }
 
-        Ok(builder)
+        Ok(listeners)
     }
+}
+
+/// A compiled listener ready to bind. Pair `addr` with `proxy.listen()`.
+pub struct CompiledListener {
+    pub addr: String,
+    pub proxy: crate::Proxy,
+}
+
+impl std::fmt::Debug for CompiledListener {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledListener")
+            .field("addr", &self.addr)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Process-wide settings duplicated across each per-listener `ProxyBuilder`.
+/// (Each listener gets its own connection pool / semaphore / drain timer in
+/// the v1 implementation; future work could share a single instance.)
+struct ProcessSettings {
+    accept_invalid_upstream_certs: bool,
+    handshake_timeout: Option<String>,
+    idle_timeout: Option<String>,
+    max_connections: Option<usize>,
+    drain_timeout: Option<String>,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout: Option<String>,
+}
+
+fn apply_process_settings(
+    mut builder: crate::ProxyBuilder,
+    s: &ProcessSettings,
+) -> anyhow::Result<crate::ProxyBuilder> {
+    if s.accept_invalid_upstream_certs {
+        builder = builder.danger_accept_invalid_upstream_certs();
+    }
+    if let Some(ref t) = s.handshake_timeout {
+        builder = builder.handshake_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(ref t) = s.idle_timeout {
+        builder = builder.idle_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(max) = s.max_connections {
+        builder = builder.max_connections(max);
+    }
+    if let Some(ref t) = s.drain_timeout {
+        builder = builder.drain_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(max) = s.pool_max_idle_per_host {
+        builder = builder.pool_max_idle_per_host(max);
+    }
+    if let Some(ref t) = s.pool_idle_timeout {
+        builder = builder.pool_idle_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    Ok(builder)
+}
+
+fn walk_listener_body(body: Vec<RuleNode>, global_decls: &[Decl]) -> anyhow::Result<Vec<Decl>> {
+    // Globals at path=[]; listener-internal at path=[0, ...]. The strict-prefix
+    // shadowing rule treats listener-internal decls as descendants of globals.
+    let mut decls: Vec<Decl> = global_decls.to_vec();
+    let mut walk = WalkCtx {
+        preds: Vec::new(),
+        path: vec![0],
+        #[cfg(feature = "redis")]
+        scope_stack: Vec::new(),
+        #[cfg(feature = "redis")]
+        scope_counter: 0,
+    };
+    walk_body(body, &mut walk, &mut decls)?;
+    resolve_exclusions(&mut decls);
+    Ok(decls)
+}
+
+fn compile_forward(
+    fwd: ForwardListener,
+    global_decls: &[Decl],
+    process: &ProcessSettings,
+    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
+) -> anyhow::Result<CompiledListener> {
+    let bind = fwd.bind.unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr = format!("{bind}:{}", fwd.port);
+
+    let decls = walk_listener_body(fwd.body, global_decls)?;
+
+    let mut builder = crate::Proxy::builder();
+    builder = apply_process_settings(builder, process)?;
+    builder = builder.ca_pem_files(&fwd.ca.cert, &fwd.ca.key)?;
+    if let Some(tls) = fwd.tls {
+        builder = builder.tls_identity(&tls.cert, &tls.key)?;
+    }
+    for cred in fwd.credentials {
+        builder = builder.credential(cred.username, cred.password);
+    }
+
+    for decl in decls {
+        builder = emit_decl(
+            builder,
+            decl,
+            #[cfg(feature = "redis")]
+            redis,
+        )?;
+    }
+
+    Ok(CompiledListener {
+        addr,
+        proxy: builder.build()?,
+    })
+}
+
+fn compile_reverse(
+    rev: ReverseListener,
+    global_decls: &[Decl],
+    process: &ProcessSettings,
+    #[cfg(feature = "redis")] redis: Option<&crate::middleware::RedisConnection>,
+) -> anyhow::Result<CompiledListener> {
+    let bind = rev.bind.unwrap_or_else(|| "127.0.0.1".to_string());
+    let addr = format!("{bind}:{}", rev.port);
+
+    let decls = walk_listener_body(rev.body, global_decls)?;
+
+    let mut builder = crate::Proxy::builder();
+    builder = apply_process_settings(builder, process)?;
+    builder = builder.reverse_proxy(&rev.upstream)?;
+    if let Some(tls) = rev.tls {
+        builder = builder.tls_identity(&tls.cert, &tls.key)?;
+    }
+
+    for decl in decls {
+        builder = emit_decl(
+            builder,
+            decl,
+            #[cfg(feature = "redis")]
+            redis,
+        )?;
+    }
+
+    Ok(CompiledListener {
+        addr,
+        proxy: builder.build()?,
+    })
+}
+
+fn validate_min_scope_global(decls: &[Decl]) -> anyhow::Result<()> {
+    for d in decls {
+        if rule_min_scope(&d.leaf) == RuleScope::Listener {
+            anyhow::bail!(
+                "`{}` is only valid inside a `forward {{ }}` or `reverse {{ }}` block",
+                rule_node_name(&d.leaf)
+            );
+        }
+    }
+    Ok(())
 }
 
 fn anyhow_str(s: String) -> anyhow::Error {
     anyhow::anyhow!("{s}")
+}
+
+/// Where a rule is allowed to appear in the config tree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RuleScope {
+    /// Anywhere — top-level globals, inside a listener, inside a match.
+    Global,
+    /// Must be inside a `forward { }` or `reverse { }` listener block
+    /// (or any deeper scope inside one). Routing rules need a listener
+    /// context to make sense.
+    Listener,
 }
 
 /// Per-middleware definition: each leaf config implements `Rule` to declare
@@ -711,6 +905,11 @@ trait Rule {
     /// Default is additive (no shadowing).
     fn is_exclusive(&self) -> bool {
         false
+    }
+
+    /// Shallowest scope where this rule is allowed. Default `Global`.
+    fn min_scope(&self) -> RuleScope {
+        RuleScope::Global
     }
 
     fn emit(
@@ -764,11 +963,74 @@ fn rule_is_exclusive(node: &RuleNode) -> bool {
     }
 }
 
+fn rule_min_scope(node: &RuleNode) -> RuleScope {
+    match node {
+        RuleNode::Log(c) => c.min_scope(),
+        RuleNode::Latency(c) => c.min_scope(),
+        RuleNode::Bandwidth(c) => c.min_scope(),
+        RuleNode::Fault(c) => c.min_scope(),
+        RuleNode::RateLimit(c) => c.min_scope(),
+        RuleNode::SlidingWindow(c) => c.min_scope(),
+        RuleNode::Retry(c) => c.min_scope(),
+        RuleNode::CircuitBreaker(c) => c.min_scope(),
+        RuleNode::Respond(c) => c.min_scope(),
+        RuleNode::Block(c) => c.min_scope(),
+        RuleNode::SetRequestHeader(c) => c.min_scope(),
+        RuleNode::AppendRequestHeader(c) => c.min_scope(),
+        RuleNode::RemoveRequestHeader(c) => c.min_scope(),
+        RuleNode::SetResponseHeader(c) => c.min_scope(),
+        RuleNode::AppendResponseHeader(c) => c.min_scope(),
+        RuleNode::RemoveResponseHeader(c) => c.min_scope(),
+        RuleNode::RewritePath(c) => c.min_scope(),
+        RuleNode::RewritePathRegex(c) => c.min_scope(),
+        RuleNode::Upstream(c) => c.min_scope(),
+        #[cfg(feature = "scripting")]
+        RuleNode::Script(c) => c.min_scope(),
+        RuleNode::Match(_)
+        | RuleNode::Host(_)
+        | RuleNode::Path(_)
+        | RuleNode::Method(_)
+        | RuleNode::Methods(_) => RuleScope::Global,
+    }
+}
+
+fn rule_node_name(node: &RuleNode) -> &'static str {
+    match node {
+        RuleNode::Log(_) => "log",
+        RuleNode::Latency(_) => "latency",
+        RuleNode::Bandwidth(_) => "bandwidth",
+        RuleNode::Fault(_) => "fault",
+        RuleNode::RateLimit(_) => "rate-limit",
+        RuleNode::SlidingWindow(_) => "sliding-window",
+        RuleNode::Retry(_) => "retry",
+        RuleNode::CircuitBreaker(_) => "circuit-breaker",
+        RuleNode::Respond(_) => "respond",
+        RuleNode::Block(_) => "block",
+        RuleNode::SetRequestHeader(_) => "set-request-header",
+        RuleNode::AppendRequestHeader(_) => "append-request-header",
+        RuleNode::RemoveRequestHeader(_) => "remove-request-header",
+        RuleNode::SetResponseHeader(_) => "set-response-header",
+        RuleNode::AppendResponseHeader(_) => "append-response-header",
+        RuleNode::RemoveResponseHeader(_) => "remove-response-header",
+        RuleNode::RewritePath(_) => "rewrite-path",
+        RuleNode::RewritePathRegex(_) => "rewrite-path-regex",
+        RuleNode::Upstream(_) => "upstream",
+        #[cfg(feature = "scripting")]
+        RuleNode::Script(_) => "script",
+        RuleNode::Match(_) => "match",
+        RuleNode::Host(_) => "host",
+        RuleNode::Path(_) => "path",
+        RuleNode::Method(_) => "method",
+        RuleNode::Methods(_) => "methods",
+    }
+}
+
 /// A collected leaf declaration. `path` records its position in the tree of
 /// enclosing matches (one entry per enclosing match, by its index in the
 /// parent body), enabling descendant detection during shadow resolution.
 /// Same-kind comparison uses `std::mem::discriminant` on `leaf`, so no
 /// parallel kind-tag is needed.
+#[derive(Clone)]
 struct Decl {
     path: Vec<usize>,
     scope_pred: Option<Predicate>,
@@ -920,6 +1182,7 @@ fn walk_match(
 /// predicate is then `scope_pred AND NOT (any of the exclusions)`.
 fn resolve_exclusions(decls: &mut [Decl]) {
     use std::mem::discriminant;
+    let always_true: Predicate = Arc::new(|_: &Request<Body>| true);
     let n = decls.len();
     #[allow(clippy::needless_range_loop)]
     // index used both for `decls[i]` reads and the later mutating assign
@@ -935,12 +1198,15 @@ fn resolve_exclusions(decls: &mut [Decl]) {
                 continue;
             }
             // j shadows i iff j's scope is strictly more nested than i's:
-            // i's path is a strict prefix of j's path.
-            if decl.path.len() > path_i.len()
-                && decl.path.starts_with(&path_i)
-                && let Some(ref p) = decl.scope_pred
-            {
-                excluded.push(p.clone());
+            // i's path is a strict prefix of j's path. A descendant with no
+            // scope predicate (`None`) means it fires for every request in
+            // its enclosing scope, so the exclusion is "always true."
+            if decl.path.len() > path_i.len() && decl.path.starts_with(&path_i) {
+                let p = decl
+                    .scope_pred
+                    .clone()
+                    .unwrap_or_else(|| always_true.clone());
+                excluded.push(p);
             }
         }
         decls[i].excluded_preds = excluded;
@@ -1334,6 +1600,12 @@ impl Rule for RewritePathRegex {
 }
 
 impl Rule for UpstreamConfig {
+    fn min_scope(&self) -> RuleScope {
+        // Routing only makes sense once we know which listener (and thus
+        // which mode) the request is in. `upstream` at the global level has
+        // no listener context, so it's an error.
+        RuleScope::Listener
+    }
     fn emit(
         self,
         mut builder: crate::ProxyBuilder,
@@ -1477,47 +1749,107 @@ mod tests {
     #[test]
     fn parse_minimal() {
         let cfg = ProxyConfig::from_kdl("").unwrap();
-        assert!(cfg.port.is_none());
         assert!(cfg.body.is_empty());
+        assert!(cfg.forwards.is_empty());
+        assert!(cfg.reverses.is_empty());
     }
 
     #[test]
-    fn parse_globals() {
+    fn parse_process_settings() {
         let cfg = ProxyConfig::from_kdl(
             r#"
-            port 9090
-            bind "127.0.0.1"
             accept-invalid-upstream-certs true
             pool-max-idle-per-host 16
             pool-idle-timeout "120s"
-
-            ca cert="cert.pem" key="key.pem"
+            handshake-timeout "10s"
+            max-connections 1000
             "#,
         )
         .unwrap();
 
-        assert_eq!(cfg.port, Some(9090));
-        assert_eq!(cfg.bind.as_deref(), Some("127.0.0.1"));
         assert!(cfg.accept_invalid_upstream_certs);
         assert_eq!(cfg.pool_max_idle_per_host, Some(16));
         assert_eq!(cfg.pool_idle_timeout.as_deref(), Some("120s"));
-        let ca = cfg.ca.unwrap();
-        assert_eq!(ca.cert, "cert.pem");
-        assert_eq!(ca.key, "key.pem");
+        assert_eq!(cfg.handshake_timeout.as_deref(), Some("10s"));
+        assert_eq!(cfg.max_connections, Some(1000));
     }
 
     #[test]
-    fn parse_credentials() {
+    fn parse_forward_listener() {
         let cfg = ProxyConfig::from_kdl(
             r#"
-            credential "alice" "secret"
-            credential "bob" "hunter2"
+            forward port=8080 bind="0.0.0.0" {
+                ca cert="cert.pem" key="key.pem"
+                credential "alice" "secret"
+                credential "bob" "hunter2"
+                log
+            }
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.credentials.len(), 2);
-        assert_eq!(cfg.credentials[0].username, "alice");
-        assert_eq!(cfg.credentials[1].password, "hunter2");
+
+        assert_eq!(cfg.forwards.len(), 1);
+        let f = &cfg.forwards[0];
+        assert_eq!(f.port, 8080);
+        assert_eq!(f.bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(f.ca.cert, "cert.pem");
+        assert_eq!(f.credentials.len(), 2);
+        assert_eq!(f.credentials[0].username, "alice");
+        assert_eq!(f.body.len(), 1);
+        assert!(matches!(f.body[0], RuleNode::Log(_)));
+    }
+
+    #[test]
+    fn parse_reverse_listener() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            reverse port=8081 {
+                upstream "http://api:3000"
+                tls cert="server.pem" key="server-key.pem"
+                rate-limit count=100 window="1s"
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.reverses.len(), 1);
+        let r = &cfg.reverses[0];
+        assert_eq!(r.port, 8081);
+        assert_eq!(r.upstream, "http://api:3000");
+        assert!(r.tls.is_some());
+        assert!(matches!(r.body[0], RuleNode::RateLimit(_)));
+    }
+
+    #[test]
+    fn parse_mixed_listeners_with_globals() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            // global rules
+            log
+            block {
+                host "*.tracking.com"
+            }
+
+            forward port=8080 {
+                ca cert="ca.pem" key="ca-key.pem"
+                credential "alice" "secret"
+            }
+
+            reverse port=8081 {
+                upstream "http://api:3000"
+                rate-limit count=100 window="1s"
+            }
+
+            reverse port=8082 {
+                upstream "http://search:4000"
+            }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.body.len(), 2);
+        assert_eq!(cfg.forwards.len(), 1);
+        assert_eq!(cfg.reverses.len(), 2);
     }
 
     #[test]
@@ -1644,16 +1976,127 @@ mod tests {
         }
     }
 
+    fn install_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
     #[test]
-    fn into_builder_with_ca() {
+    fn into_listeners_forward() {
+        install_crypto_provider();
         let cfg = ProxyConfig::from_kdl(
             r#"
-            ca cert="tests/dummy-cert.pem" key="tests/dummy-key.pem"
-            log
+            forward port=8080 {
+                ca cert="tests/dummy-cert.pem" key="tests/dummy-key.pem"
+                log
+            }
             "#,
         )
         .unwrap();
-        assert!(cfg.into_builder().is_ok());
+        let listeners = cfg.into_listeners().unwrap();
+        assert_eq!(listeners.len(), 1);
+        assert_eq!(listeners[0].addr, "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn into_listeners_no_listeners_errors() {
+        let cfg = ProxyConfig::from_kdl("log").unwrap();
+        let err = cfg.into_listeners().unwrap_err();
+        assert!(err.to_string().contains("no listeners"));
+    }
+
+    #[test]
+    fn upstream_at_global_level_errors() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            upstream "http://api:80"
+
+            forward port=8080 {
+                ca cert="tests/dummy-cert.pem" key="tests/dummy-key.pem"
+            }
+            "#,
+        )
+        .unwrap();
+        let err = cfg.into_listeners().unwrap_err();
+        assert!(err.to_string().contains("upstream"));
+        assert!(err.to_string().contains("forward") || err.to_string().contains("listener"));
+    }
+
+    #[test]
+    fn global_rule_shadowed_per_listener() {
+        // The global `log` should be shadowed by listener 0's `log`, but
+        // remain active for listener 1 (which has no `log` redeclared).
+        // We exercise this through the walker + resolver directly to see
+        // each listener's compiled decl set.
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            log
+
+            forward port=8080 {
+                ca cert="x" key="y"
+                log bodies=true
+            }
+
+            reverse port=8081 {
+                upstream "http://api:3000"
+            }
+            "#,
+        )
+        .unwrap();
+
+        // Walk globals
+        let mut global_decls = Vec::new();
+        let mut walk = WalkCtx {
+            preds: Vec::new(),
+            path: Vec::new(),
+            #[cfg(feature = "redis")]
+            scope_stack: Vec::new(),
+            #[cfg(feature = "redis")]
+            scope_counter: 0,
+        };
+        walk_body(cfg.body, &mut walk, &mut global_decls).unwrap();
+
+        // Listener 0 (forward) has its own `log`: global is shadowed
+        let fwd_decls = walk_listener_body(cfg.forwards[0].body.clone(), &global_decls).unwrap();
+        // Two log decls: global + listener-internal
+        let log_decls: Vec<&Decl> = fwd_decls
+            .iter()
+            .filter(|d| matches!(d.leaf, RuleNode::Log(_)))
+            .collect();
+        assert_eq!(log_decls.len(), 2);
+        // The global one (path=[]) has the listener-internal scope as exclusion
+        let global_log = log_decls.iter().find(|d| d.path.is_empty()).unwrap();
+        assert_eq!(global_log.excluded_preds.len(), 1);
+
+        // Listener 1 (reverse) has no `log`: global is unshadowed
+        let rev_decls = walk_listener_body(cfg.reverses[0].body.clone(), &global_decls).unwrap();
+        let log_decls: Vec<&Decl> = rev_decls
+            .iter()
+            .filter(|d| matches!(d.leaf, RuleNode::Log(_)))
+            .collect();
+        assert_eq!(log_decls.len(), 1);
+        assert!(log_decls[0].path.is_empty());
+        assert_eq!(log_decls[0].excluded_preds.len(), 0);
+    }
+
+    #[test]
+    fn into_listeners_multi() {
+        install_crypto_provider();
+        let cfg = ProxyConfig::from_kdl(
+            r#"
+            forward port=8080 {
+                ca cert="tests/dummy-cert.pem" key="tests/dummy-key.pem"
+            }
+
+            reverse port=8081 {
+                upstream "http://api:3000"
+            }
+            "#,
+        )
+        .unwrap();
+        let listeners = cfg.into_listeners().unwrap();
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0].addr, "127.0.0.1:8080");
+        assert_eq!(listeners[1].addr, "127.0.0.1:8081");
     }
 
     #[test]
