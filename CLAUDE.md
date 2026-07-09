@@ -93,7 +93,6 @@ trait Rule {
 
 ### Security
 - Redact sensitive headers by default in traffic logs (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, etc.)
-- Use constant-time credential comparison for proxy auth checks
 - Harden CONNECT authority parsing (avoid naive string split on `:`; use authority-aware parsing including IPv6)
 
 ### Scripting
