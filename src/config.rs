@@ -336,6 +336,11 @@ pub struct SlidingWindowConfig {
 }
 
 /// `retry max-retries=3 backoff="500ms" { statuses 503 429 }`.
+///
+/// Only idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) are
+/// retried by default. `methods="get post"` sets an explicit allowlist;
+/// `all-methods=true` retries every method (including POST/PATCH). Method
+/// lists are comma- or whitespace-separated and case-insensitive.
 #[derive(Decode, Debug, Clone)]
 pub struct RetryConfig {
     #[knus(property)]
@@ -346,6 +351,10 @@ pub struct RetryConfig {
     pub max_backoff: Option<String>,
     #[knus(property)]
     pub max_replay_body_bytes: Option<usize>,
+    #[knus(property)]
+    pub methods: Option<String>,
+    #[knus(property)]
+    pub all_methods: Option<bool>,
     #[knus(child, unwrap(arguments))]
     pub statuses: Option<Vec<u16>>,
     #[knus(child)]
@@ -1902,6 +1911,19 @@ fn build_circuit_breaker(c: &CircuitBreakerConfig, recovery: Duration) -> Circui
     }
 }
 
+/// Parse a comma- or whitespace-separated list of HTTP method names.
+/// Names are case-insensitive; an unrecognized name is an error.
+fn parse_method_list(list: &str) -> anyhow::Result<Vec<http::Method>> {
+    list.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            http::Method::from_bytes(name.to_ascii_uppercase().as_bytes())
+                .map_err(|_| anyhow::anyhow!("invalid HTTP method '{name}' in retry methods"))
+        })
+        .collect()
+}
+
 fn build_retry(c: RetryConfig) -> anyhow::Result<Retry> {
     let mut retry = if let Some(statuses) = c.statuses {
         Retry::on_statuses(statuses)
@@ -1919,6 +1941,11 @@ fn build_retry(c: RetryConfig) -> anyhow::Result<Retry> {
     }
     if let Some(max_bytes) = c.max_replay_body_bytes {
         retry = retry.max_replay_body_bytes(max_bytes);
+    }
+    if let Some(true) = c.all_methods {
+        retry = retry.retry_all_methods();
+    } else if let Some(ref list) = c.methods {
+        retry = retry.retry_methods(parse_method_list(list)?);
     }
     if let Some(b) = c.budget {
         retry = retry.budget(b.ratio);
@@ -2055,6 +2082,35 @@ mod tests {
         let cfg = ProxyConfig::from_kdl("log").unwrap();
         assert_eq!(cfg.body.len(), 1);
         assert!(matches!(cfg.body[0], RuleNode::Log(_)));
+    }
+
+    #[test]
+    fn parse_retry_methods_properties() {
+        let cfg =
+            ProxyConfig::from_kdl(r#"retry max-retries=3 methods="get post" all-methods=false"#)
+                .unwrap();
+        assert_eq!(cfg.body.len(), 1);
+        if let RuleNode::Retry(ref r) = cfg.body[0] {
+            assert_eq!(r.methods.as_deref(), Some("get post"));
+            assert_eq!(r.all_methods, Some(false));
+        } else {
+            panic!("expected Retry");
+        }
+    }
+
+    #[test]
+    fn parse_method_list_is_case_insensitive() {
+        let methods = parse_method_list("get, POST  put").unwrap();
+        assert_eq!(
+            methods,
+            vec![http::Method::GET, http::Method::POST, http::Method::PUT]
+        );
+    }
+
+    #[test]
+    fn parse_method_list_rejects_invalid() {
+        // '@' is not a valid HTTP method token character.
+        assert!(parse_method_list("get in@valid").is_err());
     }
 
     #[test]

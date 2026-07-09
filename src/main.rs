@@ -89,6 +89,14 @@ struct Cli {
     #[arg(long = "retry-max-backoff")]
     retry_max_backoff: Option<String>,
 
+    /// Methods eligible for retry (comma-separated; default: idempotent methods only)
+    #[arg(long = "retry-methods", value_name = "METHODS")]
+    retry_methods: Option<String>,
+
+    /// Retry all methods, including non-idempotent ones (POST, PATCH)
+    #[arg(long = "retry-all-methods")]
+    retry_all_methods: bool,
+
     /// Circuit breaker: trip after N failures, recover after duration (e.g., "5/30s")
     #[arg(long = "circuit-breaker")]
     circuit_breaker: Option<String>,
@@ -281,6 +289,12 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
             max_retries: Some(max_retries),
             backoff: None,
             max_backoff: cli.retry_max_backoff,
+            methods: cli.retry_methods,
+            all_methods: if cli.retry_all_methods {
+                Some(true)
+            } else {
+                None
+            },
             statuses: None,
             max_replay_body_bytes: cli.retry_max_body,
             budget: None,
