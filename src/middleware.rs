@@ -30,7 +30,9 @@ pub use retry::Retry;
 pub use router::{LoadBalanceStrategy, Router, Upstream};
 pub use set_response::SetResponse;
 pub use sliding_window::{InMemorySlidingWindowStore, SlidingWindow};
-pub use store::{CircuitAction, CircuitBreakerStore, RateLimitStore, SlidingWindowStore};
+pub use store::{
+    CircuitAction, CircuitBreakerStore, RateLimitOutcome, RateLimitStore, SlidingWindowStore,
+};
 pub use traffic_logger::TrafficLogger;
 pub use url_rewrite::UrlRewrite;
 

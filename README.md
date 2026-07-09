@@ -274,6 +274,8 @@ Options:
       --bandwidth <BANDWIDTH>  Global bandwidth limit in bytes per second
       --rate-limit <RATE>              Global rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
       --per-host-rate-limit <RATE>     Per-host rate limit (e.g., "10/1s"). Repeatable.
+      --rate-limit-max-delay <DURATION>  Reject with 429 once the wait would exceed this (default ~one window)
+      --rate-limit-unbounded-delay     Delay over-limit requests indefinitely; never reject
       --sliding-window <RATE>          Sliding window rate limit (e.g., "30/1s"). Repeatable.
       --per-host-sliding-window <RATE> Per-host sliding window (e.g., "10/1s"). Repeatable.
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
@@ -666,7 +668,7 @@ Path globs use `*` (single segment), `**` (any depth), `?` (single char), `[a-z]
 | `latency`                    | `latency "200ms"` or `latency "100ms..500ms"`                           | Fixed or random range. |
 | `bandwidth`                  | `bandwidth 10240`                                                       | Bytes/sec throughput limit. |
 | `fault`                      | `fault error-rate=0.5 abort-rate=0.02 error-status=503`                | Random faults. |
-| `rate-limit`                 | `rate-limit count=30 window="1s" burst=100 per-host=true`              | Token bucket. |
+| `rate-limit`                 | `rate-limit count=30 window="1s" burst=100 per-host=true max-delay="2s" unbounded-delay=false` | Token bucket. Over-limit requests are delayed; once the wait would exceed `max-delay` (default ~one window) they get `429`. `unbounded-delay=true` delays forever and never rejects. |
 | `sliding-window`             | `sliding-window count=10 window="1s" per-host=true`                    | Hard-cap, no burst. |
 | `retry`                      | `retry max-retries=3 backoff="1s" max-backoff="30s" max-replay-body-bytes=1048576 { statuses 503 429; budget ratio=0.2 window="10s" min-retries=30 }` | Retry on 429/5xx by default. `statuses` and `budget` are child nodes. |
 | `circuit-breaker`            | `circuit-breaker threshold=5 recovery="30s" half-open-probes=2 per-host=true cache-ttl="100ms"` | `cache-ttl` is Redis-only. |

@@ -322,6 +322,14 @@ pub struct RateLimitConfig {
     pub burst: Option<u64>,
     #[knus(property, default)]
     pub per_host: bool,
+    /// Cap how long an over-limit request waits before it is rejected with 429.
+    /// Defaults to roughly one window.
+    #[knus(property)]
+    pub max_delay: Option<String>,
+    /// Disable the delay cap: over-limit requests are delayed indefinitely and
+    /// never rejected.
+    #[knus(property, default)]
+    pub unbounded_delay: bool,
 }
 
 /// `sliding-window count=30 window="1s" per-host=#true`.
@@ -1543,8 +1551,13 @@ impl Rule for RateLimitConfig {
         if let Some(conn) = ctx.redis {
             let rate = self.count as f64 / window.as_secs_f64();
             let burst = self.burst.map(|b| b as f64).unwrap_or(self.count as f64);
-            let store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst)
+            let mut store = crate::middleware::RedisRateLimitStore::new(conn.clone(), rate, burst)
                 .scope(ctx.scope_label);
+            if self.unbounded_delay {
+                store = store.max_wait(None);
+            } else if let Some(ref max_delay) = self.max_delay {
+                store = store.max_wait(Some(parse_duration(max_delay).map_err(anyhow_str)?));
+            }
             let limiter = if self.per_host {
                 RateLimiter::with_store(store, host_key)
             } else {
@@ -1555,7 +1568,7 @@ impl Rule for RateLimitConfig {
         Ok(apply_layer(
             builder,
             ctx.pred.clone(),
-            build_rate_limiter(&self, window),
+            build_rate_limiter(&self, window)?,
         ))
     }
 }
@@ -1876,17 +1889,21 @@ fn host_key(req: &Request<Body>) -> String {
         .to_string()
 }
 
-fn build_rate_limiter(c: &RateLimitConfig, window: Duration) -> RateLimiter {
-    let limiter = if c.per_host {
+fn build_rate_limiter(c: &RateLimitConfig, window: Duration) -> anyhow::Result<RateLimiter> {
+    let mut limiter = if c.per_host {
         RateLimiter::per_host(c.count, window)
     } else {
         RateLimiter::global(c.count, window)
     };
     if let Some(burst) = c.burst {
-        limiter.burst(burst)
-    } else {
-        limiter
+        limiter = limiter.burst(burst);
     }
+    if c.unbounded_delay {
+        limiter = limiter.unbounded_delay();
+    } else if let Some(ref max_delay) = c.max_delay {
+        limiter = limiter.max_delay(parse_duration(max_delay).map_err(anyhow_str)?);
+    }
+    Ok(limiter)
 }
 
 fn build_circuit_breaker(c: &CircuitBreakerConfig, recovery: Duration) -> CircuitBreaker {
@@ -2055,6 +2072,27 @@ mod tests {
         let cfg = ProxyConfig::from_kdl("log").unwrap();
         assert_eq!(cfg.body.len(), 1);
         assert!(matches!(cfg.body[0], RuleNode::Log(_)));
+    }
+
+    #[test]
+    fn parse_rate_limit_delay_properties() {
+        let cfg =
+            ProxyConfig::from_kdl(r#"rate-limit count=30 window="1s" max-delay="2s""#).unwrap();
+        assert_eq!(cfg.body.len(), 1);
+        if let RuleNode::RateLimit(ref r) = cfg.body[0] {
+            assert_eq!(r.max_delay.as_deref(), Some("2s"));
+            assert!(!r.unbounded_delay);
+        } else {
+            panic!("expected RateLimit");
+        }
+
+        let cfg = ProxyConfig::from_kdl(r#"rate-limit count=30 window="1s" unbounded-delay=true"#)
+            .unwrap();
+        if let RuleNode::RateLimit(ref r) = cfg.body[0] {
+            assert!(r.unbounded_delay);
+        } else {
+            panic!("expected RateLimit");
+        }
     }
 
     #[test]

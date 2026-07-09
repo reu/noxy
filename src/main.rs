@@ -69,6 +69,15 @@ struct Cli {
     #[arg(long = "per-host-rate-limit")]
     per_host_rate_limits: Vec<String>,
 
+    /// Reject rate-limited requests once the wait would exceed this (e.g., "2s").
+    /// Applies to --rate-limit / --per-host-rate-limit. Defaults to ~one window.
+    #[arg(long = "rate-limit-max-delay", value_name = "DURATION")]
+    rate_limit_max_delay: Option<String>,
+
+    /// Never reject rate-limited requests; delay them indefinitely (legacy behavior)
+    #[arg(long = "rate-limit-unbounded-delay")]
+    rate_limit_unbounded_delay: bool,
+
     /// Global sliding window rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
     #[arg(long = "sliding-window")]
     sliding_windows: Vec<String>,
@@ -263,11 +272,21 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
             .push(RuleNode::Bandwidth(noxy::config::BandwidthConfig { bps }));
     }
 
-    for rl in cli.rate_limits {
-        config.body.push(parse_rate_limit(&rl, false)?);
+    for rl in &cli.rate_limits {
+        config.body.push(parse_rate_limit(
+            rl,
+            false,
+            cli.rate_limit_max_delay.as_deref(),
+            cli.rate_limit_unbounded_delay,
+        )?);
     }
-    for rl in cli.per_host_rate_limits {
-        config.body.push(parse_rate_limit(&rl, true)?);
+    for rl in &cli.per_host_rate_limits {
+        config.body.push(parse_rate_limit(
+            rl,
+            true,
+            cli.rate_limit_max_delay.as_deref(),
+            cli.rate_limit_unbounded_delay,
+        )?);
     }
     for sw in cli.sliding_windows {
         config.body.push(parse_sliding_window(&sw, false)?);
@@ -482,13 +501,20 @@ fn parse_count_window(s: &str, kind: &str) -> anyhow::Result<(u64, String)> {
     Ok((count, window_str.to_string()))
 }
 
-fn parse_rate_limit(s: &str, per_host: bool) -> anyhow::Result<RuleNode> {
+fn parse_rate_limit(
+    s: &str,
+    per_host: bool,
+    max_delay: Option<&str>,
+    unbounded_delay: bool,
+) -> anyhow::Result<RuleNode> {
     let (count, window) = parse_count_window(s, "rate limit")?;
     Ok(RuleNode::RateLimit(RateLimitConfig {
         count,
         window,
         burst: None,
         per_host,
+        max_delay: max_delay.map(str::to_string),
+        unbounded_delay,
     }))
 }
 
