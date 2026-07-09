@@ -279,11 +279,22 @@ pub struct HeaderMatch {
     pub value: String,
 }
 
-/// `log` (default) or `log bodies=#true`.
+/// `log` (default) or `log bodies=true`.
+///
+/// Sensitive header values are redacted by default. `log redact=false` logs
+/// every value verbatim; `log redact-headers="x-secret x-internal"` adds
+/// headers to redact; `log reveal-headers="authorization cookie"` un-redacts
+/// specific ones. Header lists are comma- or whitespace-separated.
 #[derive(Decode, Debug, Clone, Default)]
 pub struct LogConfig {
     #[knus(property)]
     pub bodies: Option<bool>,
+    #[knus(property)]
+    pub redact: Option<bool>,
+    #[knus(property)]
+    pub redact_headers: Option<String>,
+    #[knus(property)]
+    pub reveal_headers: Option<String>,
 }
 
 /// `latency "200ms"` or `latency "100ms..500ms"`.
@@ -1459,6 +1470,13 @@ fn emit_decl(builder: crate::ProxyBuilder, decl: Decl) -> anyhow::Result<crate::
     }
 }
 
+/// Split a comma- or whitespace-separated header list into individual names.
+fn parse_header_list(list: &str) -> impl Iterator<Item = &str> {
+    list.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 impl Rule for LogConfig {
     fn is_exclusive(&self) -> bool {
         true
@@ -1468,11 +1486,19 @@ impl Rule for LogConfig {
         builder: crate::ProxyBuilder,
         ctx: &EmitCtx<'_>,
     ) -> anyhow::Result<crate::ProxyBuilder> {
-        let logger = if let Some(true) = self.bodies {
-            TrafficLogger::new().log_bodies(true)
-        } else {
-            TrafficLogger::new()
-        };
+        let mut logger = TrafficLogger::new();
+        if let Some(true) = self.bodies {
+            logger = logger.log_bodies(true);
+        }
+        if let Some(false) = self.redact {
+            logger = logger.redact(false);
+        }
+        if let Some(list) = self.redact_headers.as_deref() {
+            logger = logger.redact_headers(parse_header_list(list));
+        }
+        if let Some(list) = self.reveal_headers.as_deref() {
+            logger = logger.reveal_headers(parse_header_list(list));
+        }
         Ok(apply_layer(builder, ctx.pred.clone(), logger))
     }
 }
@@ -2066,6 +2092,28 @@ mod tests {
         } else {
             panic!("expected Log");
         }
+    }
+
+    #[test]
+    fn parse_log_redaction_properties() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"log redact=false redact-headers="x-secret x-internal" reveal-headers="authorization""#,
+        )
+        .unwrap();
+        assert_eq!(cfg.body.len(), 1);
+        if let RuleNode::Log(ref l) = cfg.body[0] {
+            assert_eq!(l.redact, Some(false));
+            assert_eq!(l.redact_headers.as_deref(), Some("x-secret x-internal"));
+            assert_eq!(l.reveal_headers.as_deref(), Some("authorization"));
+        } else {
+            panic!("expected Log");
+        }
+    }
+
+    #[test]
+    fn parse_header_list_splits_on_commas_and_whitespace() {
+        let names: Vec<&str> = parse_header_list("authorization, cookie  x-api-key").collect();
+        assert_eq!(names, vec!["authorization", "cookie", "x-api-key"]);
     }
 
     #[test]

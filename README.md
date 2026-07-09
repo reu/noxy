@@ -270,6 +270,9 @@ Options:
       --tls-key <PATH>         TLS key for client-facing HTTPS (reverse proxy mode)
       --log                    Enable traffic logging
       --log-bodies             Log request/response bodies (implies --log)
+      --log-redact-headers <NAMES>  Additional header names to redact in logs (comma-separated)
+      --log-reveal-headers <NAMES>  Header names to reveal (un-redact) in logs (comma-separated)
+      --log-no-redact          Log all header values verbatim, including credentials
       --latency <LATENCY>      Add global latency (e.g., "200ms", "100ms..500ms")
       --bandwidth <BANDWIDTH>  Global bandwidth limit in bytes per second
       --rate-limit <RATE>              Global rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
@@ -662,7 +665,7 @@ Path globs use `*` (single segment), `**` (any depth), `?` (single char), `[a-z]
 
 | Node                         | Form                                                                    | Notes |
 |------------------------------|-------------------------------------------------------------------------|-------|
-| `log`                        | `log` or `log bodies=true`                                              | Traffic logger. |
+| `log`                        | `log`, `log bodies=true`, `log reveal-headers="authorization"`, `log redact=false` | Traffic logger. Sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `Api-Key`) are redacted by default. `redact-headers`/`reveal-headers` take comma- or whitespace-separated names; `redact=false` logs every value verbatim. |
 | `latency`                    | `latency "200ms"` or `latency "100ms..500ms"`                           | Fixed or random range. |
 | `bandwidth`                  | `bandwidth 10240`                                                       | Bytes/sec throughput limit. |
 | `fault`                      | `fault error-rate=0.5 abort-rate=0.02 error-status=503`                | Random faults. |
