@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -5,7 +6,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode};
 use http_body::Body as _;
 use http_body::Frame;
 use http_body_util::BodyExt;
@@ -16,6 +17,23 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BUDGET_WINDOW: Duration = Duration::from_secs(10);
 const DEFAULT_BUDGET_MIN_RETRIES: u32 = 30;
+
+/// Methods retried by default. These are idempotent per RFC 9110 §9.2.2, so
+/// re-sending them cannot cause additional side effects. Non-idempotent
+/// methods (notably `POST` and `PATCH`) are excluded, since a request whose
+/// write already reached upstream must not be silently replayed.
+fn default_retry_methods() -> HashSet<Method> {
+    [
+        Method::GET,
+        Method::HEAD,
+        Method::PUT,
+        Method::DELETE,
+        Method::OPTIONS,
+        Method::TRACE,
+    ]
+    .into_iter()
+    .collect()
+}
 
 struct BudgetState {
     ratio: f64,
@@ -127,6 +145,8 @@ pub struct Retry {
     budget_window: Duration,
     budget_min_retries: u32,
     budget_state: Option<Arc<Mutex<BudgetState>>>,
+    /// Methods eligible for retry. `None` means retry any method.
+    retry_methods: Option<Arc<HashSet<Method>>>,
 }
 
 impl Clone for Retry {
@@ -142,6 +162,7 @@ impl Clone for Retry {
             budget_window: self.budget_window,
             budget_min_retries: self.budget_min_retries,
             budget_state: self.budget_state.clone(),
+            retry_methods: self.retry_methods.clone(),
         }
     }
 }
@@ -163,6 +184,7 @@ impl Retry {
             budget_window: DEFAULT_BUDGET_WINDOW,
             budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
             budget_state: None,
+            retry_methods: Some(Arc::new(default_retry_methods())),
         }
     }
 
@@ -186,6 +208,7 @@ impl Retry {
             budget_window: DEFAULT_BUDGET_WINDOW,
             budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
             budget_state: None,
+            retry_methods: Some(Arc::new(default_retry_methods())),
         }
     }
 
@@ -215,6 +238,31 @@ impl Retry {
     /// retry decision), retries are skipped and the first response is returned.
     pub fn max_replay_body_bytes(mut self, bytes: usize) -> Self {
         self.max_replay_body_bytes = bytes;
+        self
+    }
+
+    /// Restrict retries to the given HTTP methods.
+    ///
+    /// By default only idempotent methods (`GET`, `HEAD`, `PUT`, `DELETE`,
+    /// `OPTIONS`, `TRACE`) are retried. Use this to set an explicit allowlist,
+    /// for example to also retry `POST` against an endpoint you know is safe to
+    /// replay (e.g. one guarded by an idempotency key).
+    pub fn retry_methods<I>(mut self, methods: I) -> Self
+    where
+        I: IntoIterator<Item = Method>,
+    {
+        self.retry_methods = Some(Arc::new(methods.into_iter().collect()));
+        self
+    }
+
+    /// Retry regardless of HTTP method, including non-idempotent ones such as
+    /// `POST` and `PATCH`.
+    ///
+    /// Only safe when upstream requests are idempotent or you otherwise handle
+    /// duplicate side effects; a retried write that already succeeded upstream
+    /// will be applied twice.
+    pub fn retry_all_methods(mut self) -> Self {
+        self.retry_methods = None;
         self
     }
 
@@ -371,6 +419,7 @@ impl Default for Retry {
             budget_window: DEFAULT_BUDGET_WINDOW,
             budget_min_retries: DEFAULT_BUDGET_MIN_RETRIES,
             budget_state: None,
+            retry_methods: Some(Arc::new(default_retry_methods())),
         }
     }
 }
@@ -388,6 +437,7 @@ impl tower::Layer<HttpService> for Retry {
             policy: self.policy.clone(),
             max_replay_body_bytes: self.max_replay_body_bytes,
             budget: self.budget_state.clone(),
+            retry_methods: self.retry_methods.clone(),
         }
     }
 }
@@ -401,6 +451,7 @@ pub struct RetryService {
     policy: Option<PolicyKind>,
     max_replay_body_bytes: usize,
     budget: Option<Arc<Mutex<BudgetState>>>,
+    retry_methods: Option<Arc<HashSet<Method>>>,
 }
 
 impl Service<Request<Body>> for RetryService {
@@ -421,6 +472,7 @@ impl Service<Request<Body>> for RetryService {
         let policy = self.policy.clone();
         let max_replay_body_bytes = self.max_replay_body_bytes;
         let budget = self.budget.clone();
+        let retry_methods = self.retry_methods.clone();
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -428,6 +480,16 @@ impl Service<Request<Body>> for RetryService {
             let uri = parts.uri;
             let version = parts.version;
             let headers = parts.headers;
+
+            // Only retry methods on the allowlist. When a request's method is
+            // not retryable (e.g. a non-idempotent POST), cap its effective
+            // retries to zero so it flows through untouched — this disables
+            // every retry branch below without special-casing each one.
+            let method_retryable = retry_methods
+                .as_ref()
+                .is_none_or(|allow| allow.contains(&method));
+            let max_retries = if method_retryable { max_retries } else { 0 };
+
             let capture = Arc::new(Mutex::new(ReplayCapture::new(max_replay_body_bytes)));
             let body_known_empty = body.size_hint().exact() == Some(0);
             let mut first_body = Some(body);
@@ -449,7 +511,7 @@ impl Service<Request<Body>> for RetryService {
                 *builder.headers_mut().unwrap() = headers.clone();
                 let req_body = if attempt == 0 {
                     let body = first_body.take().unwrap_or_else(crate::http::empty_body);
-                    if body_known_empty {
+                    if body_known_empty || !method_retryable {
                         body
                     } else {
                         RecordingBody::new(body, capture.clone()).boxed()
