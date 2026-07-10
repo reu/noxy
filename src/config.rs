@@ -35,6 +35,11 @@ pub struct ProxyConfig {
     #[knus(child, unwrap(argument))]
     pub idle_timeout: Option<String>,
 
+    /// Address for the health/readiness endpoint (e.g. "127.0.0.1:9090"). When
+    /// set, a small HTTP server serves `/healthz` and `/readyz`.
+    #[knus(child, unwrap(argument))]
+    pub health_addr: Option<String>,
+
     #[knus(child, unwrap(argument))]
     pub max_connections: Option<usize>,
 
@@ -2013,6 +2018,7 @@ mod tests {
             pool-max-idle-per-host 16
             pool-idle-timeout "120s"
             handshake-timeout "10s"
+            health-addr "127.0.0.1:9090"
             max-connections 1000
             "#,
         )
@@ -2022,6 +2028,7 @@ mod tests {
         assert_eq!(cfg.pool_max_idle_per_host, Some(16));
         assert_eq!(cfg.pool_idle_timeout.as_deref(), Some("120s"));
         assert_eq!(cfg.handshake_timeout.as_deref(), Some("10s"));
+        assert_eq!(cfg.health_addr.as_deref(), Some("127.0.0.1:9090"));
         assert_eq!(cfg.max_connections, Some(1000));
     }
 
