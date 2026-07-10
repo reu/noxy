@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
 use std::pin::Pin;
@@ -5,17 +6,46 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
-use http::{Request, Response};
+use http::{HeaderName, Request, Response};
 use http_body_util::BodyExt;
 use tower::Service;
 
 use crate::http::{Body, BoxError, HttpService, full_body};
+
+/// Header names whose values are redacted by default, so credentials and
+/// session material never land in logs. Matching is case-insensitive
+/// (`HeaderName` normalizes to lowercase).
+const DEFAULT_REDACTED_HEADERS: &[&str] = &[
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+];
+
+const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+fn default_redactions() -> HashSet<HeaderName> {
+    DEFAULT_REDACTED_HEADERS
+        .iter()
+        .filter_map(|h| HeaderName::from_bytes(h.as_bytes()).ok())
+        .collect()
+}
 
 /// Tower layer that logs HTTP request/response traffic.
 ///
 /// By default, logs request line, headers, response status, headers, elapsed
 /// time, and response size (from content-length). Enable `log_bodies(true)` to
 /// also buffer and print body content.
+///
+/// Sensitive header values (`Authorization`, `Proxy-Authorization`, `Cookie`,
+/// `Set-Cookie`, `X-Api-Key`, `Api-Key`) are redacted by default so
+/// credentials don't leak into logs. Use [`redact_headers`](Self::redact_headers)
+/// to redact more, [`reveal_headers`](Self::reveal_headers) to un-redact
+/// specific ones, or [`redact(false)`](Self::redact) to log every value
+/// verbatim. Redaction applies to headers only — enabling `log_bodies` prints
+/// body content as-is.
 ///
 /// # Examples
 ///
@@ -25,7 +55,12 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 /// # fn main() -> anyhow::Result<()> {
 /// let proxy = Proxy::builder()
 ///     .ca_pem_files("ca-cert.pem", "ca-key.pem")?
-///     .layer(TrafficLogger::new())
+///     // Redact an extra header, but do log the Authorization value.
+///     .layer(
+///         TrafficLogger::new()
+///             .redact_headers(["x-internal-token"])
+///             .reveal_headers(["authorization"]),
+///     )
 ///     .build()?;
 /// # Ok(())
 /// # }
@@ -33,6 +68,8 @@ use crate::http::{Body, BoxError, HttpService, full_body};
 #[derive(Clone)]
 pub struct TrafficLogger {
     log_bodies: bool,
+    redact: bool,
+    redactions: HashSet<HeaderName>,
     writer: Arc<Mutex<dyn Write + Send>>,
 }
 
@@ -40,6 +77,8 @@ impl TrafficLogger {
     pub fn new() -> Self {
         Self {
             log_bodies: false,
+            redact: true,
+            redactions: default_redactions(),
             writer: Arc::new(Mutex::new(std::io::stderr())),
         }
     }
@@ -51,10 +90,71 @@ impl TrafficLogger {
         self
     }
 
+    /// Enable or disable header-value redaction.
+    ///
+    /// Redaction is on by default. Passing `false` logs every header value
+    /// verbatim, including credentials — convenient for local debugging, but
+    /// not for shared or persisted logs.
+    pub fn redact(mut self, enable: bool) -> Self {
+        self.redact = enable;
+        self
+    }
+
+    /// Add header names whose values should be redacted, on top of the
+    /// defaults. Names are case-insensitive; invalid names are ignored.
+    pub fn redact_headers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in names {
+            if let Ok(name) = HeaderName::from_bytes(name.as_ref().as_bytes()) {
+                self.redactions.insert(name);
+            }
+        }
+        self
+    }
+
+    /// Remove header names from the redaction set so their values are logged
+    /// verbatim. Use this to reveal a default-redacted header (e.g.
+    /// `Authorization`) without disabling redaction entirely.
+    pub fn reveal_headers<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        for name in names {
+            if let Ok(name) = HeaderName::from_bytes(name.as_ref().as_bytes()) {
+                self.redactions.remove(&name);
+            }
+        }
+        self
+    }
+
     /// Use a custom writer instead of stderr.
     pub fn writer(mut self, writer: impl Write + Send + 'static) -> Self {
         self.writer = Arc::new(Mutex::new(writer));
         self
+    }
+
+    fn redactor(&self) -> Redactor {
+        Redactor {
+            enabled: self.redact,
+            headers: self.redactions.clone(),
+        }
+    }
+}
+
+/// Snapshot of the redaction policy handed to a service instance.
+#[derive(Clone)]
+struct Redactor {
+    enabled: bool,
+    headers: HashSet<HeaderName>,
+}
+
+impl Redactor {
+    fn is_redacted(&self, name: &HeaderName) -> bool {
+        self.enabled && self.headers.contains(name)
     }
 }
 
@@ -71,6 +171,7 @@ impl tower::Layer<HttpService> for TrafficLogger {
         TrafficLoggerService {
             inner,
             log_bodies: self.log_bodies,
+            redactor: self.redactor(),
             writer: self.writer.clone(),
         }
     }
@@ -79,6 +180,7 @@ impl tower::Layer<HttpService> for TrafficLogger {
 pub struct TrafficLoggerService {
     inner: HttpService,
     log_bodies: bool,
+    redactor: Redactor,
     writer: Arc<Mutex<dyn Write + Send>>,
 }
 
@@ -93,14 +195,14 @@ fn format_version(v: http::Version) -> &'static str {
     }
 }
 
-fn log_headers(w: &mut dyn Write, prefix: &str, headers: &http::HeaderMap) {
+fn log_headers(w: &mut dyn Write, prefix: &str, headers: &http::HeaderMap, redactor: &Redactor) {
     for (name, value) in headers {
-        writeln!(
-            w,
-            "{prefix} {name}: {}",
+        let rendered = if redactor.is_redacted(name) {
+            REDACTED_PLACEHOLDER
+        } else {
             value.to_str().unwrap_or("<binary>")
-        )
-        .ok();
+        };
+        writeln!(w, "{prefix} {name}: {rendered}").ok();
     }
 }
 
@@ -128,6 +230,7 @@ impl Service<Request<Body>> for TrafficLoggerService {
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let log_bodies = self.log_bodies;
+        let redactor = self.redactor.clone();
         let writer = self.writer.clone();
         let start = Instant::now();
 
@@ -142,7 +245,7 @@ impl Service<Request<Body>> for TrafficLoggerService {
                 format_version(req.version())
             )
             .ok();
-            log_headers(&mut *w, ">", req.headers());
+            log_headers(&mut *w, ">", req.headers(), &redactor);
             writeln!(w, ">").ok();
         }
 
@@ -166,7 +269,7 @@ impl Service<Request<Body>> for TrafficLoggerService {
                         parts.status.canonical_reason().unwrap_or("")
                     )
                     .ok();
-                    log_headers(&mut *w, "<", &parts.headers);
+                    log_headers(&mut *w, "<", &parts.headers, &redactor);
                     writeln!(w, "<").ok();
                     log_body_content(&mut *w, "<", &resp_bytes);
                     writeln!(w, "<").ok();
@@ -192,7 +295,7 @@ impl Service<Request<Body>> for TrafficLoggerService {
                         resp.status().canonical_reason().unwrap_or("")
                     )
                     .ok();
-                    log_headers(&mut *w, "<", resp.headers());
+                    log_headers(&mut *w, "<", resp.headers(), &redactor);
                     writeln!(w, "<").ok();
                     match content_length {
                         Some(len) => writeln!(w, "* Completed in {elapsed:?}, {len} bytes").ok(),

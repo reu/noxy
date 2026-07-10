@@ -2,6 +2,7 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Request, Response, StatusCode, Uri, header};
@@ -167,6 +168,10 @@ impl AsyncWrite for UpstreamIo {
 #[derive(Clone)]
 pub(crate) struct UpstreamConnector {
     pub tls: TlsConnector,
+    /// Bounds establishing a new upstream connection (TCP connect + TLS
+    /// handshake) so a black-holed host can't tie up the request until the OS
+    /// TCP timeout (~2 min). `None` disables the bound.
+    pub connect_timeout: Option<Duration>,
 }
 
 impl Service<Uri> for UpstreamConnector {
@@ -180,18 +185,28 @@ impl Service<Uri> for UpstreamConnector {
 
     fn call(&mut self, uri: Uri) -> Self::Future {
         let tls = self.tls.clone();
+        let connect_timeout = self.connect_timeout;
         let is_plain = uri.scheme_str() == Some("http");
         Box::pin(async move {
-            let host = uri.host().ok_or("missing host in URI")?;
-            let default_port = if is_plain { 80 } else { 443 };
-            let port = uri.port_u16().unwrap_or(default_port);
-            let tcp = TcpStream::connect((host, port)).await?;
-            if is_plain {
-                Ok(TokioIo::new(UpstreamIo::Plain(tcp)))
-            } else {
-                let server_name: ServerName<'static> = host.to_string().try_into()?;
-                let tls_stream = tls.connect(server_name, tcp).await?;
-                Ok(TokioIo::new(UpstreamIo::Tls(Box::new(tls_stream))))
+            let connect = async move {
+                let host = uri.host().ok_or("missing host in URI")?;
+                let default_port = if is_plain { 80 } else { 443 };
+                let port = uri.port_u16().unwrap_or(default_port);
+                let tcp = TcpStream::connect((host, port)).await?;
+                if is_plain {
+                    Ok::<_, BoxError>(TokioIo::new(UpstreamIo::Plain(tcp)))
+                } else {
+                    let server_name: ServerName<'static> = host.to_string().try_into()?;
+                    let tls_stream = tls.connect(server_name, tcp).await?;
+                    Ok(TokioIo::new(UpstreamIo::Tls(Box::new(tls_stream))))
+                }
+            };
+
+            match connect_timeout {
+                Some(timeout) => tokio::time::timeout(timeout, connect)
+                    .await
+                    .map_err(|_| -> BoxError { "upstream connect timed out".into() })?,
+                None => connect.await,
             }
         })
     }
@@ -202,6 +217,7 @@ pub(crate) struct ForwardService {
     client: UpstreamClient,
     authority: ::http::uri::Authority,
     scheme: UpstreamScheme,
+    request_timeout: Option<Duration>,
 }
 
 impl ForwardService {
@@ -209,13 +225,24 @@ impl ForwardService {
         client: UpstreamClient,
         authority: ::http::uri::Authority,
         scheme: UpstreamScheme,
+        request_timeout: Option<Duration>,
     ) -> Self {
         Self {
             client,
             authority,
             scheme,
+            request_timeout,
         }
     }
+}
+
+/// A `504 Gateway Timeout` response, returned when the upstream does not send
+/// response headers within the configured request timeout.
+fn gateway_timeout() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::GATEWAY_TIMEOUT)
+        .body(empty_body())
+        .expect("static 504 response is always valid")
 }
 
 impl Service<Request<Body>> for ForwardService {
@@ -248,8 +275,18 @@ impl Service<Request<Body>> for ForwardService {
         }
 
         let fut = self.client.request(req);
+        let request_timeout = self.request_timeout;
         Box::pin(async move {
-            let resp = fut.await?;
+            // The request future resolves once the upstream response *headers*
+            // arrive, so this bounds time-to-first-response without cutting off
+            // streaming/SSE bodies.
+            let resp = match request_timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+                    Ok(result) => result?,
+                    Err(_) => return Ok(gateway_timeout()),
+                },
+                None => fut.await?,
+            };
             let switching_protocols = resp.status() == StatusCode::SWITCHING_PROTOCOLS;
             let mut resp = resp.map(incoming_to_body);
             // Likewise strip hop-by-hop headers from the response, except on a

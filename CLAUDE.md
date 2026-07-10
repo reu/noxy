@@ -92,8 +92,6 @@ trait Rule {
 - Add CI guardrails for meaningful regressions (avoid failing on small noise)
 
 ### Security
-- Redact sensitive headers by default in traffic logs (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, etc.)
-- Use constant-time credential comparison for proxy auth checks
 - Harden CONNECT authority parsing (avoid naive string split on `:`; use authority-aware parsing including IPv6)
 
 ### Scripting

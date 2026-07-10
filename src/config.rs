@@ -35,6 +35,17 @@ pub struct ProxyConfig {
     #[knus(child, unwrap(argument))]
     pub idle_timeout: Option<String>,
 
+    /// Address for the health/readiness endpoint (e.g. "127.0.0.1:9090"). When
+    /// set, a small HTTP server serves `/healthz` and `/readyz`.
+    #[knus(child, unwrap(argument))]
+    pub health_addr: Option<String>,
+
+    #[knus(child, unwrap(argument))]
+    pub connect_timeout: Option<String>,
+
+    #[knus(child, unwrap(argument))]
+    pub request_timeout: Option<String>,
+
     #[knus(child, unwrap(argument))]
     pub max_connections: Option<usize>,
 
@@ -279,11 +290,22 @@ pub struct HeaderMatch {
     pub value: String,
 }
 
-/// `log` (default) or `log bodies=#true`.
+/// `log` (default) or `log bodies=true`.
+///
+/// Sensitive header values are redacted by default. `log redact=false` logs
+/// every value verbatim; `log redact-headers="x-secret x-internal"` adds
+/// headers to redact; `log reveal-headers="authorization cookie"` un-redacts
+/// specific ones. Header lists are comma- or whitespace-separated.
 #[derive(Decode, Debug, Clone, Default)]
 pub struct LogConfig {
     #[knus(property)]
     pub bodies: Option<bool>,
+    #[knus(property)]
+    pub redact: Option<bool>,
+    #[knus(property)]
+    pub redact_headers: Option<String>,
+    #[knus(property)]
+    pub reveal_headers: Option<String>,
 }
 
 /// `latency "200ms"` or `latency "100ms..500ms"`.
@@ -336,6 +358,11 @@ pub struct SlidingWindowConfig {
 }
 
 /// `retry max-retries=3 backoff="500ms" { statuses 503 429 }`.
+///
+/// Only idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) are
+/// retried by default. `methods="get post"` sets an explicit allowlist;
+/// `all-methods=true` retries every method (including POST/PATCH). Method
+/// lists are comma- or whitespace-separated and case-insensitive.
 #[derive(Decode, Debug, Clone)]
 pub struct RetryConfig {
     #[knus(property)]
@@ -346,6 +373,10 @@ pub struct RetryConfig {
     pub max_backoff: Option<String>,
     #[knus(property)]
     pub max_replay_body_bytes: Option<usize>,
+    #[knus(property)]
+    pub methods: Option<String>,
+    #[knus(property)]
+    pub all_methods: Option<bool>,
     #[knus(child, unwrap(arguments))]
     pub statuses: Option<Vec<u16>>,
     #[knus(child)]
@@ -727,6 +758,8 @@ impl ProxyConfig {
             accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
             handshake_timeout: self.handshake_timeout.clone(),
             idle_timeout: self.idle_timeout.clone(),
+            connect_timeout: self.connect_timeout.clone(),
+            request_timeout: self.request_timeout.clone(),
             max_connections: self.max_connections,
             drain_timeout: self.drain_timeout.clone(),
             pool_max_idle_per_host: self.pool_max_idle_per_host,
@@ -809,6 +842,8 @@ struct ProcessSettings {
     accept_invalid_upstream_certs: bool,
     handshake_timeout: Option<String>,
     idle_timeout: Option<String>,
+    connect_timeout: Option<String>,
+    request_timeout: Option<String>,
     max_connections: Option<usize>,
     drain_timeout: Option<String>,
     pool_max_idle_per_host: Option<usize>,
@@ -827,6 +862,12 @@ fn apply_process_settings(
     }
     if let Some(ref t) = s.idle_timeout {
         builder = builder.idle_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(ref t) = s.connect_timeout {
+        builder = builder.connect_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(ref t) = s.request_timeout {
+        builder = builder.request_timeout(parse_duration(t).map_err(anyhow_str)?);
     }
     if let Some(max) = s.max_connections {
         builder = builder.max_connections(max);
@@ -1459,6 +1500,13 @@ fn emit_decl(builder: crate::ProxyBuilder, decl: Decl) -> anyhow::Result<crate::
     }
 }
 
+/// Split a comma- or whitespace-separated header list into individual names.
+fn parse_header_list(list: &str) -> impl Iterator<Item = &str> {
+    list.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 impl Rule for LogConfig {
     fn is_exclusive(&self) -> bool {
         true
@@ -1468,11 +1516,19 @@ impl Rule for LogConfig {
         builder: crate::ProxyBuilder,
         ctx: &EmitCtx<'_>,
     ) -> anyhow::Result<crate::ProxyBuilder> {
-        let logger = if let Some(true) = self.bodies {
-            TrafficLogger::new().log_bodies(true)
-        } else {
-            TrafficLogger::new()
-        };
+        let mut logger = TrafficLogger::new();
+        if let Some(true) = self.bodies {
+            logger = logger.log_bodies(true);
+        }
+        if let Some(false) = self.redact {
+            logger = logger.redact(false);
+        }
+        if let Some(list) = self.redact_headers.as_deref() {
+            logger = logger.redact_headers(parse_header_list(list));
+        }
+        if let Some(list) = self.reveal_headers.as_deref() {
+            logger = logger.reveal_headers(parse_header_list(list));
+        }
         Ok(apply_layer(builder, ctx.pred.clone(), logger))
     }
 }
@@ -1902,6 +1958,19 @@ fn build_circuit_breaker(c: &CircuitBreakerConfig, recovery: Duration) -> Circui
     }
 }
 
+/// Parse a comma- or whitespace-separated list of HTTP method names.
+/// Names are case-insensitive; an unrecognized name is an error.
+fn parse_method_list(list: &str) -> anyhow::Result<Vec<http::Method>> {
+    list.split([',', ' ', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|name| {
+            http::Method::from_bytes(name.to_ascii_uppercase().as_bytes())
+                .map_err(|_| anyhow::anyhow!("invalid HTTP method '{name}' in retry methods"))
+        })
+        .collect()
+}
+
 fn build_retry(c: RetryConfig) -> anyhow::Result<Retry> {
     let mut retry = if let Some(statuses) = c.statuses {
         Retry::on_statuses(statuses)
@@ -1919,6 +1988,11 @@ fn build_retry(c: RetryConfig) -> anyhow::Result<Retry> {
     }
     if let Some(max_bytes) = c.max_replay_body_bytes {
         retry = retry.max_replay_body_bytes(max_bytes);
+    }
+    if let Some(true) = c.all_methods {
+        retry = retry.retry_all_methods();
+    } else if let Some(ref list) = c.methods {
+        retry = retry.retry_methods(parse_method_list(list)?);
     }
     if let Some(b) = c.budget {
         retry = retry.budget(b.ratio);
@@ -1960,7 +2034,10 @@ mod tests {
             pool-max-idle-per-host 16
             pool-idle-timeout "120s"
             handshake-timeout "10s"
+            connect-timeout "5s"
+            request-timeout "30s"
             max-connections 1000
+            health-addr "127.0.0.1:9090"
             "#,
         )
         .unwrap();
@@ -1969,7 +2046,10 @@ mod tests {
         assert_eq!(cfg.pool_max_idle_per_host, Some(16));
         assert_eq!(cfg.pool_idle_timeout.as_deref(), Some("120s"));
         assert_eq!(cfg.handshake_timeout.as_deref(), Some("10s"));
+        assert_eq!(cfg.connect_timeout.as_deref(), Some("5s"));
+        assert_eq!(cfg.request_timeout.as_deref(), Some("30s"));
         assert_eq!(cfg.max_connections, Some(1000));
+        assert_eq!(cfg.health_addr.as_deref(), Some("127.0.0.1:9090"));
     }
 
     #[test]
@@ -2058,6 +2138,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_methods_properties() {
+        let cfg =
+            ProxyConfig::from_kdl(r#"retry max-retries=3 methods="get post" all-methods=false"#)
+                .unwrap();
+        assert_eq!(cfg.body.len(), 1);
+        if let RuleNode::Retry(ref r) = cfg.body[0] {
+            assert_eq!(r.methods.as_deref(), Some("get post"));
+            assert_eq!(r.all_methods, Some(false));
+        } else {
+            panic!("expected Retry");
+        }
+    }
+
+    #[test]
+    fn parse_method_list_is_case_insensitive() {
+        let methods = parse_method_list("get, POST  put").unwrap();
+        assert_eq!(
+            methods,
+            vec![http::Method::GET, http::Method::POST, http::Method::PUT]
+        );
+    }
+
+    #[test]
+    fn parse_method_list_rejects_invalid() {
+        // '@' is not a valid HTTP method token character.
+        assert!(parse_method_list("get in@valid").is_err());
+    }
+
+    #[test]
     fn parse_log_with_bodies() {
         let cfg = ProxyConfig::from_kdl("log bodies=true").unwrap();
         assert_eq!(cfg.body.len(), 1);
@@ -2066,6 +2175,28 @@ mod tests {
         } else {
             panic!("expected Log");
         }
+    }
+
+    #[test]
+    fn parse_log_redaction_properties() {
+        let cfg = ProxyConfig::from_kdl(
+            r#"log redact=false redact-headers="x-secret x-internal" reveal-headers="authorization""#,
+        )
+        .unwrap();
+        assert_eq!(cfg.body.len(), 1);
+        if let RuleNode::Log(ref l) = cfg.body[0] {
+            assert_eq!(l.redact, Some(false));
+            assert_eq!(l.redact_headers.as_deref(), Some("x-secret x-internal"));
+            assert_eq!(l.reveal_headers.as_deref(), Some("authorization"));
+        } else {
+            panic!("expected Log");
+        }
+    }
+
+    #[test]
+    fn parse_header_list_splits_on_commas_and_whitespace() {
+        let names: Vec<&str> = parse_header_list("authorization, cookie  x-api-key").collect();
+        assert_eq!(names, vec!["authorization", "cookie", "x-api-key"]);
     }
 
     #[test]
