@@ -2579,6 +2579,7 @@ dependencies = [
  "rustls-mitm",
  "rustls-pemfile",
  "serde",
+ "subtle",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

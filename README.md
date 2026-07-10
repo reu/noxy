@@ -43,6 +43,7 @@ let proxy = Proxy::builder()
     // Per-host sliding window: 10 req/s per hostname
     .layer(SlidingWindow::per_host(10, Duration::from_secs(1)))
     // Retry 429/5xx responses up to 3 times with exponential backoff
+    // (idempotent methods only by default; add .retry_all_methods() to include POST)
     .layer(Retry::default().max_retries(3))
     // Trip circuit after 5 consecutive failures, recover in 30s
     .layer(CircuitBreaker::global(5, Duration::from_secs(30)))
@@ -270,6 +271,9 @@ Options:
       --tls-key <PATH>         TLS key for client-facing HTTPS (reverse proxy mode)
       --log                    Enable traffic logging
       --log-bodies             Log request/response bodies (implies --log)
+      --log-redact-headers <NAMES>  Additional header names to redact in logs (comma-separated)
+      --log-reveal-headers <NAMES>  Header names to reveal (un-redact) in logs (comma-separated)
+      --log-no-redact          Log all header values verbatim, including credentials
       --latency <LATENCY>      Add global latency (e.g., "200ms", "100ms..500ms")
       --bandwidth <BANDWIDTH>  Global bandwidth limit in bytes per second
       --rate-limit <RATE>              Global rate limit (e.g., "30/1s", "1500/60s"). Repeatable.
@@ -279,6 +283,8 @@ Options:
       --retry <N>                      Retry failed requests (429, 502, 503, 504) up to N times
       --retry-max-body <BYTES>         Max request body bytes captured for retry replay (default: 1048576)
       --retry-max-backoff <DURATION>   Max backoff delay for retry exponential backoff (default: 30s)
+      --retry-methods <METHODS>        Methods eligible for retry (comma-separated; default: idempotent only)
+      --retry-all-methods              Retry all methods, including non-idempotent ones (POST, PATCH)
       --retry-budget <RATIO>           Max fraction of requests that can be retries (e.g., 0.2)
       --circuit-breaker <SPEC>         Circuit breaker (e.g., "5/30s" = trip after 5 failures, recover in 30s)
       --rewrite-path <SPEC>                Rewrite request path (e.g., "/old/{*rest}=/new/{rest}"). Repeatable.
@@ -295,6 +301,7 @@ Options:
       --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
       --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
+      --health-addr <ADDR>             Serve /healthz and /readyz on this address (e.g. "127.0.0.1:9090")
   -h, --help                   Print help
 
 # Log all traffic
@@ -467,6 +474,7 @@ reverse port=8080 {
 // accept-invalid-upstream-certs true
 // pool-max-idle-per-host 8
 // pool-idle-timeout "90s"
+// health-addr "127.0.0.1:9090"
 
 // Global rules — apply to every listener below
 log
@@ -662,13 +670,13 @@ Path globs use `*` (single segment), `**` (any depth), `?` (single char), `[a-z]
 
 | Node                         | Form                                                                    | Notes |
 |------------------------------|-------------------------------------------------------------------------|-------|
-| `log`                        | `log` or `log bodies=true`                                              | Traffic logger. |
+| `log`                        | `log`, `log bodies=true`, `log reveal-headers="authorization"`, `log redact=false` | Traffic logger. Sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, `Api-Key`) are redacted by default. `redact-headers`/`reveal-headers` take comma- or whitespace-separated names; `redact=false` logs every value verbatim. |
 | `latency`                    | `latency "200ms"` or `latency "100ms..500ms"`                           | Fixed or random range. |
 | `bandwidth`                  | `bandwidth 10240`                                                       | Bytes/sec throughput limit. |
 | `fault`                      | `fault error-rate=0.5 abort-rate=0.02 error-status=503`                | Random faults. |
 | `rate-limit`                 | `rate-limit count=30 window="1s" burst=100 per-host=true`              | Token bucket. |
 | `sliding-window`             | `sliding-window count=10 window="1s" per-host=true`                    | Hard-cap, no burst. |
-| `retry`                      | `retry max-retries=3 backoff="1s" max-backoff="30s" max-replay-body-bytes=1048576 { statuses 503 429; budget ratio=0.2 window="10s" min-retries=30 }` | Retry on 429/5xx by default. `statuses` and `budget` are child nodes. |
+| `retry`                      | `retry max-retries=3 backoff="1s" max-backoff="30s" max-replay-body-bytes=1048576 methods="get post" all-methods=false { statuses 503 429; budget ratio=0.2 window="10s" min-retries=30 }` | Retry on 429/5xx by default. Only idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) are retried unless `methods=` sets an allowlist or `all-methods=true`. `statuses` and `budget` are child nodes. |
 | `circuit-breaker`            | `circuit-breaker threshold=5 recovery="30s" half-open-probes=2 per-host=true cache-ttl="100ms"` | `cache-ttl` is Redis-only. |
 | `respond`                    | `respond body="ok" status=200`                                          | Short-circuits without forwarding upstream. |
 | `upstream`                   | `upstream "http://a:80" "http://b:80" balance="round-robin"`           | Variadic URLs; `balance="round-robin"` (default) or `"random"`. Routes matched requests to the given backend(s). |
