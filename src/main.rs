@@ -159,6 +159,10 @@ struct Cli {
     /// Output logs as JSON
     #[arg(long)]
     log_json: bool,
+
+    /// Serve health/readiness endpoints (/healthz, /readyz) on this address
+    #[arg(long = "health-addr", value_name = "ADDR")]
+    health_addr: Option<String>,
 }
 
 #[tokio::main]
@@ -206,6 +210,50 @@ async fn main() -> miette::Result<()> {
     apply_cli_and_run(cli, config)
         .await
         .map_err(|e| miette::miette!("{e:#}"))
+}
+
+/// Accept loop for the health/readiness HTTP server. Stops when the shutdown
+/// signal fires.
+async fn serve_health(
+    listener: tokio::net::TcpListener,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    tokio::spawn(async move {
+                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(io, hyper::service::service_fn(health_response))
+                            .await;
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e, "health endpoint accept failed"),
+            },
+            _ = shutdown_rx.recv() => break,
+        }
+    }
+}
+
+/// Route health/readiness probes. `/healthz` is liveness, `/readyz` is
+/// readiness; everything else is 404.
+async fn health_response(
+    req: hyper::Request<hyper::body::Incoming>,
+) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
+    use ::http::{Method, StatusCode, header};
+
+    let (status, body) = match (req.method(), req.uri().path()) {
+        (&Method::GET, "/healthz" | "/health") => (StatusCode::OK, "ok\n"),
+        (&Method::GET, "/readyz" | "/ready") => (StatusCode::OK, "ready\n"),
+        _ => (StatusCode::NOT_FOUND, "not found\n"),
+    };
+
+    Ok(hyper::Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "text/plain")
+        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+        .expect("static health response is always valid"))
 }
 
 async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<()> {
@@ -409,6 +457,11 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
         }
     }
 
+    if let Some(ref addr) = cli.health_addr {
+        config.health_addr = Some(addr.clone());
+    }
+    let health_addr = config.health_addr.clone();
+
     let listeners = config.into_listeners()?;
 
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -419,6 +472,18 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
             let _ = tx.send(());
         }
     };
+
+    if let Some(addr) = health_addr {
+        let addr: std::net::SocketAddr = addr
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid health-addr '{addr}': {e}"))?;
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to bind health-addr {addr}: {e}"))?;
+        tracing::info!(%addr, "health endpoint listening");
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(serve_health(listener, shutdown_rx));
+    }
 
     let mut tasks = tokio::task::JoinSet::new();
     for listener in listeners {
@@ -517,4 +582,71 @@ fn parse_circuit_breaker(s: &str) -> anyhow::Result<RuleNode> {
         per_host: false,
         cache_ttl: None,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal HTTP/1.1 request over a raw socket (no TLS), returning the
+    /// status code and full raw response.
+    async fn request(addr: std::net::SocketAddr, method: &str, path: &str) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req =
+            format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).await.unwrap();
+        let status = raw
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0);
+        (status, raw)
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_respond() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        tokio::spawn(serve_health(listener, rx));
+
+        let (status, body) = request(addr, "GET", "/healthz").await;
+        assert_eq!(status, 200, "GET /healthz");
+        assert!(body.contains("ok"), "healthz body: {body}");
+
+        let (status, _) = request(addr, "GET", "/readyz").await;
+        assert_eq!(status, 200, "GET /readyz");
+
+        let (status, _) = request(addr, "GET", "/nope").await;
+        assert_eq!(status, 404, "unknown path should 404");
+
+        // Only GET is a probe; other methods 404.
+        let (status, _) = request(addr, "POST", "/healthz").await;
+        assert_eq!(status, 404, "POST /healthz should 404");
+
+        let _ = tx.send(());
+    }
+
+    #[tokio::test]
+    async fn health_server_stops_on_shutdown() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel::<()>(1);
+        let handle = tokio::spawn(serve_health(listener, rx));
+
+        // Works before shutdown.
+        let (status, _) = request(addr, "GET", "/healthz").await;
+        assert_eq!(status, 200);
+
+        // After shutdown the accept loop exits.
+        let _ = tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("health server should stop on shutdown")
+            .unwrap();
+    }
 }
