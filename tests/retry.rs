@@ -397,7 +397,8 @@ async fn retry_skips_when_body_exceeds_replay_limit() {
         let layer = Retry::on_statuses([503])
             .max_retries(3)
             .max_replay_body_bytes(4)
-            .backoff(Duration::from_millis(10));
+            .backoff(Duration::from_millis(10))
+            .retry_all_methods();
         tower::util::BoxService::new(layer.layer(inner))
     })])
     .await;
@@ -463,7 +464,8 @@ async fn retry_retries_when_body_within_replay_limit() {
         let layer = Retry::on_statuses([503])
             .max_retries(3)
             .max_replay_body_bytes(5)
-            .backoff(Duration::from_millis(10));
+            .backoff(Duration::from_millis(10))
+            .retry_all_methods();
         tower::util::BoxService::new(layer.layer(inner))
     })])
     .await;
@@ -530,7 +532,8 @@ async fn retry_retries_when_body_equals_replay_limit() {
         let layer = Retry::on_statuses([503])
             .max_retries(2)
             .max_replay_body_bytes(4)
-            .backoff(Duration::from_millis(10));
+            .backoff(Duration::from_millis(10))
+            .retry_all_methods();
         tower::util::BoxService::new(layer.layer(inner))
     })])
     .await;
@@ -743,4 +746,142 @@ async fn retry_budget_min_retries_floor() {
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().await.unwrap(), "hello");
     assert_eq!(counter.load(Ordering::SeqCst), 3);
+}
+
+/// Start an HTTPS upstream that always returns 503 on GET and POST, counting
+/// every request it receives.
+async fn start_counting_503_upstream(counter: Arc<AtomicUsize>) -> std::net::SocketAddr {
+    install_crypto_provider();
+    let key_pair = KeyPair::generate().unwrap();
+    let params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    let cert = params.self_signed(&key_pair).unwrap();
+    let cert_der = cert.der().to_vec();
+    let key_der = key_pair.serialized_der().to_vec();
+    let config = RustlsConfig::from_der(vec![cert_der], key_der)
+        .await
+        .unwrap();
+
+    let handler = move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            (http::StatusCode::SERVICE_UNAVAILABLE, "unavailable").into_response()
+        }
+    };
+    let app = Router::new().route("/", get(handler.clone()).post(handler));
+
+    let handle = axum_server::Handle::new();
+    let listener_handle = handle.clone();
+    tokio::spawn(async move {
+        axum_server::bind_rustls("127.0.0.1:0".parse().unwrap(), config)
+            .handle(handle)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    });
+    listener_handle.listening().await.unwrap()
+}
+
+/// POST is non-idempotent, so it must not be retried by default even when the
+/// status is retryable. The upstream should see exactly one request.
+#[tokio::test]
+async fn retry_skips_post_by_default() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let upstream_addr = start_counting_503_upstream(counter.clone()).await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Retry::on_statuses([503])
+            .max_retries(3)
+            .backoff(Duration::from_millis(10));
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .post(format!("https://localhost:{}/", upstream_addr.port()))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "POST must not be retried by default"
+    );
+}
+
+/// With `retry_all_methods`, POST is retried like any other method.
+#[tokio::test]
+async fn retry_retries_post_with_all_methods() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let upstream_addr = start_counting_503_upstream(counter.clone()).await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Retry::on_statuses([503])
+            .max_retries(3)
+            .backoff(Duration::from_millis(10))
+            .retry_all_methods();
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    let resp = client
+        .post(format!("https://localhost:{}/", upstream_addr.port()))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 503);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        4,
+        "POST should be retried 3 times (1 + 3) when all methods are allowed"
+    );
+}
+
+/// An explicit allowlist including POST retries it; a GET stays retryable only
+/// if it is on the list.
+#[tokio::test]
+async fn retry_methods_allowlist_controls_retries() {
+    let counter = Arc::new(AtomicUsize::new(0));
+    let upstream_addr = start_counting_503_upstream(counter.clone()).await;
+
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = Retry::on_statuses([503])
+            .max_retries(2)
+            .backoff(Duration::from_millis(10))
+            .retry_methods([http::Method::POST]);
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+
+    // POST is on the allowlist → retried.
+    let resp = client
+        .post(format!("https://localhost:{}/", upstream_addr.port()))
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(counter.load(Ordering::SeqCst), 3, "POST should be retried");
+
+    // GET is not on the allowlist → not retried.
+    counter.store(0, Ordering::SeqCst);
+    let resp = client
+        .get(format!("https://localhost:{}/", upstream_addr.port()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "GET should not be retried when only POST is allowlisted"
+    );
 }

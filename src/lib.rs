@@ -40,6 +40,27 @@ type RoutePredicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
 type BufferedHttpService =
     tower::buffer::Buffer<Request<Body>, <HttpService as Service<Request<Body>>>::Future>;
 
+/// Check supplied proxy credentials against the configured set in constant time.
+///
+/// Every configured credential is compared regardless of earlier matches, and
+/// username/password bytes are compared with a constant-time primitive, so the
+/// running time does not reveal which (if any) credential matched nor how many
+/// leading bytes are correct — closing the timing oracle that a naive `==`
+/// comparison opens for byte-by-byte brute forcing. (The lengths of the
+/// credentials are not hidden, matching the behavior of standard constant-time
+/// comparison routines.)
+fn credentials_match(credentials: &[(String, String)], user: &str, pass: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let mut matched = subtle::Choice::from(0u8);
+    for (expected_user, expected_pass) in credentials {
+        let user_ok = expected_user.as_bytes().ct_eq(user.as_bytes());
+        let pass_ok = expected_pass.as_bytes().ct_eq(pass.as_bytes());
+        matched |= user_ok & pass_ok;
+    }
+    matched.into()
+}
+
 /// A `ServerCertVerifier` that accepts any certificate. Used when
 /// `danger_accept_invalid_upstream_certs` is enabled on the builder.
 #[derive(Debug)]
@@ -997,7 +1018,7 @@ impl Proxy {
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .and_then(|decoded| {
                             let (u, p) = decoded.split_once(':')?;
-                            Some(creds.iter().any(|(eu, ep)| eu == u && ep == p))
+                            Some(credentials_match(creds, u, p))
                         })
                         .unwrap_or(false);
 
@@ -1057,5 +1078,62 @@ impl Proxy {
         };
 
         Ok((hyper_service, client_tls))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credentials_match;
+
+    fn creds(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn matches_exact_credential() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(credentials_match(&c, "admin", "s3cret"));
+    }
+
+    #[test]
+    fn rejects_wrong_password() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", "wrong"));
+    }
+
+    #[test]
+    fn rejects_wrong_username() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "root", "s3cret"));
+    }
+
+    #[test]
+    fn rejects_password_prefix() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", "s3c"));
+        assert!(!credentials_match(&c, "admin", "s3cretary"));
+    }
+
+    #[test]
+    fn rejects_when_no_credentials_configured() {
+        assert!(!credentials_match(&[], "admin", "s3cret"));
+    }
+
+    #[test]
+    fn matches_any_configured_credential() {
+        let c = creds(&[("alice", "pw1"), ("bob", "pw2")]);
+        assert!(credentials_match(&c, "bob", "pw2"));
+        assert!(credentials_match(&c, "alice", "pw1"));
+        // Cross pairing must not authenticate.
+        assert!(!credentials_match(&c, "alice", "pw2"));
+    }
+
+    #[test]
+    fn rejects_empty_password_mismatch() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", ""));
     }
 }
