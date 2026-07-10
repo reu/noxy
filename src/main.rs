@@ -210,6 +210,40 @@ async fn main() -> miette::Result<()> {
         .map_err(|e| miette::miette!("{e:#}"))
 }
 
+/// Resolve on the first OS shutdown signal. `Ctrl-C` (SIGINT) is handled on
+/// every platform; on Unix, SIGTERM is also handled — that's the signal
+/// Kubernetes, systemd, and `docker stop` send, so without it graceful
+/// shutdown would never run in the most common deployments.
+async fn os_shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = ctrl_c => tracing::info!("received SIGINT"),
+                    _ = term.recv() => tracing::info!("received SIGTERM"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install SIGTERM handler; Ctrl-C only");
+                ctrl_c.await;
+                tracing::info!("received SIGINT");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        ctrl_c.await;
+        tracing::info!("received Ctrl-C");
+    }
+}
+
 async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<()> {
     if cli.accept_invalid_certs {
         config.accept_invalid_upstream_certs = true;
@@ -417,7 +451,7 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
     let shutdown_signal = {
         let tx = shutdown_tx.clone();
         async move {
-            let _ = tokio::signal::ctrl_c().await;
+            os_shutdown_signal().await;
             let _ = tx.send(());
         }
     };
