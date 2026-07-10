@@ -165,6 +165,12 @@ struct Cli {
 async fn main() -> miette::Result<()> {
     use miette::IntoDiagnostic;
 
+    // Install the process-wide rustls crypto provider before any TLS config is
+    // built. Without this the CLI panics on startup ("Could not automatically
+    // determine the process-level CryptoProvider") as soon as it constructs an
+    // upstream or MITM TLS config.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
