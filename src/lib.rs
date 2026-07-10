@@ -14,6 +14,7 @@ pub use rustls_mitm::CertificateAuthority;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +40,27 @@ type LayerFn = Box<dyn Fn(HttpService) -> HttpService + Send + Sync>;
 type RoutePredicate = Arc<dyn Fn(&Request<Body>) -> bool + Send + Sync>;
 type BufferedHttpService =
     tower::buffer::Buffer<Request<Body>, <HttpService as Service<Request<Body>>>::Future>;
+
+/// Check supplied proxy credentials against the configured set in constant time.
+///
+/// Every configured credential is compared regardless of earlier matches, and
+/// username/password bytes are compared with a constant-time primitive, so the
+/// running time does not reveal which (if any) credential matched nor how many
+/// leading bytes are correct — closing the timing oracle that a naive `==`
+/// comparison opens for byte-by-byte brute forcing. (The lengths of the
+/// credentials are not hidden, matching the behavior of standard constant-time
+/// comparison routines.)
+fn credentials_match(credentials: &[(String, String)], user: &str, pass: &str) -> bool {
+    use subtle::ConstantTimeEq;
+
+    let mut matched = subtle::Choice::from(0u8);
+    for (expected_user, expected_pass) in credentials {
+        let user_ok = expected_user.as_bytes().ct_eq(user.as_bytes());
+        let pass_ok = expected_pass.as_bytes().ct_eq(pass.as_bytes());
+        matched |= user_ok & pass_ok;
+    }
+    matched.into()
+}
 
 /// A `ServerCertVerifier` that accepts any certificate. Used when
 /// `danger_accept_invalid_upstream_certs` is enabled on the builder.
@@ -329,7 +351,9 @@ impl ProxyBuilder {
 
     /// Set an idle timeout for established connections. For HTTP/1.1 this
     /// configures `header_read_timeout`; for HTTP/2 it configures keep-alive
-    /// pings.
+    /// pings. It also bounds upgraded (e.g. WebSocket) tunnels: a tunnel with
+    /// no traffic in either direction for this long is closed, so a stalled
+    /// peer cannot pin it open indefinitely.
     pub fn idle_timeout(mut self, timeout: Duration) -> Self {
         self.idle_timeout = Some(timeout);
         self
@@ -580,8 +604,116 @@ impl ProxyBuilder {
 
 /// Adapter that bridges a tower `Service` (which uses `&mut self`) to hyper's
 /// `Service` trait (which uses `&self`) via a bounded tower buffer.
+/// Why an upgrade relay tunnel stopped.
+enum TunnelOutcome {
+    /// One side closed the connection cleanly.
+    Closed,
+    /// No bytes flowed in either direction for the idle timeout.
+    Idle,
+    /// An I/O error ended the relay.
+    Error(std::io::Error),
+}
+
+/// Relay bytes in both directions between an upgraded client and upstream
+/// connection until one side closes, an I/O error occurs, or — when
+/// `idle_timeout` is set — no data flows in either direction for that long.
+///
+/// This replaces a bare `copy_bidirectional`, which has no notion of an idle
+/// timeout and would let a stalled peer pin the tunnel (and its file
+/// descriptors) open indefinitely.
+async fn relay_tunnel<A, B>(client: A, upstream: B, idle_timeout: Option<Duration>) -> TunnelOutcome
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let (mut client_rd, mut client_wr) = tokio::io::split(client);
+    let (mut upstream_rd, mut upstream_wr) = tokio::io::split(upstream);
+    let activity = Arc::new(AtomicU64::new(0));
+
+    let to_upstream = copy_half(&mut client_rd, &mut upstream_wr, &activity);
+    let to_client = copy_half(&mut upstream_rd, &mut client_wr, &activity);
+    // Relay until both directions have reached EOF (or either errors), matching
+    // copy_bidirectional. When one side half-closes, copy_half shuts down the
+    // matching write half and the other direction keeps flowing.
+    let relay = async { tokio::try_join!(to_upstream, to_client).map(|_| ()) };
+
+    match idle_timeout {
+        Some(idle) => tokio::select! {
+            result = relay => match result {
+                Ok(()) => TunnelOutcome::Closed,
+                Err(e) => TunnelOutcome::Error(e),
+            },
+            _ = idle_watchdog(&activity, idle) => TunnelOutcome::Idle,
+        },
+        None => match relay.await {
+            Ok(()) => TunnelOutcome::Closed,
+            Err(e) => TunnelOutcome::Error(e),
+        },
+    }
+}
+
+/// Copy one direction, bumping `activity` on every chunk so the idle watchdog
+/// can tell whether the tunnel is still in use.
+async fn copy_half<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    activity: &AtomicU64,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            let _ = writer.shutdown().await;
+            return Ok(());
+        }
+        activity.fetch_add(1, Ordering::Relaxed);
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+    }
+}
+
+/// Resolve once no activity has been recorded for a full `idle` interval.
+async fn idle_watchdog(activity: &AtomicU64, idle: Duration) {
+    let mut last = activity.load(Ordering::Relaxed);
+    loop {
+        tokio::time::sleep(idle).await;
+        let now = activity.load(Ordering::Relaxed);
+        if now == last {
+            return;
+        }
+        last = now;
+    }
+}
+
+/// Resolve when graceful shutdown is signalled; never resolves if there is no
+/// shutdown receiver.
+async fn wait_for_shutdown(rx: Option<&mut tokio::sync::watch::Receiver<bool>>) {
+    if let Some(rx) = rx
+        && rx.wait_for(|&shutting_down| shutting_down).await.is_ok()
+    {
+        return;
+    }
+    // No receiver, or the sender was dropped without ever signalling shutdown
+    // (e.g. the standalone `handle_connection` path, whose local channel ends
+    // when that call returns — which is *before* the detached tunnel does).
+    // In that case there is no shutdown to react to, so never fire.
+    std::future::pending::<()>().await
+}
+
 struct HyperServiceAdapter {
     inner: BufferedHttpService,
+    /// Inactivity timeout applied to established upgrade (e.g. WebSocket)
+    /// tunnels so a stalled peer cannot hold the relay open forever. Populated
+    /// by [`Proxy::serve_client`].
+    tunnel_idle_timeout: Option<Duration>,
+    /// Connection shutdown signal, so an in-flight upgrade tunnel is torn down
+    /// on graceful shutdown instead of lingering as a detached task.
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
@@ -611,6 +743,11 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
             None
         };
 
+        // Copy out the tunnel-lifecycle inputs so the future doesn't borrow
+        // `self`.
+        let tunnel_idle_timeout = self.tunnel_idle_timeout;
+        let tunnel_shutdown_rx = self.shutdown_rx.clone();
+
         Box::pin(
             async move {
                 let req = req.map(incoming_to_body);
@@ -621,6 +758,8 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
                     && let Some(client_upgrade) = client_upgrade
                 {
                     let upstream_upgrade = hyper::upgrade::on(&mut resp);
+                    let idle_timeout = tunnel_idle_timeout;
+                    let mut shutdown_rx = tunnel_shutdown_rx;
                     tokio::spawn(async move {
                         let (client_io, upstream_io) =
                             match tokio::try_join!(client_upgrade, upstream_upgrade) {
@@ -630,12 +769,24 @@ impl hyper::service::Service<Request<Incoming>> for HyperServiceAdapter {
                                     return;
                                 }
                             };
-                        let mut client_io = TokioIo::new(client_io);
-                        let mut upstream_io = TokioIo::new(upstream_io);
-                        if let Err(e) =
-                            tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await
-                        {
-                            tracing::debug!(error = %e, "upgrade stream ended");
+                        let client_io = TokioIo::new(client_io);
+                        let upstream_io = TokioIo::new(upstream_io);
+
+                        tokio::select! {
+                            result = relay_tunnel(client_io, upstream_io, idle_timeout) => {
+                                match result {
+                                    TunnelOutcome::Closed => {}
+                                    TunnelOutcome::Idle => tracing::debug!(
+                                        "upgrade tunnel closed: idle timeout"
+                                    ),
+                                    TunnelOutcome::Error(e) => tracing::debug!(
+                                        error = %e, "upgrade tunnel ended"
+                                    ),
+                                }
+                            }
+                            _ = wait_for_shutdown(shutdown_rx.as_mut()) => {
+                                tracing::debug!("upgrade tunnel torn down on shutdown");
+                            }
                         }
                     });
                 }
@@ -877,9 +1028,14 @@ impl Proxy {
     >(
         &self,
         client_io: I,
-        hyper_service: HyperServiceAdapter,
+        mut hyper_service: HyperServiceAdapter,
         mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     ) -> anyhow::Result<()> {
+        // Give the adapter what it needs to bound upgrade tunnels: an idle
+        // timeout and the shutdown signal.
+        hyper_service.tunnel_idle_timeout = self.idle_timeout;
+        hyper_service.shutdown_rx = Some(shutdown_rx.clone());
+
         let client_io = TokioIo::new(client_io);
         let mut builder =
             hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
@@ -964,6 +1120,8 @@ impl Proxy {
         let service = self.build_service_chain(upstream_authority, upstream_scheme);
         let hyper_service = HyperServiceAdapter {
             inner: tower::buffer::Buffer::new(service, 1024),
+            tunnel_idle_timeout: None,
+            shutdown_rx: None,
         };
 
         if let Some(acceptor) = tls_acceptor {
@@ -1032,7 +1190,7 @@ impl Proxy {
                         .and_then(|bytes| String::from_utf8(bytes).ok())
                         .and_then(|decoded| {
                             let (u, p) = decoded.split_once(':')?;
-                            Some(creds.iter().any(|(eu, ep)| eu == u && ep == p))
+                            Some(credentials_match(creds, u, p))
                         })
                         .unwrap_or(false);
 
@@ -1089,8 +1247,168 @@ impl Proxy {
         let service = self.build_service_chain(authority, ::http::uri::Scheme::HTTPS);
         let hyper_service = HyperServiceAdapter {
             inner: tower::buffer::Buffer::new(service, 1024),
+            tunnel_idle_timeout: None,
+            shutdown_rx: None,
         };
 
         Ok((hyper_service, client_tls))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::credentials_match;
+
+    fn creds(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(u, p)| (u.to_string(), p.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn matches_exact_credential() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(credentials_match(&c, "admin", "s3cret"));
+    }
+
+    #[test]
+    fn rejects_wrong_password() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", "wrong"));
+    }
+
+    #[test]
+    fn rejects_wrong_username() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "root", "s3cret"));
+    }
+
+    #[test]
+    fn rejects_password_prefix() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", "s3c"));
+        assert!(!credentials_match(&c, "admin", "s3cretary"));
+    }
+
+    #[test]
+    fn rejects_when_no_credentials_configured() {
+        assert!(!credentials_match(&[], "admin", "s3cret"));
+    }
+
+    #[test]
+    fn matches_any_configured_credential() {
+        let c = creds(&[("alice", "pw1"), ("bob", "pw2")]);
+        assert!(credentials_match(&c, "bob", "pw2"));
+        assert!(credentials_match(&c, "alice", "pw1"));
+        // Cross pairing must not authenticate.
+        assert!(!credentials_match(&c, "alice", "pw2"));
+    }
+
+    #[test]
+    fn rejects_empty_password_mismatch() {
+        let c = creds(&[("admin", "s3cret")]);
+        assert!(!credentials_match(&c, "admin", ""));
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn relay_tunnel_forwards_both_directions() {
+        let (mut client_ext, client_int) = duplex(1024);
+        let (mut upstream_ext, upstream_int) = duplex(1024);
+        let handle = tokio::spawn(relay_tunnel(client_int, upstream_int, None));
+
+        // client -> upstream
+        client_ext.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        upstream_ext.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // upstream -> client
+        upstream_ext.write_all(b"pong").await.unwrap();
+        let mut buf = [0u8; 4];
+        client_ext.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        // Closing both ends completes the relay cleanly.
+        drop(client_ext);
+        drop(upstream_ext);
+        let outcome = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("relay should finish")
+            .unwrap();
+        assert!(matches!(outcome, TunnelOutcome::Closed));
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_times_out_when_idle() {
+        // Keep both external ends open but never send anything.
+        let (_client_ext, client_int) = duplex(1024);
+        let (_upstream_ext, upstream_int) = duplex(1024);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            relay_tunnel(client_int, upstream_int, Some(Duration::from_millis(120))),
+        )
+        .await
+        .expect("idle tunnel should stop on its own");
+        assert!(matches!(outcome, TunnelOutcome::Idle));
+    }
+
+    #[tokio::test]
+    async fn relay_tunnel_idle_timer_resets_on_activity() {
+        let (mut client_ext, client_int) = duplex(1024);
+        let (mut upstream_ext, upstream_int) = duplex(1024);
+        let handle = tokio::spawn(relay_tunnel(
+            client_int,
+            upstream_int,
+            Some(Duration::from_millis(200)),
+        ));
+
+        // Stay active across several idle intervals; the tunnel must not close.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            client_ext.write_all(b"x").await.unwrap();
+            let mut b = [0u8; 1];
+            upstream_ext.read_exact(&mut b).await.unwrap();
+            assert!(!handle.is_finished(), "active tunnel must stay open");
+        }
+
+        // Now go quiet -> it should time out.
+        let outcome = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("idle tunnel should stop")
+            .unwrap();
+        assert!(matches!(outcome, TunnelOutcome::Idle));
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_fires_on_signal() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut rx = rx.clone();
+        let waiter = tokio::spawn(async move { wait_for_shutdown(Some(&mut rx)).await });
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should fire on shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waiter_ignores_sender_drop() {
+        // A dropped sender that never signalled shutdown must not tear the
+        // tunnel down (regression: the standalone handle_connection path).
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut rx = rx.clone();
+        drop(tx);
+        let fired =
+            tokio::time::timeout(Duration::from_millis(150), wait_for_shutdown(Some(&mut rx)))
+                .await;
+        assert!(fired.is_err(), "must not fire when the sender just drops");
     }
 }

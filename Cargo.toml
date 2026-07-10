@@ -57,6 +57,7 @@ webpki-roots = "0.26"
 matchit = "0.8"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 regex = "1"
+subtle = "2"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
