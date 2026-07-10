@@ -121,6 +121,14 @@ struct Cli {
     #[arg(long = "pool-idle-timeout")]
     pool_idle_timeout: Option<String>,
 
+    /// Timeout for establishing a new upstream connection (default: 30s)
+    #[arg(long = "connect-timeout")]
+    connect_timeout: Option<String>,
+
+    /// Timeout for receiving upstream response headers; 504 on expiry (e.g., "30s")
+    #[arg(long = "request-timeout")]
+    request_timeout: Option<String>,
+
     /// Set a request header (format: "name: value", repeatable)
     #[arg(long = "set-request-header")]
     set_request_headers: Vec<String>,
@@ -317,6 +325,18 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
         parse_duration(&timeout_str)
             .map_err(|e| anyhow::anyhow!("invalid pool-idle-timeout: {e}"))?;
         config.pool_idle_timeout = Some(timeout_str);
+    }
+
+    if let Some(timeout_str) = cli.connect_timeout {
+        parse_duration(&timeout_str)
+            .map_err(|e| anyhow::anyhow!("invalid connect-timeout: {e}"))?;
+        config.connect_timeout = Some(timeout_str);
+    }
+
+    if let Some(timeout_str) = cli.request_timeout {
+        parse_duration(&timeout_str)
+            .map_err(|e| anyhow::anyhow!("invalid request-timeout: {e}"))?;
+        config.request_timeout = Some(timeout_str);
     }
 
     #[cfg(feature = "redis")]

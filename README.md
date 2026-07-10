@@ -300,6 +300,8 @@ Options:
       --redis-url <URL>                Redis URL for distributed middleware state (requires redis feature)
       --pool-max-idle <N>              Max idle connections per host (default: 8, 0 to disable)
       --pool-idle-timeout <DURATION>   Idle timeout for pooled connections (e.g., "90s")
+      --connect-timeout <DURATION>     Upstream connect timeout (default: 30s)
+      --request-timeout <DURATION>     Upstream response-header timeout; 504 on expiry (e.g., "30s")
       --accept-invalid-certs           Accept invalid upstream TLS certificates
       --health-addr <ADDR>             Serve /healthz and /readyz on this address (e.g. "127.0.0.1:9090")
   -h, --help                   Print help
@@ -474,6 +476,8 @@ reverse port=8080 {
 // accept-invalid-upstream-certs true
 // pool-max-idle-per-host 8
 // pool-idle-timeout "90s"
+// connect-timeout "30s"
+// request-timeout "30s"
 // health-addr "127.0.0.1:9090"
 
 // Global rules — apply to every listener below
