@@ -53,6 +53,18 @@ struct Cli {
     #[arg(long)]
     log_bodies: bool,
 
+    /// Additional header names to redact in logs (comma-separated)
+    #[arg(long, value_name = "NAMES")]
+    log_redact_headers: Option<String>,
+
+    /// Header names to reveal (un-redact) in logs (comma-separated)
+    #[arg(long, value_name = "NAMES")]
+    log_reveal_headers: Option<String>,
+
+    /// Log all header values verbatim, including credentials (disables redaction)
+    #[arg(long)]
+    log_no_redact: bool,
+
     /// Add global latency (e.g., "200ms", "100ms..500ms")
     #[arg(long)]
     latency: Option<String>,
@@ -245,9 +257,17 @@ async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<
         })
         .collect::<anyhow::Result<_>>()?;
 
-    if cli.log || cli.log_bodies {
+    if cli.log
+        || cli.log_bodies
+        || cli.log_no_redact
+        || cli.log_redact_headers.is_some()
+        || cli.log_reveal_headers.is_some()
+    {
         config.body.push(RuleNode::Log(LogConfig {
             bodies: if cli.log_bodies { Some(true) } else { None },
+            redact: if cli.log_no_redact { Some(false) } else { None },
+            redact_headers: cli.log_redact_headers.clone(),
+            reveal_headers: cli.log_reveal_headers.clone(),
         }));
     }
 
