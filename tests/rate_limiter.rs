@@ -8,6 +8,71 @@ use noxy::middleware::RateLimiter;
 use tower::Layer;
 
 #[tokio::test]
+async fn rate_limiter_rejects_when_backlog_exceeded() {
+    let upstream_addr = start_upstream("hello").await;
+
+    // Very low rate + tiny max-delay: once the two burst tokens are spent, the
+    // backlog cap is immediately exceeded, so further requests get 429 rather
+    // than an ever-growing sleep.
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer =
+            RateLimiter::global(2, Duration::from_secs(10)).max_delay(Duration::from_millis(20));
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    let mut ok = 0;
+    let mut rejected = 0;
+    let mut retry_after_seen = false;
+    for _ in 0..10 {
+        let resp = client.get(&url).send().await.unwrap();
+        match resp.status().as_u16() {
+            200 => ok += 1,
+            429 => {
+                rejected += 1;
+                retry_after_seen |= resp.headers().contains_key("retry-after");
+            }
+            other => panic!("unexpected status {other}"),
+        }
+    }
+
+    assert!(ok >= 1, "some requests should be admitted");
+    assert!(rejected > 0, "backlog overflow should be rejected with 429");
+    assert!(
+        retry_after_seen,
+        "429 responses should carry a Retry-After header"
+    );
+}
+
+#[tokio::test]
+async fn rate_limiter_unbounded_delay_never_rejects() {
+    let upstream_addr = start_upstream("hello").await;
+
+    // With the cap disabled, over-limit requests are delayed, never rejected.
+    let proxy_addr = start_proxy(vec![Box::new(|inner: HttpService| {
+        let layer = RateLimiter::global(4, Duration::from_secs(1))
+            .burst(1)
+            .unbounded_delay();
+        tower::util::BoxService::new(layer.layer(inner))
+    })])
+    .await;
+    let client = http_client(proxy_addr);
+    let url = format!("https://localhost:{}/", upstream_addr.port());
+
+    for i in 0..3 {
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "request {i} should be delayed, not rejected"
+        );
+        assert_eq!(resp.text().await.unwrap(), "hello");
+    }
+}
+
+#[tokio::test]
 async fn rate_limiter_delays_requests() {
     let upstream_addr = start_upstream("hello").await;
 

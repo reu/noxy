@@ -8,11 +8,22 @@ use std::time::{Duration, Instant};
 use http::{Request, Response};
 use tower::Service;
 
-use super::store::RateLimitStore;
-use crate::http::{Body, BoxError, HttpService};
+use super::store::{RateLimitOutcome, RateLimitStore};
+use crate::http::{Body, BoxError, HttpService, empty_body};
 
 type KeyFn = Arc<dyn Fn(&Request<Body>) -> String + Send + Sync>;
 const DEFAULT_MAX_KEYS: usize = 10_000;
+
+/// Default backlog cap: one full bucket of debt (`burst / rate`), i.e. roughly
+/// one window. Requests that would wait longer than this are rejected rather
+/// than queued indefinitely.
+fn default_max_wait(rate: f64, burst: f64) -> Option<Duration> {
+    if rate > 0.0 && burst.is_finite() {
+        Some(Duration::from_secs_f64(burst / rate))
+    } else {
+        None
+    }
+}
 const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(600);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -29,18 +40,38 @@ impl TokenBucket {
         }
     }
 
-    fn take(&mut self, rate: f64, burst: f64) -> Option<Duration> {
+    /// Refill, then attempt to consume one token.
+    ///
+    /// `max_wait` caps the backlog: if consuming a token would leave the bucket
+    /// so far in deficit that the caller would have to wait longer than
+    /// `max_wait`, the request is rejected and **no token is consumed** (so the
+    /// bucket recovers and the enforced rate is preserved). `None` means no cap
+    /// — the wait can grow without bound (legacy behavior).
+    fn take(&mut self, rate: f64, burst: f64, max_wait: Option<Duration>) -> RateLimitOutcome {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         self.last_refill = now;
 
-        self.tokens = (self.tokens + elapsed * rate).min(burst);
-        self.tokens -= 1.0;
+        let refilled = (self.tokens + elapsed * rate).min(burst);
+        let after = refilled - 1.0;
 
-        if self.tokens < 0.0 {
-            Some(Duration::from_secs_f64(-self.tokens / rate))
+        if let Some(max_wait) = max_wait {
+            let max_debt = max_wait.as_secs_f64() * rate;
+            if after < -max_debt {
+                // Backlog is full: reject without consuming a token, keeping the
+                // refilled level so admitted traffic stays paced at `rate`.
+                self.tokens = refilled;
+                return RateLimitOutcome::Reject {
+                    retry_after: max_wait,
+                };
+            }
+        }
+
+        self.tokens = after;
+        if after < 0.0 {
+            RateLimitOutcome::Wait(Duration::from_secs_f64(-after / rate))
         } else {
-            None
+            RateLimitOutcome::Allow
         }
     }
 }
@@ -54,6 +85,9 @@ struct SharedState {
     buckets: HashMap<String, BucketState>,
     rate: f64,
     burst: f64,
+    /// Maximum time a request may be asked to wait before it is rejected
+    /// instead. `None` disables the cap (unbounded delay).
+    max_wait: Option<Duration>,
     max_keys: usize,
     idle_ttl: Duration,
     next_cleanup: Instant,
@@ -99,13 +133,14 @@ impl SharedState {
         }
     }
 
-    fn take(&mut self, key: &str) -> Option<Duration> {
+    fn take(&mut self, key: &str) -> RateLimitOutcome {
         let now = Instant::now();
         self.maybe_cleanup(now);
         self.evict_if_needed(key, now);
 
         let rate = self.rate;
         let burst = self.burst;
+        let max_wait = self.max_wait;
         let state = self
             .buckets
             .entry(key.to_string())
@@ -114,7 +149,7 @@ impl SharedState {
                 last_seen: now,
             });
         state.last_seen = now;
-        state.bucket.take(rate, burst)
+        state.bucket.take(rate, burst, max_wait)
     }
 }
 
@@ -134,6 +169,7 @@ impl InMemoryRateLimitStore {
                 buckets: HashMap::new(),
                 rate,
                 burst,
+                max_wait: default_max_wait(rate, burst),
                 max_keys: DEFAULT_MAX_KEYS,
                 idle_ttl: DEFAULT_IDLE_TTL,
                 next_cleanup: Instant::now() + CLEANUP_INTERVAL,
@@ -143,6 +179,12 @@ impl InMemoryRateLimitStore {
 
     pub(crate) fn set_burst(&self, burst: f64) {
         self.state.lock().unwrap().burst = burst;
+    }
+
+    /// Cap the maximum wait before a request is rejected. `None` disables the
+    /// cap (unbounded delay).
+    pub(crate) fn set_max_wait(&self, max_wait: Option<Duration>) {
+        self.state.lock().unwrap().max_wait = max_wait;
     }
 
     pub(crate) fn set_max_keys(&self, max: usize) {
@@ -155,7 +197,7 @@ impl InMemoryRateLimitStore {
 }
 
 impl RateLimitStore for InMemoryRateLimitStore {
-    fn take(&self, key: &str) -> impl Future<Output = Option<Duration>> + Send {
+    fn take(&self, key: &str) -> impl Future<Output = RateLimitOutcome> + Send {
         let result = self.state.lock().unwrap().take(key);
         std::future::ready(result)
     }
@@ -163,9 +205,13 @@ impl RateLimitStore for InMemoryRateLimitStore {
 
 /// Tower layer that rate-limits requests using a token bucket algorithm.
 ///
-/// Requests that exceed the configured rate are delayed (not rejected),
-/// providing backpressure to clients while still eventually serving every
-/// request.
+/// Requests that exceed the configured rate are delayed to provide
+/// backpressure. Because the delay is reserved when a request is admitted, a
+/// sustained flood would otherwise pile up ever-growing waits; to bound that,
+/// a request whose wait would exceed [`max_delay`](Self::max_delay) (default:
+/// roughly one window) is instead rejected with `429 Too Many Requests` and a
+/// `Retry-After` header. Use [`unbounded_delay`](Self::unbounded_delay) to
+/// delay indefinitely and never reject.
 ///
 /// The rate limit key is derived from each request by a user-provided
 /// function. Use [`global`](Self::global) or [`per_host`](Self::per_host)
@@ -256,6 +302,25 @@ impl RateLimiter {
         self
     }
 
+    /// Cap how long an over-limit request may be delayed before it is rejected
+    /// with `429 Too Many Requests` instead of queued.
+    ///
+    /// Because the delay is reserved when the request is admitted, an unbounded
+    /// delay lets a sustained flood pile up ever-growing waits (and the
+    /// connections holding them). Defaults to roughly one window (`burst /
+    /// rate`). See [`unbounded_delay`](Self::unbounded_delay) to opt out.
+    pub fn max_delay(self, max_delay: Duration) -> Self {
+        self.store.set_max_wait(Some(max_delay));
+        self
+    }
+
+    /// Remove the delay cap: over-limit requests are delayed indefinitely and
+    /// never rejected. Restores the pre-cap behavior.
+    pub fn unbounded_delay(self) -> Self {
+        self.store.set_max_wait(None);
+        self
+    }
+
     /// Soft cap for distinct keys tracked in memory.
     /// Idle keys are evicted first; if all keys are active, the map may
     /// temporarily exceed this value to preserve rate-limit correctness.
@@ -313,27 +378,45 @@ impl<S: RateLimitStore> Service<Request<Body>> for RateLimiterService<S> {
         let fut = self.inner.call(req);
 
         Box::pin(async move {
-            if let Some(delay) = store.take(&key).await {
-                tokio::time::sleep(delay).await;
+            match store.take(&key).await {
+                RateLimitOutcome::Allow => fut.await,
+                RateLimitOutcome::Wait(delay) => {
+                    tokio::time::sleep(delay).await;
+                    fut.await
+                }
+                RateLimitOutcome::Reject { retry_after } => Ok(too_many_requests(retry_after)),
             }
-            fut.await
         })
     }
+}
+
+/// Build a `429 Too Many Requests` response with a `Retry-After` header.
+fn too_many_requests(retry_after: Duration) -> Response<Body> {
+    let secs = retry_after.as_secs_f64().ceil().max(1.0) as u64;
+    Response::builder()
+        .status(http::StatusCode::TOO_MANY_REQUESTS)
+        .header(http::header::RETRY_AFTER, secs)
+        .body(empty_body())
+        .expect("static 429 response is always valid")
 }
 
 #[cfg(feature = "redis")]
 mod redis_impl {
     use std::time::Duration;
 
-    use super::super::store::RateLimitStore;
+    use super::super::store::{RateLimitOutcome, RateLimitStore};
     use super::InMemoryRateLimitStore;
     use crate::redis::RedisConnection;
 
+    // Returns: -1 = reject (backlog cap exceeded, token not consumed),
+    // 0 = allow now, >0 = wait this many milliseconds. `max_debt` < 0 disables
+    // the cap.
     const RATE_LIMIT_LUA: &str = r#"
 local key = KEYS[1]
 local rate = tonumber(ARGV[1])
 local burst = tonumber(ARGV[2])
 local ttl_ms = tonumber(ARGV[3])
+local max_debt = tonumber(ARGV[4])
 
 local t = redis.call('TIME')
 local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -349,13 +432,20 @@ end
 
 local elapsed_s = (now_ms - last_ms) / 1000.0
 local refilled = math.min(tokens + elapsed_s * rate, burst)
-refilled = refilled - 1.0
+local after = refilled - 1.0
 
-redis.call('HSET', key, 'tokens', tostring(refilled), 'last_refill_ms', tostring(now_ms))
+if max_debt >= 0 and after < -max_debt then
+    -- Backlog full: reject without consuming a token.
+    redis.call('HSET', key, 'tokens', tostring(refilled), 'last_refill_ms', tostring(now_ms))
+    redis.call('PEXPIRE', key, ttl_ms)
+    return -1
+end
+
+redis.call('HSET', key, 'tokens', tostring(after), 'last_refill_ms', tostring(now_ms))
 redis.call('PEXPIRE', key, ttl_ms)
 
-if refilled < 0 then
-    return math.ceil((-refilled / rate) * 1000)
+if after < 0 then
+    return math.ceil((-after / rate) * 1000)
 else
     return 0
 end
@@ -370,6 +460,7 @@ end
         fallback: InMemoryRateLimitStore,
         rate: f64,
         burst: f64,
+        max_wait: Option<Duration>,
         namespace: String,
     }
 
@@ -380,6 +471,7 @@ end
                 fallback: InMemoryRateLimitStore::new(rate, burst),
                 rate,
                 burst,
+                max_wait: super::default_max_wait(rate, burst),
                 namespace: "rate_limit".to_string(),
             }
         }
@@ -391,14 +483,24 @@ end
             self.namespace = format!("rate_limit:{id}");
             self
         }
+
+        /// Cap how long a request may wait before it is rejected. `None`
+        /// disables the cap (unbounded delay). Mirrors
+        /// [`RateLimiter::max_delay`](super::RateLimiter::max_delay).
+        pub fn max_wait(mut self, max_wait: Option<Duration>) -> Self {
+            self.max_wait = max_wait;
+            self.fallback.set_max_wait(max_wait);
+            self
+        }
     }
 
     impl RateLimitStore for RedisRateLimitStore {
-        fn take(&self, key: &str) -> impl std::future::Future<Output = Option<Duration>> + Send {
+        fn take(&self, key: &str) -> impl std::future::Future<Output = RateLimitOutcome> + Send {
             let redis_key = self.conn.prefixed_key(&self.namespace, key);
             let conn = self.conn.clone();
             let rate = self.rate;
             let burst = self.burst;
+            let max_wait = self.max_wait;
             let fallback = self.fallback.clone();
             let key = key.to_string();
 
@@ -412,18 +514,26 @@ end
                 };
 
                 let ttl_ms = ((burst / rate) * 1000.0) as u64 + 60_000;
+                // Negative disables the cap in the Lua script.
+                let max_debt = max_wait.map(|w| w.as_secs_f64() * rate).unwrap_or(-1.0);
 
                 let result: Result<i64, _> = ::redis::Script::new(RATE_LIMIT_LUA)
                     .key(&redis_key)
                     .arg(rate)
                     .arg(burst)
                     .arg(ttl_ms)
+                    .arg(max_debt)
                     .invoke_async(&mut mgr.clone())
                     .await;
 
                 match result {
-                    Ok(delay_ms) if delay_ms > 0 => Some(Duration::from_millis(delay_ms as u64)),
-                    Ok(_) => None,
+                    Ok(-1) => RateLimitOutcome::Reject {
+                        retry_after: max_wait.unwrap_or(Duration::ZERO),
+                    },
+                    Ok(delay_ms) if delay_ms > 0 => {
+                        RateLimitOutcome::Wait(Duration::from_millis(delay_ms as u64))
+                    }
+                    Ok(_) => RateLimitOutcome::Allow,
                     Err(e) => {
                         tracing::warn!(error = %e, "Redis rate limit failed, using in-memory fallback");
                         fallback.take(&key).await
@@ -442,11 +552,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_bucket_rejects_beyond_backlog_cap() {
+        let (rate, burst) = (5.0, 5.0);
+        let max_wait = Some(Duration::from_secs(1)); // max debt = 5 tokens
+        let mut bucket = TokenBucket::new(burst);
+
+        // Hammer the bucket faster than it can refill.
+        let outcomes: Vec<_> = (0..30)
+            .map(|_| bucket.take(rate, burst, max_wait))
+            .collect();
+
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, RateLimitOutcome::Reject { .. })),
+            "sustained overload should eventually reject"
+        );
+        // Debt is bounded: tokens never fall below -max_debt.
+        assert!(
+            bucket.tokens >= -5.0 - 1e-9,
+            "tokens should be floored at -max_debt, got {}",
+            bucket.tokens
+        );
+        // No admitted request is ever told to wait longer than the cap.
+        for outcome in &outcomes {
+            if let RateLimitOutcome::Wait(delay) = outcome {
+                assert!(
+                    *delay <= Duration::from_secs(1) + Duration::from_millis(1),
+                    "wait {delay:?} should not exceed max_wait"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn token_bucket_unbounded_debt_without_cap() {
+        let (rate, burst) = (1.0, 1.0);
+        let mut bucket = TokenBucket::new(burst);
+
+        for _ in 0..50 {
+            assert!(
+                !matches!(
+                    bucket.take(rate, burst, None),
+                    RateLimitOutcome::Reject { .. }
+                ),
+                "without a cap the bucket must never reject"
+            );
+        }
+        // Legacy behavior: debt grows without bound.
+        assert!(
+            bucket.tokens < -40.0,
+            "uncapped debt should accumulate, got {}",
+            bucket.tokens
+        );
+    }
+
+    #[test]
+    fn token_bucket_rejects_do_not_consume_tokens() {
+        let (rate, burst) = (1.0, 1.0);
+        let max_wait = Some(Duration::from_millis(1)); // max debt ~= 0.001 tokens
+        let mut bucket = TokenBucket::new(burst);
+
+        assert!(matches!(
+            bucket.take(rate, burst, max_wait),
+            RateLimitOutcome::Allow
+        ));
+        // Subsequent immediate requests are rejected, and each rejection leaves
+        // the bucket at the same level (no token consumed).
+        let before = bucket.tokens;
+        assert!(matches!(
+            bucket.take(rate, burst, max_wait),
+            RateLimitOutcome::Reject { .. }
+        ));
+        assert!(
+            (bucket.tokens - before).abs() < 0.01,
+            "reject must not consume a token"
+        );
+    }
+
+    #[test]
     fn shared_state_preserves_active_keys_when_over_capacity() {
         let mut state = SharedState {
             buckets: HashMap::new(),
             rate: 1.0,
             burst: 1.0,
+            max_wait: None,
             max_keys: 2,
             idle_ttl: Duration::from_secs(60),
             next_cleanup: Instant::now() + CLEANUP_INTERVAL,
@@ -467,6 +657,7 @@ mod tests {
             buckets: HashMap::new(),
             rate: 1.0,
             burst: 1.0,
+            max_wait: None,
             max_keys: 10,
             idle_ttl: Duration::from_millis(1),
             next_cleanup: Instant::now(),
@@ -488,6 +679,7 @@ mod tests {
             buckets: HashMap::new(),
             rate: 1.0,
             burst: 10.0,
+            max_wait: None,
             max_keys: 10,
             idle_ttl: Duration::from_millis(1),
             next_cleanup: Instant::now(),
@@ -507,6 +699,7 @@ mod tests {
             buckets: HashMap::new(),
             rate: 1.0,
             burst: 10.0,
+            max_wait: None,
             max_keys: 1,
             idle_ttl: Duration::from_secs(600),
             next_cleanup: Instant::now() + CLEANUP_INTERVAL,
