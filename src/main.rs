@@ -212,8 +212,6 @@ async fn main() -> miette::Result<()> {
         .map_err(|e| miette::miette!("{e:#}"))
 }
 
-/// Accept loop for the health/readiness HTTP server. Stops when the shutdown
-/// signal fires.
 async fn serve_health(
     listener: tokio::net::TcpListener,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -225,7 +223,21 @@ async fn serve_health(
                     tokio::spawn(async move {
                         let io = hyper_util::rt::TokioIo::new(stream);
                         let _ = hyper::server::conn::http1::Builder::new()
-                            .serve_connection(io, hyper::service::service_fn(health_response))
+                            .serve_connection(io, hyper::service::service_fn(|req| async move {
+                                use ::http::{Method, StatusCode, header};
+
+                                let (status, body) = match (req.method(), req.uri().path()) {
+                                    (&Method::GET, "/healthz" | "/health") => (StatusCode::OK, "ok\n"),
+                                    (&Method::GET, "/readyz" | "/ready") => (StatusCode::OK, "ready\n"),
+                                    _ => (StatusCode::NOT_FOUND, "not found\n"),
+                                };
+
+                                Ok::<_, std::convert::Infallible>(hyper::Response::builder()
+                                    .status(status)
+                                    .header(header::CONTENT_TYPE, "text/plain")
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                    .expect("static health response is always valid"))
+                            }))
                             .await;
                     });
                 }
@@ -234,26 +246,6 @@ async fn serve_health(
             _ = shutdown_rx.recv() => break,
         }
     }
-}
-
-/// Route health/readiness probes. `/healthz` is liveness, `/readyz` is
-/// readiness; everything else is 404.
-async fn health_response(
-    req: hyper::Request<hyper::body::Incoming>,
-) -> Result<hyper::Response<http_body_util::Full<bytes::Bytes>>, std::convert::Infallible> {
-    use ::http::{Method, StatusCode, header};
-
-    let (status, body) = match (req.method(), req.uri().path()) {
-        (&Method::GET, "/healthz" | "/health") => (StatusCode::OK, "ok\n"),
-        (&Method::GET, "/readyz" | "/ready") => (StatusCode::OK, "ready\n"),
-        _ => (StatusCode::NOT_FOUND, "not found\n"),
-    };
-
-    Ok(hyper::Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/plain")
-        .body(http_body_util::Full::new(bytes::Bytes::from(body)))
-        .expect("static health response is always valid"))
 }
 
 async fn apply_cli_and_run(cli: Cli, mut config: ProxyConfig) -> anyhow::Result<()> {
