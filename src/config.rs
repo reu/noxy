@@ -36,6 +36,12 @@ pub struct ProxyConfig {
     pub idle_timeout: Option<String>,
 
     #[knus(child, unwrap(argument))]
+    pub connect_timeout: Option<String>,
+
+    #[knus(child, unwrap(argument))]
+    pub request_timeout: Option<String>,
+
+    #[knus(child, unwrap(argument))]
     pub max_connections: Option<usize>,
 
     #[knus(child, unwrap(argument))]
@@ -727,6 +733,8 @@ impl ProxyConfig {
             accept_invalid_upstream_certs: self.accept_invalid_upstream_certs,
             handshake_timeout: self.handshake_timeout.clone(),
             idle_timeout: self.idle_timeout.clone(),
+            connect_timeout: self.connect_timeout.clone(),
+            request_timeout: self.request_timeout.clone(),
             max_connections: self.max_connections,
             drain_timeout: self.drain_timeout.clone(),
             pool_max_idle_per_host: self.pool_max_idle_per_host,
@@ -809,6 +817,8 @@ struct ProcessSettings {
     accept_invalid_upstream_certs: bool,
     handshake_timeout: Option<String>,
     idle_timeout: Option<String>,
+    connect_timeout: Option<String>,
+    request_timeout: Option<String>,
     max_connections: Option<usize>,
     drain_timeout: Option<String>,
     pool_max_idle_per_host: Option<usize>,
@@ -827,6 +837,12 @@ fn apply_process_settings(
     }
     if let Some(ref t) = s.idle_timeout {
         builder = builder.idle_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(ref t) = s.connect_timeout {
+        builder = builder.connect_timeout(parse_duration(t).map_err(anyhow_str)?);
+    }
+    if let Some(ref t) = s.request_timeout {
+        builder = builder.request_timeout(parse_duration(t).map_err(anyhow_str)?);
     }
     if let Some(max) = s.max_connections {
         builder = builder.max_connections(max);
@@ -1960,6 +1976,8 @@ mod tests {
             pool-max-idle-per-host 16
             pool-idle-timeout "120s"
             handshake-timeout "10s"
+            connect-timeout "5s"
+            request-timeout "30s"
             max-connections 1000
             "#,
         )
@@ -1969,6 +1987,8 @@ mod tests {
         assert_eq!(cfg.pool_max_idle_per_host, Some(16));
         assert_eq!(cfg.pool_idle_timeout.as_deref(), Some("120s"));
         assert_eq!(cfg.handshake_timeout.as_deref(), Some("10s"));
+        assert_eq!(cfg.connect_timeout.as_deref(), Some("5s"));
+        assert_eq!(cfg.request_timeout.as_deref(), Some("30s"));
         assert_eq!(cfg.max_connections, Some(1000));
     }
 

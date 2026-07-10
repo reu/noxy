@@ -103,6 +103,8 @@ pub struct ProxyBuilder {
     accept_invalid_upstream_certs: bool,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
     max_connections: Option<usize>,
     drain_timeout: Option<Duration>,
     credentials: Vec<(String, String)>,
@@ -333,6 +335,29 @@ impl ProxyBuilder {
         self
     }
 
+    /// Set the timeout for establishing a new upstream connection (TCP connect
+    /// plus TLS handshake). Defaults to 30s so a black-holed upstream can't
+    /// hang a request until the OS TCP timeout.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Remove the upstream connect timeout (wait indefinitely for a connection).
+    pub fn no_connect_timeout(mut self) -> Self {
+        self.connect_timeout = None;
+        self
+    }
+
+    /// Set a timeout for receiving the upstream response headers. If the
+    /// upstream does not start responding within this window, the client gets
+    /// `504 Gateway Timeout`. This bounds time-to-first-response and does not
+    /// cut off streaming/SSE response bodies. Disabled by default.
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
     /// Limit the number of concurrent connections the proxy will handle.
     /// Additional connections will be backpressured at the accept loop.
     pub fn max_connections(mut self, max: usize) -> Self {
@@ -474,6 +499,7 @@ impl ProxyBuilder {
 
         let connector = UpstreamConnector {
             tls: TlsConnector::from(Arc::new(client_config)),
+            connect_timeout: self.connect_timeout,
         };
 
         let upstream_client =
@@ -545,6 +571,7 @@ impl ProxyBuilder {
             upstream_client,
             handshake_timeout: self.handshake_timeout,
             idle_timeout: self.idle_timeout,
+            request_timeout: self.request_timeout,
             max_connections: self.max_connections.map(|n| Arc::new(Semaphore::new(n))),
             drain_timeout: self.drain_timeout,
         })
@@ -631,6 +658,7 @@ pub struct Proxy {
     upstream_client: UpstreamClient,
     handshake_timeout: Option<Duration>,
     idle_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
     max_connections: Option<Arc<Semaphore>>,
     drain_timeout: Option<Duration>,
 }
@@ -644,6 +672,8 @@ impl Proxy {
             accept_invalid_upstream_certs: false,
             handshake_timeout: None,
             idle_timeout: None,
+            connect_timeout: Some(Duration::from_secs(30)),
+            request_timeout: None,
             max_connections: None,
             drain_timeout: None,
             credentials: Vec::new(),
@@ -829,7 +859,12 @@ impl Proxy {
         authority: ::http::uri::Authority,
         scheme: UpstreamScheme,
     ) -> HttpService {
-        let forward = ForwardService::new(self.upstream_client.clone(), authority, scheme);
+        let forward = ForwardService::new(
+            self.upstream_client.clone(),
+            authority,
+            scheme,
+            self.request_timeout,
+        );
         let mut service: HttpService = tower::util::BoxService::new(forward);
         for layer_fn in self.layers.iter().rev() {
             service = layer_fn(service);
