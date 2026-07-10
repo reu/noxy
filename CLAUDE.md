@@ -92,7 +92,6 @@ trait Rule {
 - Add CI guardrails for meaningful regressions (avoid failing on small noise)
 
 ### Security
-- Use constant-time credential comparison for proxy auth checks
 - Harden CONNECT authority parsing (avoid naive string split on `:`; use authority-aware parsing including IPv6)
 
 ### Scripting
