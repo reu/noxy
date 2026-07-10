@@ -185,6 +185,8 @@ struct Cli {
 async fn main() -> miette::Result<()> {
     use miette::IntoDiagnostic;
 
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
